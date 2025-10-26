@@ -8,8 +8,8 @@ import asyncio
 
 from loguru import logger
 
-from lnbits.db import Database
-from lnbits.helpers import decrypt_internal_message, encrypt_internal_message
+from lnbits.db import Database # type: ignore
+from lnbits.helpers import decrypt_internal_message, encrypt_internal_message # type: ignore
 
 from .models import CyberherdSettings, LegacyCyberherdMember
 from .services.shares import compute_member_share_percentages
