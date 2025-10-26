@@ -250,6 +250,13 @@ class ZapMonitorService:
                 logger.debug(f"No settings found for user {self.user_id}")
                 return
             
+            if not getattr(settings, "zap_tracking_enabled", False):
+                logger.info(
+                    f"Zap processing skipped for user {self.user_id}: zap_tracking_enabled is False"
+                )
+                self.last_error = "zap_tracking_disabled"
+                return False
+            
             herd_wallet_id = getattr(settings, 'herd_wallet', None)
             # Coerce herd_wallet_id to a string only if it's a real value. Tests use Mock objects
             # which will return a Mock for missing attributes; treat non-str values as unset.
