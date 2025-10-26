@@ -9,10 +9,13 @@ to manage users and trigger headbutt logic when appropriate.
 import asyncio
 import ast
 import json
+import os
 import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
+
+import httpx
 
 from loguru import logger
 
@@ -39,6 +42,128 @@ except Exception:  # pragma: no cover - messaging extension optional at import t
         if candidate.startswith("http://"):
             return "ws://" + candidate[len("http://") :]
         return None
+
+
+_METADATA_CACHE: dict[str, dict[str, Any]] = {}
+_METADATA_REFRESH_SECONDS = int(os.getenv("CYBERHERD_METADATA_REFRESH_SECONDS", "3600") or 3600)
+_NIP05_REFRESH_SECONDS = int(os.getenv("CYBERHERD_NIP05_REFRESH_SECONDS", "10800") or 10800)
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _sanitize_metadata_payload(data: dict[str, Any] | None) -> dict[str, Any]:
+    """Return a shallow copy with harmless fields only."""
+    if not data:
+        return {}
+    allowed = ("display_name", "lud16", "picture", "nip05", "relays")
+    cleaned: dict[str, Any] = {}
+    for key in allowed:
+        value = data.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            candidate = value.strip()
+            if not candidate:
+                continue
+            cleaned[key] = candidate
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
+def _metadata_cache_get(pubkey: str) -> dict[str, Any] | None:
+    return _METADATA_CACHE.get(pubkey)
+
+
+def _metadata_cache_store(pubkey: str, data: dict[str, Any], *, fetched_at: float | None = None) -> dict[str, Any]:
+    entry = _METADATA_CACHE.setdefault(pubkey, {})
+    entry["data"] = _sanitize_metadata_payload(data)
+    entry["fetched_at"] = fetched_at if fetched_at is not None else _now()
+    return entry
+
+
+def _metadata_cache_mark_verified(pubkey: str, result: Optional[bool]) -> None:
+    if result is None:
+        return
+    entry = _METADATA_CACHE.setdefault(pubkey, {})
+    entry["verified"] = bool(result)
+    entry["verified_at"] = _now()
+
+
+async def _verify_nip05_relaxed(pubkey: str, nip05: str) -> tuple[Optional[bool], str]:
+    """Return (result, reason) where result is True/False/None for match/mismatch/unknown."""
+    identity = (nip05 or "").strip()
+    pubkey_norm = (pubkey or "").strip().lower()
+    if not identity or "@" not in identity:
+        return False, "invalid_format"
+
+    username, domain = identity.split("@", 1)
+    username = username.strip().lower()
+    domain = domain.strip()
+    if not username or not domain:
+        return False, "invalid_format"
+
+    errors: list[str] = []
+
+    url = f"https://{domain}/.well-known/nostr.json?name={username}"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        mapped = None
+        try:
+            mapped = data.get("names", {}).get(username)
+        except Exception:
+            mapped = None
+
+        if isinstance(mapped, str):
+            candidate = mapped.strip()
+            if candidate:
+                try:
+                    from lnbits.utils.nostr import normalize_public_key  # type: ignore
+
+                    candidate = normalize_public_key(candidate)  # type: ignore[assignment]
+                except Exception:
+                    candidate = candidate.lower()
+                else:
+                    candidate = candidate.strip().lower()
+                if candidate == pubkey_norm:
+                    return True, "direct_match"
+                return False, "direct_mismatch"
+        return False, "mapping_missing"
+    except Exception as exc:
+        errors.append(f"direct:{exc}")
+
+    try:
+        from lnbits.core.services.nostr import fetch_nip5_details  # type: ignore
+    except Exception as exc:
+        errors.append(f"fallback_import:{exc}")
+    else:
+        try:
+            resolved, _ = await fetch_nip5_details(identity)
+        except Exception as exc:
+            errors.append(f"fallback:{exc}")
+        else:
+            if resolved:
+                try:
+                    from lnbits.utils.nostr import normalize_public_key  # type: ignore
+
+                    resolved = normalize_public_key(resolved)  # type: ignore[assignment]
+                except Exception:
+                    resolved = resolved.strip().lower()
+                else:
+                    resolved = resolved.strip().lower()
+                if resolved == pubkey_norm:
+                    return True, "fallback_match"
+                return False, "fallback_mismatch"
+            return False, "fallback_missing"
+
+    if errors:
+        return None, "; ".join(errors)
+    return None, "unknown"
 
 
 def _pick_first_relay(relays_field: Any) -> str | None:
@@ -410,6 +535,67 @@ class EnhancedHeadbuttService:
         except Exception as e:
             logger.error(f"Error getting today's cyberherd notes: {e}", exc_info=True)
             return []
+
+    async def _resolve_attacker_metadata(self, attacker: Any) -> tuple[dict[str, Any], Optional[str]]:
+        """Fetch metadata for attacker with caching and local fallback."""
+        pubkey = getattr(attacker, "pubkey", None)
+        if not pubkey:
+            return {}, None
+
+        entry = _metadata_cache_get(pubkey)
+        cached_data = dict(entry.get("data", {})) if entry and entry.get("data") else {}
+        now = _now()
+        age = None
+        if entry and entry.get("fetched_at") is not None:
+            try:
+                age = now - float(entry["fetched_at"])
+            except Exception:
+                age = None
+
+        needs_refresh = not cached_data or (age is not None and age > _METADATA_REFRESH_SECONDS)
+        source: Optional[str] = None
+
+        metadata: dict[str, Any] | None = None
+        if needs_refresh:
+            try:
+                from .nostr_lookup import lookup_metadata  # type: ignore
+
+                metadata = await lookup_metadata(pubkey)
+            except Exception as exc:  # pragma: no cover - network dependent
+                logger.debug(f"cyberherd: metadata lookup failed for {pubkey[:8]}...: {exc}")
+
+        if metadata:
+            source = "nostr"
+            entry = _metadata_cache_store(pubkey, metadata, fetched_at=now)
+            cached_data = dict(entry.get("data", {}))
+        elif cached_data:
+            source = "cache"
+        else:
+            try:
+                local = await self.db.get_cyberherd_member_by_pubkey(pubkey, user_id=self.user_id)
+            except Exception as exc:
+                logger.debug(f"cyberherd: local metadata lookup failed for {pubkey[:8]}...: {exc}")
+                local = None
+            if local:
+                source = "local"
+                fallback = {
+                    "display_name": local.get("display_name"),
+                    "lud16": local.get("lud16"),
+                    "picture": local.get("picture"),
+                    "nip05": local.get("nip05"),
+                    "relays": local.get("relays"),
+                }
+                entry = _metadata_cache_store(pubkey, fallback, fetched_at=now)
+                cached_data = dict(entry.get("data", {}))
+            elif entry and entry.get("data"):
+                # Fall back to stale cache even if refresh failed
+                source = "cache"
+                cached_data = dict(entry.get("data", {}))
+            else:
+                source = None
+                cached_data = {}
+
+        return cached_data, source
 
     async def process_headbutting_attempts(
         self, attempts: list[Any]
@@ -1191,60 +1377,95 @@ class EnhancedHeadbuttService:
         existing = await self.db.get_cyberherd_member_by_pubkey(attacker.pubkey, user_id=self.user_id)
         payouts = calculate_payout(float(attacker.amount))
         if existing:
+            if not getattr(attacker, "nip05", None):
+                attacker.nip05 = (existing or {}).get("nip05")
             await self.db.update_and_activate_member(
                 attacker.pubkey,
                 attacker.amount,
                 payouts,
                 user_id=self.user_id,
                 kinds=getattr(attacker, 'kinds', None),
+                nip05=getattr(attacker, "nip05", None),
             )
             return "reactivated"
         else:
-            # Before adding, enforce valid nip05 and lud16 via nostrclient lookup
-            try:
-                from .nostr_lookup import lookup_metadata, verify_nip05
-                from ..utils.tlv import hex_to_nprofile
+            zap_amount = int(getattr(attacker, "amount", 0) or 0)
+            requires_lud16 = zap_amount <= 0
 
-                meta = await lookup_metadata(attacker.pubkey) or {}
-                nip05 = meta.get("nip05")
-                if not nip05 or not await verify_nip05(attacker.pubkey, nip05):
-                    logger.info(
-                        f"AdmissionGuard nip05_required: missing_or_invalid (pubkey={attacker.pubkey[:16]}..., nip05={nip05 or 'none'})"
-                    )
-                    return "nip05_required"
-                
-                # Augment attacker with fetched fields if missing
+            metadata, metadata_source = await self._resolve_attacker_metadata(attacker)
+            cache_entry = _metadata_cache_get(attacker.pubkey)
+            metadata_timestamp = int(cache_entry.get("fetched_at", _now())) if cache_entry else int(_now())
+
+            if metadata:
                 if not getattr(attacker, "display_name", None):
-                    attacker.display_name = meta.get("display_name") or "Anon"
-                if not getattr(attacker, "lud16", None):
-                    attacker.lud16 = meta.get("lud16")
-                if not getattr(attacker, "picture", None):
-                    attacker.picture = meta.get("picture")
-                
-                # Enforce Lightning address (lud16) requirement
-                if not attacker.lud16:
-                    logger.info(
-                        f"AdmissionGuard lud16_required: missing (pubkey={attacker.pubkey[:16]}...)"
-                    )
-                    return "lud16_required"
-                
-                # Generate nprofile for attacker (without relay hints - faster and still valid)
-                try:
-                    attacker.nprofile = hex_to_nprofile(attacker.pubkey)
-                except Exception:
-                    attacker.nprofile = None
-            except Exception:
-                # If lookup fails, treat as not eligible
-                logger.info("Admission blocked — failed nip05 lookup")
+                    attacker.display_name = metadata.get("display_name") or "Anon"
+                if not getattr(attacker, "lud16", None) and metadata.get("lud16"):
+                    attacker.lud16 = metadata.get("lud16")
+                if not getattr(attacker, "picture", None) and metadata.get("picture"):
+                    attacker.picture = metadata.get("picture")
+                if metadata.get("relays") and not getattr(attacker, "relays", None):
+                    attacker.relays = metadata.get("relays")
+                if metadata.get("nip05"):
+                    attacker.nip05 = metadata.get("nip05")
+            else:
+                logger.debug(
+                    f"AdmissionGuard metadata_unavailable: pubkey={attacker.pubkey[:16]}..., source={metadata_source or 'none'}"
+                )
+
+            if not getattr(attacker, "display_name", None):
+                attacker.display_name = "Anon"
+
+            has_lud16 = bool(str(getattr(attacker, "lud16", "") or "").strip())
+            if requires_lud16 and not has_lud16:
+                logger.info(
+                    f"AdmissionGuard lud16_required: missing (pubkey={attacker.pubkey[:16]}..., zap_amount={zap_amount})"
+                )
+                return "lud16_required"
+
+            nip05_value = str(getattr(attacker, "nip05", "") or "").strip()
+            if not nip05_value and metadata:
+                nip05_candidate = metadata.get("nip05")
+                if isinstance(nip05_candidate, str):
+                    nip05_value = nip05_candidate.strip()
+                    if nip05_value:
+                        attacker.nip05 = nip05_value
+
+            if not nip05_value:
+                logger.info(
+                    f"AdmissionGuard nip05_required: missing (pubkey={attacker.pubkey[:16]}...)"
+                )
                 return "nip05_required"
 
-                # If metadata includes relays, attach to attacker so we can persist them
-                try:
-                    relays_val = meta.get("relays") if isinstance(meta, dict) else None
-                    if relays_val:
-                        attacker.relays = relays_val
-                except Exception:
-                    pass
+            verification_result, verification_reason = await _verify_nip05_relaxed(attacker.pubkey, nip05_value)
+            cached_verified = bool(cache_entry and cache_entry.get("verified"))
+            if verification_result is False:
+                _metadata_cache_mark_verified(attacker.pubkey, False)
+                logger.info(
+                    f"AdmissionGuard nip05_required: verification_failed (pubkey={attacker.pubkey[:16]}..., nip05={nip05_value}, reason={verification_reason})"
+                )
+                return "nip05_required"
+            if verification_result is True:
+                _metadata_cache_mark_verified(attacker.pubkey, True)
+            elif not cached_verified:
+                logger.warning(
+                    f"AdmissionGuard nip05_unverified: proceeding without confirmation (pubkey={attacker.pubkey[:16]}..., nip05={nip05_value}, reason={verification_reason})"
+                )
+            else:
+                logger.debug(
+                    f"AdmissionGuard nip05_cached_ok: using cached verification (pubkey={attacker.pubkey[:16]}..., reason={verification_reason})"
+                )
+
+            # Generate nprofile for attacker (without relay hints - faster and still valid)
+            try:
+                from ..utils.tlv import hex_to_nprofile  # type: ignore
+
+                if not getattr(attacker, "nprofile", None):
+                    attacker.nprofile = hex_to_nprofile(attacker.pubkey)
+            except Exception:
+                if not getattr(attacker, "nprofile", None):
+                    attacker.nprofile = None
+
+            setattr(attacker, "metadata_last_checked_at", metadata_timestamp)
 
             await self._add_new_member(attacker, payouts)
             return "new"
@@ -1355,11 +1576,13 @@ class EnhancedHeadbuttService:
             "kinds": kinds_str,
             "nprofile": getattr(member, "nprofile", None),
             "lud16": getattr(member, "lud16", None),
+            "nip05": getattr(member, "nip05", None),
             "payouts": float(payouts or 0.0),
             "amount": int(getattr(member, "amount", 0) or 0),
             "picture": getattr(member, "picture", None),
             # Try to persist any relays present on the member object (from lookup)
             "relays": getattr(member, "relays", None),
+            "metadata_last_checked_at": getattr(member, "metadata_last_checked_at", None),
         }
         await self.db.add_new_active_member(member_data, user_id=self.user_id)
 

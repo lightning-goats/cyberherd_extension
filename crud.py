@@ -1212,6 +1212,9 @@ async def add_new_active_member(member_data: dict, user_id: str | None = None):
     raw_lud16 = member_data.get("lud16") or ""
     normalized_lud16 = raw_lud16.strip().lower() if raw_lud16 else ""
 
+    raw_nip05 = member_data.get("nip05") or ""
+    normalized_nip05 = raw_nip05.strip().lower() if raw_nip05 else None
+
     values = {
         "pubkey": normalized_pubkey,
         "user_id": user_id,  # Add user_id to values
@@ -1222,6 +1225,7 @@ async def add_new_active_member(member_data: dict, user_id: str | None = None):
     "kinds": None,
         "nprofile": member_data.get("nprofile"),
     "lud16": normalized_lud16,
+        "nip05": normalized_nip05,
         "payouts": float(member_data.get("payouts") or 0.0),
         "amount": int(amt_val),
         "picture": member_data.get("picture"),
@@ -1327,10 +1331,10 @@ async def add_new_active_member(member_data: dict, user_id: str | None = None):
         await db.execute(
             f"""INSERT INTO {db.references_schema}cyber_herd (
                 pubkey, user_id, display_name, event_id, note, kinds, nprofile, lud16,
-                payouts, amount, picture, relays, metadata_last_checked_at, is_active
+                nip05, payouts, amount, picture, relays, metadata_last_checked_at, is_active
             ) VALUES (
                 :pubkey, :user_id, :display_name, :event_id, :note, :kinds, :nprofile, :lud16,
-                :payouts, :amount, :picture, :relays, :metadata_last_checked_at, 1
+                :nip05, :payouts, :amount, :picture, :relays, :metadata_last_checked_at, 1
             )
             ON CONFLICT(pubkey) DO UPDATE SET
                 user_id = excluded.user_id,
@@ -1340,6 +1344,7 @@ async def add_new_active_member(member_data: dict, user_id: str | None = None):
                 kinds = excluded.kinds,
                 nprofile = excluded.nprofile,
                 lud16 = excluded.lud16,
+                nip05 = COALESCE(excluded.nip05, nip05),
                 payouts = excluded.payouts,
                 amount = excluded.amount,
                 picture = excluded.picture,
@@ -1399,6 +1404,7 @@ async def update_and_activate_member(
     user_id: str | None = None,
     event_id: str | None = None,
     kinds: str | list | tuple | set | None = None,
+    nip05: str | None = None,
 ):
     """Update and activate a cyberherd member for a specific user.
     
@@ -1460,6 +1466,13 @@ async def update_and_activate_member(
     if ai >= 1_000_000:
         ai = ai // 1000
 
+    nip05_normalized: str | None = None
+    if nip05:
+        try:
+            nip05_normalized = str(nip05).strip().lower() or None
+        except Exception:
+            nip05_normalized = None
+
     result = await db.execute(
         f"""
         UPDATE {db.references_schema}cyber_herd
@@ -1467,7 +1480,8 @@ async def update_and_activate_member(
             payouts = payouts + :payouts_increase,
             is_active = 1,
             metadata_last_checked_at = :ts,
-            event_id = COALESCE(:event_id, event_id)
+            event_id = COALESCE(:event_id, event_id),
+            nip05 = COALESCE(:nip05, nip05)
         WHERE pubkey = :pubkey AND user_id = :user_id
         """,
         {
@@ -1477,6 +1491,7 @@ async def update_and_activate_member(
             "pubkey": normalized_pubkey,
             "user_id": user_id,
             "event_id": event_id,
+            "nip05": nip05_normalized,
         },
     )
     # If no rows were updated, target row doesn't exist for this user. Fail fast
@@ -1681,6 +1696,7 @@ async def _bootstrap_cyberherd_tables():
             kinds TEXT,
             nprofile TEXT,
             lud16 TEXT,
+            nip05 TEXT,
             notified INTEGER DEFAULT 0,
             payouts REAL DEFAULT 0,
             amount INTEGER DEFAULT 0,
@@ -1737,6 +1753,7 @@ async def _bootstrap_cyberherd_tables():
         );
         """
     )
+    stmts.append("ALTER TABLE cyber_herd ADD COLUMN nip05 TEXT;")
     for s in stmts:
         try:
             await db.execute(s)
