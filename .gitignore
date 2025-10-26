@@ -1,0 +1,74 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Logs and runtime data
+*.log
+*.pid
+*.seed
+*.cover
+.coverage
+htmlcov/
+.tox/
+.nox/
+.cache/
+pytest_cache/
+.mypy_cache/
+.pytest_cache/
+.dmypy.json
+coverage.xml
+*.cover
+*.py,cover
+
+# Editor and system files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# LNbits-specific
+lnbits/extensions/*/__pycache__/
+lnbits/extensions/*/static/js/*.map
+lnbits/extensions/*/static/css/*.map
+lnbits/extensions/*/node_modules/
+lnbits/extensions/*/dist/
+lnbits/extensions/*/.env
+lnbits/extensions/*/.pytest_cache/
+lnbits/extensions/*/.mypy_cache/
+lnbits/extensions/*/*.sqlite3
+lnbits/extensions/*/*.db
+
+# Tests
+tests/
+*/tests/
+test_*.py
+*_test.py
+*.spec
+
+# Misc
+*.bak
+*.tmp
+*.orig
+*.rej
+*.log

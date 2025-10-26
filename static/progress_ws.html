@@ -1,0 +1,1976 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>js overlay</title>
+  <meta charset="UTF-8">
+  <link rel="icon" href="data:," type="image/x-icon">
+  <style>
+    /* General Styles */
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: 'Arial', sans-serif; 
+    }
+    
+    #container {
+      position: absolute;
+      width: 1920px; 
+      height: 1080px; 
+      margin: auto;
+      top: 0;
+      left: 0;
+    }
+    
+    #qr-code {
+      position: absolute;
+      top: 3px; 
+      right: 8px; 
+      background-color: white;
+      width: 180px; 
+      height: 180px; 
+      border-radius: 18px; 
+      z-index: 3;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+      transition: transform 0.2s ease-out, box-shadow 0.2s ease-out;
+    }
+    #qr-code:hover {
+      transform: scale(1.03);
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.15);
+    }
+    
+    #sats-received-overlay {
+      position: absolute;
+      top: 188px; 
+      right: 8px;   
+      width: 180px; 
+      text-align: center; 
+      font-size: 18px;
+      font-weight: bold;
+      font-family: 'Arial', sans-serif;
+      color: black;
+      background-color: rgba(255, 255, 255, 0.95); 
+      padding: 5px 10px;
+      border-radius: 8px;
+      pointer-events: none;
+      z-index: 4; 
+      opacity: 0;
+      white-space: nowrap;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+      box-sizing: border-box; 
+    }
+    
+    #content {
+      width: 100%;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      flex-direction: column;
+    }
+    
+    #top-left-container {
+      display: flex;
+      flex-direction: row; 
+      align-items: center;
+      background-color: #000000;
+      border-radius: 18px;
+      padding: 5px 9px;
+      position: absolute;
+      top: 5px;
+      left: 5px;
+      box-sizing: border-box;
+      z-index: 0;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    }
+    
+    #goat-feedings,
+    #spots-remaining,
+    #sats_left,
+    #btc-price,
+    #btc-change,
+    .top-left-item {
+      color: white;
+      font-weight: bold;
+      font-size: 18px;
+      font-family: 'Arial', sans-serif;
+      margin-right: 10px;
+      transition: color 0.5s ease-out; 
+    }
+
+    #goat-feedings:last-child,
+    #spots-remaining:last-child,
+    #sats_left:last-child,
+    #btc-price:last-child,
+    #btc-change:last-child,
+    .top-left-item:last-child {
+      margin-right: 0;
+    }
+
+    .btc-change-positive {
+      color: #4CAF50;
+    }
+
+    .btc-change-negative {
+      color: #F44336;
+    }
+    
+    #bottom-container {
+      display: flex;
+      align-items: center;
+      background-color: #e33502; 
+      background-image: linear-gradient(to bottom, #e33502, #c82a00);
+      border-radius: 18px;
+      padding: 5px 9px;
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      width: 100%;
+      box-sizing: border-box;
+      z-index: 0;
+      box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.15);
+    }
+    
+    #time-temperature-container {
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      background-color: #e33502;
+      border-radius: 11px;
+      padding: 5px 9px;
+      font-size: 18px;
+      font-weight: bold;
+      font-family: 'Arial', sans-serif;
+      color: white;
+      z-index: 2;
+    }
+    
+    #current-time,
+    #current-temperature {
+      margin-right: 8px;
+    }
+    
+    #wallet-balance {
+      margin-left: 8px;
+    }
+    
+    #center-container {
+      flex-grow: 1;
+      display: flex;
+      justify-content: center;
+      position: relative;
+    }
+    
+    #progress-container {
+      position: relative;
+      width: 99%;
+      height: 20px;
+      background-color: #d0d0d0; 
+      border-radius: 11px;
+      overflow: hidden;
+      z-index: 2;
+      box-shadow: inset 0 1px 3px rgba(0,0,0,0.25); 
+    }
+    
+    #progress-fill {
+      height: 100%;
+      background-color: #e6b800; 
+      background-image: linear-gradient(
+        -45deg, 
+        rgba(230,184,0,1) 25%,  
+        rgba(235,195,20,1) 25%,  
+        rgba(235,195,20,1) 50%,
+        rgba(230,184,0,1) 50%,
+        rgba(230,184,0,1) 75%,
+        rgba(235,195,20,1) 75%,
+        rgba(235,195,20,1) 100%
+      );
+      background-size: 20px 20px; 
+      border-radius: 11px;
+      width: 0%;
+      z-index: 1; 
+      position: relative; 
+    }
+
+    #progress-fill.is-filling { 
+        animation: pulseFill 1.5s infinite ease-in-out, progressBarFlow 1.8s linear infinite; 
+    }
+    @keyframes pulseFill {
+        0%, 100% { filter: brightness(100%); }
+        50% { filter: brightness(110%); } 
+    }
+    @keyframes progressBarFlow {
+      0% { background-position: 0 0; }
+      100% { background-position: 20px 0; } 
+    }
+
+
+    #progress-fill.shine-effect::after { 
+        content: '';
+        position: absolute;
+        top: 0;
+        left: -150%; 
+        width: 100%; 
+        height: 100%;
+        background: linear-gradient(90deg, transparent, rgba(255,255,255,0.4), transparent); 
+        animation: shine 0.75s forwards;
+        border-radius: 11px; 
+    }
+    @keyframes shine {
+        to { left: 150%; } 
+    }
+
+    #progress-drainer { 
+        position: absolute;
+        top: 0;
+        right: 0; 
+        width: 0%; 
+        height: 100%;
+        background-color: #d0d0d0; 
+        border-radius: 11px;
+        z-index: 2; 
+        display: none; 
+    }
+
+    #progress-percentage {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: #000;
+      font-size: 16px;
+      font-weight: bold;
+      font-family: 'Arial', sans-serif;
+      z-index: 2;
+      text-shadow: 1px 1px 2px rgba(255,255,255,0.8);
+      pointer-events: none;
+    }
+        
+    #scrolling-comment {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%; 
+      height: 100%;
+      z-index: 5; 
+      overflow: hidden;
+      pointer-events: none;
+    }
+    
+    #scrolling-comment .message {
+      position: absolute; 
+      white-space: nowrap;
+      font-size: 18px;
+      font-weight: bold;
+      color: #000; 
+      will-change: transform;
+      background-color: #d0d0d0; 
+      padding: 4px 10px; 
+      border-radius: 11px;  
+    }
+    
+    #accordion-container {
+      position: absolute;
+      top: 50px; 
+      left: 8px; 
+      width: auto; 
+      height: auto; 
+      background-color: transparent;
+      display: flex;
+      flex-direction: row;  
+      overflow: visible; 
+      z-index: 3;
+      opacity: 0;
+      transform: translateX(-100%); 
+    }
+    
+    .accordion-item {
+      background-color: #000000;
+      width: 130px; 
+      height: 190px; 
+      position: relative;
+      margin-right: 10px; 
+      border-radius: 18px; 
+      overflow: hidden; 
+      box-shadow: 0 3px 8px rgba(0,0,0,0.2);
+      opacity: 0; 
+    }
+    
+    .accordion-item.user-profile {
+      height: 190px; 
+    }
+    
+    .accordion-content {
+      background-color: #000000;
+      height: 100%;
+      display: flex;
+      flex-direction: column; 
+      justify-content: flex-start; 
+      opacity: 1; 
+      padding: 10px 5px; 
+      align-items: center;
+      border-radius: 18px; 
+      transition: transform 0.2s ease-out, box-shadow 0.2s ease-out; 
+    }
+
+    .accordion-item:hover .accordion-content {
+        transform: translateY(-3px);
+        box-shadow: 0 5px 12px rgba(255, 219, 88, 0.4); 
+    }
+    
+    .accordion-content img {
+      height: 100px;
+      width: 100px;
+      display: block;
+      margin-top: 10px; 
+      margin-bottom: 8px; 
+      border-radius: 50%; 
+      object-fit: cover; 
+      border: 2px solid white; 
+      box-shadow: 0 4px 8px rgba(0,0,0,0.2); 
+    }
+    
+    @keyframes breathe {
+      0% { transform: scale(1); }
+      50% { transform: scale(1.05); }
+      100% { transform: scale(1); }
+    }
+    
+    [data-newest="true"] .accordion-content img {
+      animation: breathe 3s infinite ease-in-out;
+    }
+
+    .user-profile-container {
+      display: flex;
+      flex-direction: column; 
+      align-items: center;
+      justify-content: flex-start; 
+      text-align: center; 
+      width: 100%;
+      padding: 0 5px;
+      box-sizing: border-box;
+    }
+    
+    .user-profile-text {
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-start; 
+      align-items: center;
+      margin-top: 5px; 
+    }
+    
+    .user-profile-name {
+      color: white;
+      font-weight: bold;
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 120px;
+      white-space: nowrap;
+      text-align: center;
+    }
+    
+    .user-profile-kinds {
+      color: #ffdb58;
+      font-weight: bold;
+      font-size: 12px;
+      margin-top: 2px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 120px;
+      white-space: nowrap;
+      display: block; 
+      text-align: center;
+    }
+    
+    .user-profile-zap {
+      color: #ffdb58;
+      font-weight: bold;
+      font-size: 12px;
+      margin-top: 2px;
+      display: block;
+      text-align: center;
+    }
+
+    .cyberherd-label {
+      color: #ffdb58;
+      font-weight: bold;
+      font-size: 12px;
+      text-align: center;
+      margin-bottom: 5px;
+      display: block;
+    }
+
+    #lightning-effect {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background-color: #F0F8FF; 
+      z-index: 1000;
+      pointer-events: none;
+      display: none;
+      opacity: 0;
+    }
+
+    #feeder-triggered {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        color: white; 
+        padding: 30px 60px; 
+        border-radius: 15px; 
+        font-size: 36px; 
+        font-weight: bold;
+        text-shadow: 0 0 5px rgba(0,0,0,0.7); 
+        display: none;
+        z-index: 7;
+        transition: color 0.05s linear; 
+    }
+
+    body.lightning-flash-on #feeder-triggered {
+        color: black;
+        text-shadow: 0 0 3px rgba(255,255,255,0.5); 
+    }
+
+  </style>
+  <!-- GSAP Library -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.10.4/gsap.min.js" defer></script>
+</head>
+<body>
+  <div id="container">
+    <div id="feeder-triggered" style="display: none;">⚡ Feeder Triggered ⚡</div>
+    
+    <div id="top-left-container">
+      <span id="spots-remaining" class="top-left-item"></span>
+      <span id="sats_left" class="top-left-item">⚡0 sats to go until the herd is fed again.⚡</span>
+      <span id="btc-price" class="top-left-item">BTC: --</span>
+      <span id="btc-change" class="top-left-item">(24h: --)</span>
+    </div>
+    
+    <div id="qr-code">
+      <img src="images/qr.png" width="180" height="180" style="border-radius: 18px;">
+      <img id="lightning-img" src="images/lightning.png" width="177" height="177" style="border-radius: 18px; display: none;">
+    </div>
+    <div id="sats-received-overlay"></div> 
+    
+    <div id="content">
+      <div id="bottom-container">
+        <div id="time-temperature-container">
+          <div id="current-time">--:--</div>
+          <div id="current-temperature">-- °F</div>
+        </div>
+        <div id="center-container">
+          <div id="progress-container">
+            <div id="progress-fill"></div>
+            <div id="progress-drainer"></div> 
+            <div id="progress-percentage">0%</div>
+            <div id="scrolling-comment"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="accordion-container" style="display: none;"></div>
+    <div id="lightning-effect"></div>
+  </div>
+  <script>
+    (function () {
+      // ========================================
+      // CONFIGURATION - Set your wallet ID here
+      // ========================================
+      // Change this to your herd_wallet ID from CyberHerd settings
+      // This is the wallet that receives CyberHerd payments
+      const HERD_WALLET_READ_KEY = '036ad4bb0dcb4b8c952230ab7b47ea52';
+      
+      // ========================================
+      // Connection Configuration
+      // ========================================
+      const RECONNECT_INTERVAL_BASE = 30000; 
+      const MAX_RECONNECT_INTERVAL = 60000; 
+      const FETCH_INTERVAL = 16000;
+      const SATS_LEFT_DISPLAY_DURATION = 2500; 
+      // Single WebSocket URL for all CyberHerd and payment updates
+      const WS_URL = `ws://192.168.1.161:3002/api/v1/ws/${HERD_WALLET_READ_KEY}`;
+      const API_BASE_URL = 'http://192.168.1.161:8090';
+      const MAX_PROCESSED_HASHES = 25;
+      const MAX_DISPLAYED_MEMBERS = 10; 
+      const BTC_FETCH_INTERVAL = 10000;
+      
+      const animationConfig = {
+        message: {
+          scrollSpeed: 200,       
+          spacing: 30,            
+          separator: " ⚡ ", 
+          checkPoints: [0.8, 0.5, 0.3], 
+          separatorColor: "#e33502" 
+        },
+        accordion: {
+          displayDuration: 18000, 
+          transitionDuration: 1000, 
+          itemStagger: 0.1, 
+          breatheAnimationDuration: 3000 
+        },
+        qrCode: {
+          flashDuration: 125,    
+          displayDuration: 2000  
+        },
+        satsReceivedOverlay: {
+          entryDuration: 0.4, 
+          exitDuration: 0.3, 
+        },
+        feeder: {
+          effectDuration: 2000,  
+          scalingStart: 0.8,     
+          scalingEnd: 1.2        
+        },
+        lightning: {
+          flashDuration: 150,    
+          flashCount: 3          
+        },
+        progressBar: {
+          updateDuration: 2000,   
+          shineDuration: 750,
+          popDuration: 300, 
+          colorFlashDuration: 200, 
+          drainDuration: 800 
+        },
+        dataUpdate: {
+            highlightColor: "#ffdb58", 
+            originalColorText: "white", 
+            duration: 0.8 
+        }
+      };
+      
+      const container = document.getElementById('container');
+      const feederTriggeredText = document.getElementById('feeder-triggered');
+      const qrCode = document.getElementById('qr-code');
+      const qrCodeImg = document.querySelector('#qr-code img:first-child');
+      const lightningImg = document.getElementById('lightning-img');
+      const satsLeftElem = document.getElementById('sats_left');
+      const currentTimeElem = document.getElementById('current-time');
+      const currentTempElem = document.getElementById('current-temperature');
+      const spotsRemainingElem = document.getElementById('spots-remaining');
+      const btcPriceElem = document.getElementById('btc-price');
+      const btcChangeElem = document.getElementById('btc-change');
+      const progressContainer = document.getElementById('progress-container'); 
+      const progressFill = document.getElementById('progress-fill');
+      const progressDrainer = document.getElementById('progress-drainer'); 
+      const progressPercentage = document.getElementById('progress-percentage');
+      const scrollingComment = document.getElementById('scrolling-comment');
+      const satsReceivedOverlay = document.getElementById('sats-received-overlay');
+      
+      let balance = 0; 
+      let goal = 0;
+      let lastSuccessfulGoal = 0;
+      let lastSuccessfulBalance = 0;
+      let isFeederAnimating = false; 
+      let triggeredPaymentHashes = new Set(); // Track payment hashes that have triggered feeder animations
+      
+      let messageQueue = [];
+      let activeMessages = []; 
+      let messageSpacing = animationConfig.message.spacing; 
+      let messageCheckInterval = null;
+      const MESSAGE_SEPARATOR = animationConfig.message.separator; 
+      
+      let cyberHerdMembers = [];
+      
+      let reconnectInterval = RECONNECT_INTERVAL_BASE;
+      let processedPaymentHashes = new Set();
+      
+      const goats = {
+        "Newton": { img: "images/newton.png" },
+        "Nova": { img: "images/nova.png" },
+        "Cosmo": { img: "images/cosmo.png" },
+        "Dexter": { img: "images/dexter.png" },
+        "Rowan": { img: "images/rowan.png" }
+      };
+      
+      let accordionTimeout = null;
+      
+      function debounce(func, wait) {
+        let timeout;
+        return function (...args) {
+          clearTimeout(timeout);
+          timeout = setTimeout(() => func.apply(this, args), wait);
+        };
+      }
+      
+      function throttle(func, limit) {
+        let inThrottle;
+        return function (...args) {
+          if (!inThrottle) {
+            func.apply(this, args);
+            inThrottle = true;
+            setTimeout(() => inThrottle = false, limit);
+          }
+        };
+      }
+
+      function animateTextUpdate(element, newText, highlightColor, originalColor, duration) {
+          if (element.innerText !== newText) {
+              element.innerText = newText;
+              gsap.fromTo(element, 
+                  { color: highlightColor }, 
+                  { color: originalColor, duration: duration, ease: "power1.inOut" }
+              );
+          }
+      }
+      
+      function formatTime(date) {
+        return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      }
+      
+      const debouncedUpdateProgressBar = debounce(updateProgressBar, 100);
+      const throttledUpdateSatsLeft = throttle(updateSatsLeftDisplay, 200); 
+      
+      async function fetchData(url, options = {}) {
+        try {
+          const response = await fetch(url, options);
+          if (!response.ok) {
+            throw new Error(`Error fetching ${url}: ${response.statusText}`);
+          }
+          const contentType = response.headers.get('content-type');
+          if (contentType && contentType.includes('application/json')) {
+            return await response.json();
+          }
+          return await response.text();
+        } catch (error) {
+          throw error;
+        }
+      }
+      
+      async function fetchGoal() {
+        if (goal <= 0) {
+          try {
+            const data = await fetchData(`${API_BASE_URL}/trigger_amount`);
+            const newGoal = parseFloat(data.trigger_amount);
+            if (!isNaN(newGoal)) {
+              lastSuccessfulGoal = newGoal;
+              goal = newGoal;
+            } else {
+              throw new Error("Invalid trigger amount received");
+            }
+          } catch (error) {
+            goal = lastSuccessfulGoal;
+          }
+        }
+      }
+      
+      async function fetchBalance() {
+        if (balance <= 0) {
+          try {
+            const data = await fetchData(`${API_BASE_URL}/balance`);
+            if (data && typeof data.balance === 'number' && data.balance >= 0) {
+              const balanceInSats = Math.round(data.balance / 1000);
+              lastSuccessfulBalance = balanceInSats;
+              balance = balanceInSats;
+            } else {
+              balance = lastSuccessfulBalance || 0;
+              throw new Error("Invalid balance data received");
+            }
+          } catch (error) {
+            balance = lastSuccessfulBalance || 0;
+          }
+        }
+        updateSatsLeftDisplay(); 
+      }
+      
+      async function fetchSpotsRemaining() {
+        try {
+          const data = await fetchData('http://192.168.1.161:8090/cyberherd/active_count');
+          if (data && typeof data.active_count === 'number') {
+            const activeCount = data.active_count;
+            const spots = Math.max(0, 3 - activeCount);
+            const displayText = spots === 0 ? 'The CyberHerd is Full' : `CyberHerd spots left: ${spots}`;
+            animateTextUpdate(spotsRemainingElem, 
+                              displayText,
+                              animationConfig.dataUpdate.highlightColor,
+                              animationConfig.dataUpdate.originalColorText,
+                              animationConfig.dataUpdate.duration);
+          } else {
+            spotsRemainingElem.innerText = '';
+          }
+        } catch (error) {
+          spotsRemainingElem.innerText = '';
+        }
+      }      async function fetchBitcoinData() {
+        if (!btcPriceElem || !btcChangeElem) {
+          return;
+        }
+        try {
+          const data = await fetchData(`${API_BASE_URL}/openhab/bitcoin_data`);
+          if (data && typeof data.btc_usd_price === 'number') {
+            const formattedPrice = data.btc_usd_price.toLocaleString('en-US', {
+              style: 'currency',
+              currency: 'USD',
+              minimumFractionDigits: 0,
+              maximumFractionDigits: 0
+            });
+            animateTextUpdate(
+              btcPriceElem,
+              `BTC: ${formattedPrice}`,
+              animationConfig.dataUpdate.highlightColor,
+              animationConfig.dataUpdate.originalColorText,
+              animationConfig.dataUpdate.duration
+            );
+          } else {
+            btcPriceElem.innerText = 'BTC: --';
+            btcPriceElem.style.color = animationConfig.dataUpdate.originalColorText;
+          }
+
+          if (data && typeof data.btc_price_24h_percent_change === 'number') {
+            const change = data.btc_price_24h_percent_change;
+            const sign = change >= 0 ? '+' : '';
+            const formattedChange = `${sign}${change.toFixed(2)}%`;
+            const newChangeText = `(24h: ${formattedChange})`;
+
+            btcChangeElem.classList.remove('btc-change-positive', 'btc-change-negative');
+
+            let targetColor = animationConfig.dataUpdate.originalColorText;
+            if (change > 0) {
+              targetColor = '#4CAF50';
+              btcChangeElem.classList.add('btc-change-positive');
+            } else if (change < 0) {
+              targetColor = '#F44336';
+              btcChangeElem.classList.add('btc-change-negative');
+            }
+
+            animateTextUpdate(
+              btcChangeElem,
+              newChangeText,
+              animationConfig.dataUpdate.highlightColor,
+              targetColor,
+              animationConfig.dataUpdate.duration
+            );
+          } else {
+            btcChangeElem.classList.remove('btc-change-positive', 'btc-change-negative');
+            btcChangeElem.innerText = '(24h: --)';
+            btcChangeElem.style.color = animationConfig.dataUpdate.originalColorText;
+          }
+        } catch (error) {
+          btcPriceElem.innerText = 'BTC: --';
+          btcChangeElem.innerText = '(24h: --)';
+          btcChangeElem.classList.remove('btc-change-positive', 'btc-change-negative');
+          btcPriceElem.style.color = animationConfig.dataUpdate.originalColorText;
+          btcChangeElem.style.color = animationConfig.dataUpdate.originalColorText;
+        }
+      }
+      
+      function addMessageToQueue(text, displayData = null) {
+        if (!text) return;
+        const cleanedText = text.replace(/https?:\/\/[^\s]+/g, '').replace(/www\.[^\s]+/g, '').trim();
+        if (!cleanedText) return;
+        messageQueue.push({ text: cleanedText, displayData: displayData });
+        tryDisplayMessage();
+        if (messageCheckInterval === null) {
+            messageCheckInterval = setInterval(tryDisplayMessage, 200);
+        }
+      }
+      
+      function tryDisplayMessage() {
+        if (messageQueue.length === 0) {
+          if (messageCheckInterval !== null && activeMessages.length === 0) {
+            clearInterval(messageCheckInterval);
+            messageCheckInterval = null;
+          }
+          return;
+        }
+        if (activeMessages.length === 0) {
+          processNextMessage();
+          return;
+        }
+        const progressBarTotalWidth = progressContainer.offsetWidth; 
+        let newestMessage = activeMessages[activeMessages.length - 1];
+        let newestMessageRightEdge = newestMessage.x + newestMessage.width;
+        const enteredEnough = newestMessageRightEdge <= progressBarTotalWidth - messageSpacing;
+        if (enteredEnough) {
+          processNextMessage();
+        }
+      }
+      
+      function processNextMessage() {
+        if (messageQueue.length === 0) return;
+        if (isFeederAnimating) { // Don't start new messages if feeder sequence is active
+            return; 
+        }
+
+        const messageItem = messageQueue.shift();
+        const messageText = messageItem.text;
+        const displayData = messageItem.displayData;
+        if (displayData) {
+          displayAccordion(Array.isArray(displayData) ? displayData : [displayData]);
+        }
+        
+        const progressBarTotalWidth = progressContainer.offsetWidth; 
+        const messageSpan = document.createElement('span');
+        messageSpan.className = 'message';
+        const finalMessageText = activeMessages.length > 0 ? 
+          MESSAGE_SEPARATOR + messageText : 
+          messageText;
+        messageSpan.innerText = finalMessageText;
+        
+        gsap.set(messageSpan, { x: progressBarTotalWidth, top: '50%', y: '-50%' });
+        scrollingComment.appendChild(messageSpan);
+
+        requestAnimationFrame(() => {
+          const messageWidth = messageSpan.offsetWidth;
+          const totalDistance = progressBarTotalWidth + messageWidth; 
+          const duration = totalDistance / animationConfig.message.scrollSpeed;
+          
+          const messageTracker = {
+            element: messageSpan,
+            width: messageWidth,
+            x: progressBarTotalWidth,
+            get rightEdge() { return this.x + this.width; },
+            initialTimestamp: Date.now()
+          };
+          activeMessages.push(messageTracker);
+
+          gsap.to(messageSpan, {
+            x: -messageWidth,
+            duration: duration,
+            ease: "linear",
+            onUpdate: function() {
+              if (isFeederAnimating) return; // Message doesn't control fill during feeder animation
+
+              messageTracker.x = parseFloat(messageSpan._gsap.x); 
+              
+              const naturalProgressPercent = (goal > 0) ? Math.min(Math.max((balance / goal) * 100, 0), 100) : 0;
+              const naturalFillWidthPx = (naturalProgressPercent / 100) * progressBarTotalWidth;
+
+              let newFillWidthPx;
+
+              if (messageTracker.x < naturalFillWidthPx) {
+                newFillWidthPx = Math.max(0, messageTracker.x);
+              } else {
+                newFillWidthPx = naturalFillWidthPx;
+              }
+              
+              newFillWidthPx = Math.min(newFillWidthPx, progressBarTotalWidth);
+
+              gsap.to(progressFill, { width: newFillWidthPx + 'px', duration: 0.05, ease: 'none' });
+
+              const shouldBeFilling = newFillWidthPx > 0 && newFillWidthPx < progressBarTotalWidth;
+              if (shouldBeFilling) {
+                if (!progressFill.classList.contains('is-filling')) {
+                    progressFill.classList.add('is-filling');
+                }
+              } else {
+                if (progressFill.classList.contains('is-filling')) {
+                    progressFill.classList.remove('is-filling');
+                }
+              }
+            },
+            onComplete: () => {
+              const index = activeMessages.findIndex(m => m.element === messageSpan);
+              if (index !== -1) activeMessages.splice(index, 1);
+              
+              if (scrollingComment.contains(messageSpan)) {
+                scrollingComment.removeChild(messageSpan);
+              }
+              
+              if (!isFeederAnimating && activeMessages.length === 0) {
+                updateProgressBar(); 
+              }
+              tryDisplayMessage(); 
+            }
+          });
+        });
+      }
+      
+      function updateSatsLeftDisplay(receivedAmount = 0, isNewPayment = false) {
+        if (isNewPayment && receivedAmount > 0) {
+          displayReceivedAmount(receivedAmount); 
+        } else {
+          const currentGoal = typeof goal === 'number' ? goal : 0;
+          const currentBalance = typeof balance === 'number' ? balance : 0;
+          const satsLeft = Math.max(currentGoal - currentBalance, 0);
+          animateTextUpdate(satsLeftElem, 
+                            `⚡${satsLeft} sats to go until the herd is fed again.⚡`,
+                            animationConfig.dataUpdate.highlightColor,
+                            animationConfig.dataUpdate.originalColorText,
+                            animationConfig.dataUpdate.duration);
+        }
+        debouncedUpdateProgressBar();
+      }
+      
+      function displayReceivedAmount(receivedAmount) {
+        if (receivedAmount > 0) {
+          const overlayText = `⚡ ${Math.round(receivedAmount)} sats ⚡`;
+          satsReceivedOverlay.innerText = overlayText;
+          
+          gsap.fromTo(satsReceivedOverlay, 
+            { opacity: 0, y: 20 }, 
+            { 
+              opacity: 1, 
+              y: 0, 
+              duration: animationConfig.satsReceivedOverlay.entryDuration,
+              ease: "power2.out"
+            }
+          );
+
+          setTimeout(() => {
+            gsap.to(satsReceivedOverlay, { 
+              opacity: 0, 
+              y: -10, 
+              duration: animationConfig.satsReceivedOverlay.exitDuration, 
+              ease: "power2.in",
+              onComplete: () => {
+                updateSatsLeftDisplay(); 
+              }
+            });
+          }, SATS_LEFT_DISPLAY_DURATION - (animationConfig.satsReceivedOverlay.exitDuration * 1000));
+        } else {
+          updateSatsLeftDisplay();
+        }
+      }
+      
+    function updateProgressBar() {
+        if (isFeederAnimating) { 
+            return;
+        }
+
+        const currentProgressVal = (goal > 0) ? (balance / goal) * 100 : 0;
+        if (activeMessages.length > 0 && currentProgressVal < 100) { // If messages active AND not 100% yet
+            return; 
+        }
+
+        if (goal === 0) {
+            gsap.to(progressFill, { width: '0%', duration: animationConfig.progressBar.updateDuration / 1000 });
+            progressFill.classList.remove('is-filling');
+            progressFill.classList.remove('shine-effect'); 
+            progressPercentage.innerText = '0%';
+            return;
+        }
+
+        const progress = Math.min(Math.max(currentProgressVal, 0), 100);
+        progressPercentage.innerText = `${Math.round(progress)}%`;
+
+        if (progress < 100) { // Regular progress update
+            gsap.to(progressFill, { 
+                width: `${progress}%`, 
+                duration: animationConfig.progressBar.updateDuration / 1000 
+            });
+
+            if (progress > 0) {
+                if (!progressFill.classList.contains('is-filling')) {
+                    progressFill.classList.add('is-filling');
+                }
+            } else {
+                if (progressFill.classList.contains('is-filling')) {
+                    progressFill.classList.remove('is-filling');
+                }
+            }
+            progressFill.classList.remove('shine-effect');
+        } else if (progress >= 100 && !isFeederAnimating) { // Goal reached!
+            isFeederAnimating = true; 
+            
+            gsap.killTweensOf(progressFill, "width"); // Stop any message-driven width tweens
+
+            gsap.to(progressFill, { width: '100%', duration: 0.2, onComplete: () => {
+                const tl = gsap.timeline();
+                tl.to(progressContainer, { 
+                    scale: 1.05, 
+                    duration: animationConfig.progressBar.popDuration / 2000, 
+                    yoyo: true, 
+                    repeat: 1, 
+                    ease: "power1.inOut"
+                })
+                .to(progressFill, { 
+                    backgroundColor: "#76FF03", 
+                    duration: animationConfig.progressBar.colorFlashDuration / 2000, 
+                    yoyo: true,
+                    repeat: 1,
+                    ease: "power1.inOut"
+                }, "-=0.1") 
+                .add(() => { 
+                    progressFill.classList.remove('is-filling');
+                    progressFill.classList.add('shine-effect');
+                })
+                .add(() => { 
+                    triggerLightningEffect();
+                    triggerFeederEffect(); 
+                }, `+=${(animationConfig.progressBar.shineDuration / 1000) - 0.1}`);
+            }});
+        }
+    }
+
+    function triggerFeederEffect() { // No changes here
+        feederTriggeredText.style.display = 'block'; 
+        gsap.fromTo(feederTriggeredText,
+          { opacity: 0, scale: animationConfig.feeder.scalingStart },
+          { opacity: 1, scale: 1, duration: 0.5, ease: 'back.out(1.7)' });
+        
+        gsap.to(feederTriggeredText, {
+          opacity: 0,
+          scale: animationConfig.feeder.scalingEnd,
+          duration: 0.5,
+          delay: animationConfig.feeder.effectDuration / 1000 - 0.5, 
+          ease: 'back.in(1.7)',
+          onComplete: () => {
+            feederTriggeredText.style.display = 'none'; 
+            resetProgressBar(); 
+          }
+        });
+    }
+
+    function resetProgressBar() { // Modified to reset flag and re-evaluate messages
+        balance = 0; 
+        // Clear triggered payment hashes when resetting for new cycle
+        triggeredPaymentHashes.clear();
+        // updateSatsLeftDisplay(); // Called at the end of the timeline now
+
+        gsap.set(progressDrainer, { display: 'block', width: '0%', right: '0', left: 'auto' });
+        
+        const tl = gsap.timeline({
+            onComplete: () => {
+                gsap.set(progressDrainer, { display: 'none' });
+                isFeederAnimating = false; // Reset the flag here
+                progressPercentage.innerText = '0%'; // Reset percentage display
+                // Force balance refresh after feeder reset since balance = 0 now
+                fetchBalance().then(() => {
+                    updateSatsLeftDisplay();   // Update display and potentially progress bar
+                    tryDisplayMessage();       // Allow messages to check if they can start
+                });
+            }
+        });
+
+        tl.to(progressDrainer, { 
+            width: '100%', 
+            duration: animationConfig.progressBar.drainDuration / 1000,
+            ease: "power1.inOut"
+        })
+        .to(progressFill, { 
+            width: `0%`, 
+            duration: animationConfig.progressBar.drainDuration / 1000 
+        }, 0); 
+
+        progressFill.classList.remove('is-filling');
+        progressFill.classList.remove('shine-effect');
+    }
+      
+      function addProcessedPaymentHash(hash) {
+        if (processedPaymentHashes.size >= MAX_PROCESSED_HASHES) {
+          const firstHash = processedPaymentHashes.values().next().value;
+          processedPaymentHashes.delete(firstHash);
+        }
+        processedPaymentHashes.add(hash);
+      }
+      
+      let ws;
+      let currentReconnectInterval = RECONNECT_INTERVAL_BASE;
+      
+      function initWebSocket() {
+        ws = new WebSocket(WS_URL);
+        ws.onopen = () => { 
+          console.log('[WebSocket] Connected to:', WS_URL);
+          currentReconnectInterval = RECONNECT_INTERVAL_BASE; 
+        };
+        ws.onerror = (error) => {
+          console.error('[WebSocket] Error:', error);
+        };
+        ws.onmessage = async (event) => {
+          // Log all incoming WebSocket messages for troubleshooting
+          console.log('[WebSocket] Raw message received:', event.data);
+          
+          try {
+            const data = JSON.parse(event.data);
+            console.log('[WebSocket] Parsed message:', data);
+            console.log('[WebSocket] Message type:', data.type || 'unknown');
+            
+            // Handle payment updates if present
+            if (data.payment && data.wallet_balance !== undefined) {
+              console.log('[WebSocket] Processing payment update:', {
+                amount: data.payment.amount,
+                wallet_balance: data.wallet_balance,
+                payment_hash: data.payment.payment_hash
+              });
+              
+              const receivedAmount = data.payment.amount / 1000;
+              const walletBalanceSats = data.wallet_balance;
+              const paymentHash = (data.payment.payment_hash || '').toLowerCase().trim();
+              if (!paymentHash) return;
+              if (processedPaymentHashes.has(paymentHash)) {
+                console.log('[WebSocket] Payment hash already processed:', paymentHash);
+                return;
+              }
+              addProcessedPaymentHash(paymentHash);
+              console.log('[WebSocket] Payment hash added to processed:', paymentHash);
+              
+              // Always update balance to reflect actual wallet state
+              balance = walletBalanceSats;
+              lastSuccessfulBalance = balance;
+              console.log('[WebSocket] Balance updated:', {
+                balance: balance,
+                goal: goal,
+                progress: goal > 0 ? `${((balance / goal) * 100).toFixed(2)}%` : '0%'
+              });
+              
+              if (receivedAmount > 0) {
+                console.log('[WebSocket] Incoming payment detected:', receivedAmount, 'sats');
+                // Only show effects and trigger updates for incoming payments
+                throttledUpdateSatsLeft(receivedAmount, true); 
+                toggleQRCodeImage();
+                
+                // Check if this payment triggers the feeder and we haven't triggered for this payment yet
+                const currentProgress = goal > 0 ? (balance / goal) * 100 : 0;
+                if (currentProgress >= 100 && !triggeredPaymentHashes.has(paymentHash)) {
+                  console.log('[WebSocket] Payment triggers feeder! Hash:', paymentHash);
+                  triggeredPaymentHashes.add(paymentHash);
+                  // The updateProgressBar call will trigger the feeder animation
+                }
+              } else if (receivedAmount < 0) {
+                console.log('[WebSocket] Outgoing payment detected:', receivedAmount, 'sats');
+                // For outgoing payments (wallet emptying), reset progress if balance drops significantly
+                // This provides a backup reset mechanism if the automatic reset fails
+                const previousProgress = goal > 0 ? ((balance - Math.abs(receivedAmount)) / goal) * 100 : 0;
+                const currentProgress = goal > 0 ? (balance / goal) * 100 : 0;
+                
+                if (previousProgress >= 80 && currentProgress <= 20) {
+                  // Wallet was significantly emptied (likely feeder triggered)
+                  // Clear the triggered payment hashes for the next cycle
+                  triggeredPaymentHashes.clear();
+                }
+                
+                throttledUpdateSatsLeft();
+              }
+            }
+            
+            // Handle all messages (payment and CyberHerd events) through unified handler
+            // Skip pure payment messages - they're already fully processed above
+            // Only pass through messages that have a 'type' field (CyberHerd events)
+            if (data.type) {
+              // Serialize back to string for the handler
+              const messageData = typeof event.data === 'string' ? event.data : JSON.stringify(data);
+              console.log('[WebSocket] Passing to handleWebSocketMessage');
+              handleWebSocketMessage(messageData);
+            } else if (data.payment && data.wallet_balance !== undefined) {
+              console.log('[WebSocket] Pure payment message - already processed, skipping handler');
+            } else {
+              // Unknown message structure - pass to handler to see if it can process it
+              console.log('[WebSocket] Unknown message structure - passing to handler');
+              const messageData = typeof event.data === 'string' ? event.data : JSON.stringify(data);
+              handleWebSocketMessage(messageData);
+            }
+            
+          } catch (error) {
+            console.error('[WebSocket] JSON parsing failed:', error);
+            console.log('[WebSocket] Raw data:', event.data);
+            // If JSON parsing fails, pass the raw data to the handler
+            handleWebSocketMessage(event.data);
+          }
+        };
+        ws.onclose = (event) => {
+          console.log('[WebSocket] Connection closed:', {
+            code: event.code,
+            reason: event.reason,
+            wasClean: event.wasClean
+          });
+          console.log('[WebSocket] Reconnecting in', currentReconnectInterval, 'ms');
+          setTimeout(() => {
+            currentReconnectInterval = Math.min(currentReconnectInterval * 2, MAX_RECONNECT_INTERVAL);
+            initWebSocket();
+          }, currentReconnectInterval);
+        };
+      }
+
+      function normalizeCyberherdPayload(payload) {
+        if (!payload || typeof payload !== 'object') {
+          return payload;
+        }
+        const normalized = { ...payload };
+
+        if (!normalized.message) {
+          switch (normalized.type) {
+            case 'headbutt_success': {
+              const attacker = normalized.attacker || normalized.attacker_name || 'Anon';
+              const victim = normalized.victim || normalized.victim_name || 'the herd';
+              const amount = normalized.attacker_amount ?? normalized.amount;
+              normalized.message = amount
+                ? `${attacker} headbutted ${victim} with ${amount} sats`
+                : `${attacker} headbutted ${victim}`;
+              break;
+            }
+            case 'headbutt_failure': {
+              const attacker = normalized.attacker || normalized.attacker_name || 'Anon';
+              const victim = normalized.victim || normalized.victim_name || 'the herd';
+              const required = normalized.required_amount ?? normalized.amount;
+              normalized.message = required
+                ? `${attacker} needs ${required} more sats to beat ${victim}`
+                : `${attacker} could not beat ${victim}`;
+              break;
+            }
+          }
+        }
+
+        return normalized;
+      }
+
+      function cleanMessageText(text) {
+        if (!text) return '';
+        let cleaned = text.replace(/[\r\n]+/g, ' ');
+        cleaned = cleaned.replace(/https?:\/\/[^\s]+/g, '');
+        cleaned = cleaned.replace(/www\.[^\s]+/g, '');
+        cleaned = cleaned.replace(/\s+/g, ' ').trim();
+        return cleaned;
+      }
+
+      function normalizeGoatList(raw) {
+        if (!raw) return null;
+
+        const asArray = Array.isArray(raw) ? raw : [raw];
+        const normalized = [];
+
+        const fallbackImage = (name) => {
+          if (!name) return '';
+          const slug = String(name)
+            .toLowerCase()
+            .replace(/[^a-z0-9]/g, '');
+          return slug ? `images/${slug}.png` : '';
+        };
+
+        for (const entry of asArray) {
+          if (!entry) continue;
+
+          if (typeof entry === 'string') {
+            const name = entry.trim();
+            if (!name) continue;
+            normalized.push({
+              name,
+              imageUrl: fallbackImage(name),
+            });
+            continue;
+          }
+
+          if (Array.isArray(entry)) {
+            const name = entry.length ? String(entry[0] ?? 'Goat') : 'Goat';
+            const imageUrl =
+              entry.length > 3 && entry[3]
+                ? String(entry[3])
+                : fallbackImage(name);
+            normalized.push({
+              name: name || 'Goat',
+              imageUrl: imageUrl || fallbackImage(name),
+            });
+            continue;
+          }
+
+          if (typeof entry === 'object') {
+            const name =
+              entry.name ||
+              entry.display_name ||
+              entry.member_name ||
+              entry.username ||
+              entry.pubkey ||
+              'Goat';
+            const imageUrl =
+              entry.imageUrl ||
+              entry.image_url ||
+              entry.picture ||
+              entry.avatar ||
+              entry.image ||
+              fallbackImage(name);
+            normalized.push({
+              name: String(name || 'Goat'),
+              imageUrl: String(imageUrl || fallbackImage(name)),
+            });
+            continue;
+          }
+        }
+
+        return normalized.length ? normalized : null;
+      }
+
+      function resolveGoatData(obj, depth = 0) {
+        if (!obj || typeof obj !== 'object' || depth > 3) return null;
+
+        if (obj.goat_data) return obj.goat_data;
+        if (obj.goatData) return obj.goatData;
+        if (obj.goats) return obj.goats;
+
+        const nestedCandidates = ['values', 'payload', 'data', 'message'];
+        for (const key of nestedCandidates) {
+          if (!obj[key]) continue;
+          const nested = resolveGoatData(obj[key], depth + 1);
+          if (nested) return nested;
+        }
+        return null;
+      }
+
+      function buildFallbackMessage(eventType, dataObj) {
+        const getNested = (obj, key) => {
+          if (!obj || typeof obj !== 'object') return undefined;
+          if (key in obj) return obj[key];
+          for (const candidate of ['payload', 'values', 'data']) {
+            if (obj[candidate] && typeof obj[candidate] === 'object' && key in obj[candidate]) {
+              return obj[candidate][key];
+            }
+          }
+          return undefined;
+        };
+
+        const firstString = (...candidates) => {
+          for (const candidate of candidates) {
+            if (typeof candidate === 'string' && candidate.trim()) {
+              return candidate.trim();
+            }
+          }
+          return '';
+        };
+
+        const safe = (value, fallback) =>
+          typeof value === 'string' && value.trim() ? value.trim() : fallback;
+
+        const getMemberName = () =>
+          safe(
+            firstString(
+              getNested(dataObj, 'member_display_name'),
+              getNested(dataObj, 'member_name'),
+              getNested(dataObj, 'name'),
+              dataObj?.member_display_name,
+              dataObj?.member_name,
+              dataObj?.name
+            ),
+            'A member'
+          );
+
+        switch (eventType) {
+          case 'new_member': {
+            const name = getMemberName();
+            const amount =
+              getNested(dataObj, 'initial_amount') ??
+              getNested(dataObj, 'increase_amount') ??
+              dataObj?.initial_amount;
+            if (amount) {
+              return `${name} joined with ${amount} sats.`;
+            }
+            return `${name} joined the CyberHerd.`;
+          }
+          case 'member_increase': {
+            const name = getMemberName();
+            const amount =
+              getNested(dataObj, 'increase_amount') ??
+              dataObj?.increase_amount;
+            if (amount) {
+              return `${name} increased by ${amount} sats.`;
+            }
+            return `${name} increased contribution.`;
+          }
+          case 'cyber_herd':
+          case 'cyber_herd_update':
+          case 'cyberherd_update':
+            return 'CyberHerd roster updated.';
+          case 'feeder_triggered':
+          case 'feeder_trigger_bolt12':
+          case 'feeder_trigger':
+            return 'Feeder triggered!';
+          case 'sats_received':
+          case 'sats_received_zap': {
+            const amount =
+              getNested(dataObj, 'new_amount') ??
+              getNested(dataObj, 'sats_received') ??
+              dataObj?.new_amount;
+            if (amount) {
+              return `CyberHerd received ${amount} sats.`;
+            }
+            return 'CyberHerd received sats.';
+          }
+          case 'cyber_herd_treats': {
+            const name = getMemberName();
+            const amount =
+              getNested(dataObj, 'new_amount') ?? dataObj?.new_amount;
+            if (amount) {
+              return `${name} received ${amount} sats from the herd.`;
+            }
+            return `${name} received treats.`;
+          }
+          default:
+            return '';
+        }
+      }
+
+      function handleWebSocketMessage(data) {
+        console.log('[handleWebSocketMessage] Processing message');
+        try {
+            if (data.trim().startsWith('{') && data.trim().endsWith('}')) {
+            let jsonData = JSON.parse(data);
+            console.log('[handleWebSocketMessage] Parsed JSON:', jsonData);
+            
+            // Normalize CyberHerd payloads (fill in missing message fields)
+            jsonData = normalizeCyberherdPayload(jsonData);
+            console.log('[handleWebSocketMessage] After normalization:', jsonData);
+
+            // Check for nested JSON in the message property
+            if (jsonData.message && typeof jsonData.message === 'string') {
+                try {
+                    const nestedData = JSON.parse(jsonData.message);
+                    // If parsing succeeds, merge nested data into the main object
+                    // The nested data's properties will overwrite if there are conflicts
+                    jsonData = { ...jsonData, ...nestedData };
+                } catch (e) {
+                    // Not a nested JSON string, proceed as normal
+                }
+            }
+            
+            // Handle specific message types
+            const eventType = (jsonData.type || '').toString();
+            console.log('[handleWebSocketMessage] Handling message type:', eventType);
+
+            const rawGoatData = resolveGoatData(jsonData);
+            let displayGoats = normalizeGoatList(rawGoatData);
+            let messageQueued = false;
+
+            switch(eventType) {
+                case "connection_established":
+                    console.log('[handleWebSocketMessage] Connection established message - skipping');
+                    return; // Skip connection messages
+                
+                case "cyber_herd":
+                    console.log('[handleWebSocketMessage] cyber_herd message:', jsonData);
+                    fetchSpotsRemaining(); 
+                    if(jsonData.members && Array.isArray(jsonData.members)) {
+                        console.log('[handleWebSocketMessage] Displaying', jsonData.members.length, 'CyberHerd members');
+                        displayCyberHerdMembers(jsonData.members, jsonData.newest_pubkey || null);
+                    }
+                    break;
+
+                case "cyber_herd_update":
+                case "cyberherd_update":
+                case "kind_6_repost":
+                case "kind_7_reaction":
+                case "zapper_displaces_kind_6":
+                case "zapper_displaces_kind_7":
+                    console.log('[handleWebSocketMessage] cyberherd_update message:', jsonData);
+                    fetchSpotsRemaining();
+                    if (jsonData.members && Array.isArray(jsonData.members)) {
+                        console.log('[handleWebSocketMessage] Updating', jsonData.members.length, 'CyberHerd members');
+                        displayCyberHerdMembers(jsonData.members, jsonData.newest || jsonData.newest_pubkey || null);
+                    }
+                    break;
+                
+                case "feeder_trigger":
+                case "feeder_triggered":
+                case "feeder_trigger_bolt12":
+                    console.log('[handleWebSocketMessage] feeder_triggered message:', jsonData);
+                    // Only force trigger feeder animation if not already running AND balance isn't already at goal
+                    if (!isFeederAnimating && balance < goal) {
+                        console.log('[handleWebSocketMessage] Force triggering feeder animation');
+                        balance = goal; // Force 100% to trigger feeder effect
+                        updateProgressBar();
+                    }
+                    // Check for goat data in feeder_triggered messages
+                    if (displayGoats) {
+                        console.log('[handleWebSocketMessage] Feeder has goat data:', displayGoats);
+                        addMessageToQueue(jsonData.message || cleanMessageText(data), displayGoats);
+                        messageQueued = true;
+                    }
+                    break;
+                
+                case "herd_reset":
+                    console.log('[handleWebSocketMessage] herd_reset message');
+                    // Reset CyberHerd display
+                    const accordionContainer = document.getElementById('accordion-container');
+                    accordionContainer.style.display = 'none';
+                    fetchSpotsRemaining();
+                    break;
+                
+                case "sats_received":
+                case "sats_received_zap":
+                case "member_increase":
+                case "new_member":
+                case "cyber_herd_treats":
+                    console.log('[handleWebSocketMessage]', eventType, 'message:', jsonData);
+                    // Refresh spots remaining for member-related events
+                    fetchSpotsRemaining();
+                    // Check for goat data in sats_received messages
+                    if ((eventType === "sats_received" || eventType === "sats_received_zap") && displayGoats) {
+                        console.log('[handleWebSocketMessage] sats_received has goat data:', displayGoats);
+                        addMessageToQueue(jsonData.message || cleanMessageText(data), displayGoats);
+                        messageQueued = true;
+                        break;
+                    }
+                    // For member_increase events, add the message to the scrolling display
+                    if (eventType === "member_increase") {
+                        console.log('[handleWebSocketMessage] Adding member_increase message to queue');
+                        addMessageToQueue(jsonData.message || cleanMessageText(data), displayGoats);
+                        messageQueued = true;
+                    }
+                    break;
+                
+                case "headbutt_attempt":
+                case "headbutt_success":
+                case "headbutt_failure":
+                case "kind_6_headbutt_failure":
+                case "kind_7_headbutt_failure":
+                    console.log('[handleWebSocketMessage]', eventType, 'message:', jsonData);
+                    // Could add special visual effects for headbutts
+                    fetchSpotsRemaining();
+                    if (!jsonData.message) {
+                        const attacker = jsonData.attacker || jsonData.attacker_name || 'Anon';
+                        const victim = jsonData.victim || jsonData.victim_name || 'the herd';
+                        if (eventType === "headbutt_success") {
+                            const amount = jsonData.attacker_amount ?? jsonData.amount;
+                            jsonData.message = amount
+                              ? `${attacker} headbutted ${victim} with ${amount} sats`
+                              : `${attacker} headbutted ${victim}`;
+                        } else if (eventType === "headbutt_failure" || eventType === "kind_6_headbutt_failure" || eventType === "kind_7_headbutt_failure") {
+                            const required = jsonData.required_amount ?? jsonData.amount;
+                            jsonData.message = required
+                              ? `${attacker} needs ${required} more sats to beat ${victim}`
+                              : `${attacker} could not beat ${victim}`;
+                        }
+                    }
+                    break;
+                
+                case "interface_info":
+                    console.log('[handleWebSocketMessage] interface_info message:', jsonData);
+                    // Informational messages - just add to queue
+                    break;
+                
+                case "payment_metrics":
+                    console.log('[handleWebSocketMessage] payment_metrics message:', jsonData);
+                    // Backend now sends pre-formatted messages
+                    break;
+                
+                case "system_status":
+                    console.log('[handleWebSocketMessage] system_status message:', jsonData);
+                    // Backend now sends pre-formatted messages
+                    // Update progress bar if balance info is available
+                    if (jsonData.current_balance !== undefined && jsonData.trigger_amount !== undefined) {
+                        console.log('[handleWebSocketMessage] Updating balance from system_status:', {
+                            balance: jsonData.current_balance,
+                            goal: jsonData.trigger_amount
+                        });
+                        balance = jsonData.current_balance;
+                        goal = jsonData.trigger_amount;
+                        updateProgressBar();
+                    }
+                    break;
+                
+                case "weather_status":
+                    console.log('[handleWebSocketMessage] weather_status message:', jsonData);
+                    // Backend now sends pre-formatted messages
+                    break;
+                
+                default: {
+                    const isKindEvent = eventType.startsWith("kind_6") || eventType.startsWith("kind_7");
+                    const isHeadbuttKind = isKindEvent && eventType.includes("headbutt");
+                    const isRosterKind =
+                        (isKindEvent && !isHeadbuttKind) ||
+                        eventType.startsWith("zapper_displaces_kind_");
+
+                    if (isHeadbuttKind) {
+                        console.log('[handleWebSocketMessage] Treating', eventType, 'as headbutt event');
+                        fetchSpotsRemaining();
+                        break;
+                    }
+
+                    if (isRosterKind) {
+                        console.log('[handleWebSocketMessage] Treating', eventType, 'as roster update event');
+                        fetchSpotsRemaining();
+                        if (jsonData.members && Array.isArray(jsonData.members)) {
+                            displayCyberHerdMembers(jsonData.members, jsonData.newest || jsonData.newest_pubkey || null);
+                        }
+                        break;
+                    }
+
+                    console.log('[handleWebSocketMessage] Unknown message type:', eventType);
+                    // Unknown message type - handle normally
+                    break;
+                }
+            }
+
+            if (!messageQueued) {
+                let messageText =
+                    jsonData.message ||
+                    jsonData.content ||
+                    (jsonData.values && jsonData.values.message) ||
+                    '';
+                let cleanedMessage = cleanMessageText(messageText);
+                if (!cleanedMessage && displayGoats) {
+                    cleanedMessage = displayGoats.map((g) => g.name).join(' ⚡ ');
+                }
+                 if (!cleanedMessage) {
+                    cleanedMessage = buildFallbackMessage(eventType, jsonData) || '';
+                 }
+                if (cleanedMessage || displayGoats) {
+                    console.log('[handleWebSocketMessage] Adding message to queue:', cleanedMessage);
+                    addMessageToQueue(cleanedMessage || '⚡ CyberHerd Update ⚡', displayGoats);
+                }
+            }
+            } else {
+            console.log('[handleWebSocketMessage] Not JSON, treating as plain text');
+            const cleanedMessage = cleanMessageText(data);
+            if (cleanedMessage) {
+                console.log('[handleWebSocketMessage] Adding plain text to queue:', cleanedMessage);
+                addMessageToQueue(cleanedMessage);
+            }
+            }
+        } catch (e) {
+            console.error('[handleWebSocketMessage] Error processing message:', e);
+            console.log('[handleWebSocketMessage] Problematic data:', data);
+            const cleanedMessage = cleanMessageText(data);
+            if (cleanedMessage) {
+                console.log('[handleWebSocketMessage] Adding error fallback message to queue:', cleanedMessage);
+                addMessageToQueue(cleanedMessage);
+            }
+        }
+      }
+      
+      class ImageCache {
+        constructor(cacheName = 'lg-image-cache-v1') {
+          this.cacheName = cacheName;
+          this.cacheSupported = 'caches' in window;
+          this.loadedImages = new Set(); 
+        }
+        async initCache() {
+          if (!this.cacheSupported) return false;
+          try {
+            this.cache = await caches.open(this.cacheName);
+            return true;
+          } catch (error) { return false; }
+        }
+        async preloadImages(imageUrls) {
+          if (!this.cacheSupported || !this.cache) return;
+          const cachePromises = imageUrls.map(url => this.cacheImage(url, true));
+          try { await Promise.allSettled(cachePromises); } catch (error) {}
+        }
+        async cacheImage(url, silent = false) {
+          if (!this.cacheSupported || !this.cache || !url) return url;
+          if (this.loadedImages.has(url)) return url;
+          try {
+            const cacheResponse = await this.cache.match(url);
+            if (cacheResponse) { this.loadedImages.add(url); return url; }
+            const fetchResponse = await fetch(url, { mode: 'no-cors', cache: 'no-cache' });
+            if (fetchResponse && fetchResponse.status === 200) {
+              await this.cache.put(url, fetchResponse.clone());
+              this.loadedImages.add(url);
+            }
+            return url;
+          } catch (error) { return url; }
+        }
+        async getImage(url) {
+          if (!this.cacheSupported || !this.cache || !url) return url;
+          try {
+            const cachedResponse = await this.cache.match(url);
+            if (cachedResponse) { this.loadedImages.add(url); return url; }
+            await this.cacheImage(url);
+            return url;
+          } catch (error) { return url; }
+        }
+        async cleanCache(maxAgeDays = 7) {
+          if (!this.cacheSupported) return;
+          try {
+            const cache = await caches.open(this.cacheName);
+            const cachedRequests = await cache.keys();
+            const now = Date.now();
+            const maxAge = maxAgeDays * 24 * 60 * 60 * 1000;
+            for (const request of cachedRequests) {
+              const response = await cache.match(request);
+              if (response) {
+                const dateHeader = response.headers.get('date');
+                if (dateHeader) {
+                  const cacheDate = new Date(dateHeader).getTime();
+                  if (now - cacheDate > maxAge) await cache.delete(request);
+                }
+              }
+            }
+          } catch (error) {}
+        }
+      }
+      const imageCache = new ImageCache();
+      
+      function getPreloadImageUrls() {
+        const urls = [];
+        Object.values(goats).forEach(goat => { if (goat.img) urls.push(goat.img); });
+        urls.push('images/qr.png', 'images/lightning.png', 'images/lightninggoatslogo1.png');
+        return urls.filter(Boolean);
+      }
+      
+      function createCachedImage(url, alt, title, options = {}) {
+        const img = document.createElement('img');
+        if (url && imageCache.cacheSupported) {
+          if (options.placeholder) img.src = options.placeholder;
+          imageCache.getImage(url).then(cachedUrl => { img.src = cachedUrl; })
+                          .catch(() => { img.src = url; });
+        } else { img.src = url; }
+        if (alt) img.alt = alt;
+        if (title) img.title = title;
+        img.onerror = () => { img.src = options.fallback || "images/lightninggoatslogo1.png"; };
+        return img;
+      }
+      
+      function displayAccordion(items) {
+        if (items.length > 0 && items[0].isUser) return true; 
+        
+        const accordionContainer = document.getElementById('accordion-container');
+        accordionContainer.innerHTML = ""; 
+        if (!items || items.length === 0) return false;
+        
+        items.forEach(item => {
+          if (!item.imageUrl) return;
+          const div = document.createElement('div');
+          div.className = 'accordion-item';
+          const content = document.createElement('div');
+          content.className = 'accordion-content';
+          const profileContainer = document.createElement('div');
+          profileContainer.className = 'user-profile-container';
+          const img = createCachedImage(item.imageUrl, item.name, item.name);
+          profileContainer.appendChild(img);
+          const textContainer = document.createElement('div');
+          textContainer.className = 'user-profile-text';
+          const nameElement = document.createElement('span');
+          nameElement.className = 'user-profile-name';
+          nameElement.innerText = item.name || "Goat";
+          textContainer.appendChild(nameElement);
+          profileContainer.appendChild(textContainer);
+          content.appendChild(profileContainer);
+          div.appendChild(content);
+          accordionContainer.appendChild(div);
+        });
+        
+        showAccordionContainer(true); 
+        return true;
+      }
+      
+      function toggleQRCodeImage() {
+        gsap.to(qrCodeImg, {
+          duration: animationConfig.qrCode.flashDuration / 1000,
+          opacity: 0,
+          onComplete: () => {
+            qrCodeImg.style.display = 'none';
+            lightningImg.style.display = 'block';
+            gsap.to(lightningImg, { 
+              duration: animationConfig.qrCode.flashDuration / 1000, 
+              opacity: 1 
+            });
+          }
+        });
+        setTimeout(() => {
+          gsap.to(lightningImg, {
+            duration: 0.5,
+            opacity: 0,
+            onComplete: () => {
+              lightningImg.style.display = 'none';
+              qrCodeImg.style.display = 'block';
+              gsap.to(qrCodeImg, { duration: 0.5, opacity: 1 });
+            }
+          });
+        }, animationConfig.qrCode.displayDuration);
+      }
+      
+      function updateCurrentTime() {
+        const now = new Date();
+        currentTimeElem.innerText = formatTime(now);
+      }
+      
+      async function fetchTemperature() {
+        try {
+          const data = await fetchData(`http://192.168.1.161:5000/get_received_data`);
+          const temp = data.AmbientWeatherWS2902A_WeatherDataWs2902a_Temperature;
+          if (temp !== undefined) {
+            const temperature = Math.round(temp);
+            currentTempElem.innerText = `${temperature} °F`;
+          }
+        } catch (error) {}
+      }
+      
+      function triggerLightningEffect() { // No changes here
+        const lightningEffect = document.getElementById('lightning-effect');
+        const bodyEl = document.body;
+
+        lightningEffect.style.display = 'block';
+        bodyEl.classList.remove('lightning-flash-on'); 
+
+        let flashCount = 0;
+        const flash = () => {
+            if (flashCount >= animationConfig.lightning.flashCount) {
+                lightningEffect.style.display = 'none';
+                bodyEl.classList.remove('lightning-flash-on'); 
+                return;
+            }
+            bodyEl.classList.add('lightning-flash-on');
+            gsap.to(lightningEffect, {
+                opacity: 1,
+                duration: animationConfig.lightning.flashDuration / 2000, 
+                onComplete: () => {
+                    bodyEl.classList.remove('lightning-flash-on');
+                    gsap.to(lightningEffect, {
+                        opacity: 0,
+                        duration: animationConfig.lightning.flashDuration / 2000, 
+                        onComplete: () => {
+                            flashCount++;
+                            flash();
+                        }
+                    });
+                }
+            });
+        };
+        flash();
+      }
+      
+      document.addEventListener('DOMContentLoaded', async function () {
+        try {
+          await imageCache.initCache();
+          imageCache.preloadImages(getPreloadImageUrls());
+          
+          updateCurrentTime(); 
+          satsLeftElem.innerText = `⚡Loading...⚡`;
+          currentTempElem.innerText = `-- °F`;
+          spotsRemainingElem.innerText = `CyberHerd spots left: --`;
+          if (btcPriceElem) {
+            btcPriceElem.innerText = 'BTC: --';
+            btcPriceElem.style.color = animationConfig.dataUpdate.originalColorText;
+          }
+          if (btcChangeElem) {
+            btcChangeElem.classList.remove('btc-change-positive', 'btc-change-negative');
+            btcChangeElem.innerText = '(24h: --)';
+            btcChangeElem.style.color = animationConfig.dataUpdate.originalColorText;
+          }
+          
+          // Initialize single unified WebSocket connection
+          initWebSocket();
+          
+          const fetchPromises = [
+            fetchGoal(),
+            fetchBalance(),
+            fetchSpotsRemaining(),
+            fetchTemperature(),
+            fetchBitcoinData()
+          ];
+          await Promise.allSettled(fetchPromises);
+          
+          updateSatsLeftDisplay();
+          
+          setInterval(fetchTemperature, FETCH_INTERVAL);
+          setInterval(fetchBitcoinData, BTC_FETCH_INTERVAL);
+          setInterval(updateCurrentTime, 1000);
+          setTimeout(() => { imageCache.cleanCache(7); }, 60000); 
+          
+        } catch (error) {
+          updateCurrentTime();
+          satsLeftElem.innerText = `⚡Connect to see sats progress⚡`;
+        }
+      });
+
+      const styleSheet = document.createElement("style");
+      styleSheet.textContent = `
+        #scrolling-comment .message-separator {
+          color: ${animationConfig.message.separatorColor};
+          font-weight: bold;
+          margin: 0 10px;
+          display: inline-block;
+        }
+      `;
+      document.head.appendChild(styleSheet);
+      
+      function displayCyberHerdMembers(members, newestPubkey = null) {
+        if (!members || !Array.isArray(members) || members.length === 0) return false;
+        
+        // Update spots remaining when members are displayed
+        fetchSpotsRemaining();
+        
+        const accordionContainer = document.getElementById('accordion-container');
+        accordionContainer.innerHTML = ""; 
+        
+        const sortedMembers = members.sort((a, b) => {
+          const amountA = a.amount || 0;
+          const amountB = b.amount || 0;
+          return amountB - amountA; // Highest amount first
+        });
+        const displayMembers = sortedMembers.slice(0, MAX_DISPLAYED_MEMBERS);
+        
+        displayMembers.forEach(member => {
+          const pubkey = member.pubkey || "";
+          const imageUrl = member.picture || member.imageUrl || "";
+          const name = member.display_name || member.name || "Anon";
+          const amount = member.amount || 0;
+          const isNewest = newestPubkey ? pubkey === newestPubkey : member.is_newest;
+          
+          if (!imageUrl) return;
+          
+          const div = document.createElement('div');
+          div.className = 'accordion-item user-profile';
+          const content = document.createElement('div');
+          content.className = 'accordion-content user-profile';
+          
+          // Add CyberHerd label
+          const cyberHerdLabel = document.createElement('span');
+          cyberHerdLabel.className = 'cyberherd-label';
+          cyberHerdLabel.innerText = 'CyberHerd';
+          content.appendChild(cyberHerdLabel);
+          
+          const img = createCachedImage(imageUrl, name, name, { fallback: "images/lightninggoatslogo1.png" });
+          const profileContainer = document.createElement('div');
+          profileContainer.className = 'user-profile-container';
+          profileContainer.appendChild(img);
+          const textContainer = document.createElement('div');
+          textContainer.className = 'user-profile-text';
+          const nameElement = document.createElement('span');
+          nameElement.className = 'user-profile-name';
+          nameElement.innerText = name;
+          textContainer.appendChild(nameElement);
+          if (amount > 0) {
+            const zapElement = document.createElement('span');
+            zapElement.className = 'user-profile-zap';
+            zapElement.innerText = `⚡ ${amount} sats`;
+            textContainer.appendChild(zapElement);
+          }
+          profileContainer.appendChild(textContainer);
+          content.appendChild(profileContainer);
+          if (isNewest) {
+            content.style.border = "2px solid #ffdb58";
+            div.dataset.newest = "true";
+          }
+          div.appendChild(content);
+          accordionContainer.appendChild(div);
+        });
+        
+        showAccordionContainer(true); 
+        return true;
+      }
+      
+      function showAccordionContainer(staggerItems = false) {
+        const accordionContainer = document.getElementById('accordion-container');
+        if (accordionTimeout) clearTimeout(accordionTimeout);
+        
+        // Show accordion
+        accordionContainer.style.display = 'flex';
+        
+        // Animate accordion in
+        gsap.to(accordionContainer, {
+          opacity: 1,
+          x: 0, 
+          duration: animationConfig.accordion.transitionDuration / 1000,
+          onComplete: () => {
+            if (staggerItems) {
+                gsap.to(".accordion-item", {
+                    opacity: 1,
+                    duration: 0.5, 
+                    stagger: animationConfig.accordion.itemStagger,
+                    ease: "power1.out"
+                });
+            } else {
+                gsap.set(".accordion-item", { opacity: 1 });
+            }
+          }
+        });
+        
+        accordionTimeout = setTimeout(() => {
+          // Animate accordion out
+          gsap.to(accordionContainer, {
+            opacity: 0,
+            x: -100, 
+            duration: animationConfig.accordion.transitionDuration / 1000,
+            onComplete: () => {
+              accordionContainer.style.display = 'none';
+              gsap.set(".accordion-item", { opacity: 0 });
+            }
+          });
+        }, animationConfig.accordion.displayDuration);
+      }
+    })();
+  </script>
+</body>
+</html>
