@@ -1327,9 +1327,7 @@ async def add_new_active_member(member_data: dict, user_id: str | None = None):
         else:
             values["kinds"] = None
 
-    try:
-        await db.execute(
-            f"""INSERT INTO {db.references_schema}cyber_herd (
+    insert_sql = f"""INSERT INTO {db.references_schema}cyber_herd (
                 pubkey, user_id, display_name, event_id, note, kinds, nprofile, lud16,
                 nip05, payouts, amount, picture, relays, metadata_last_checked_at, is_active
             ) VALUES (
@@ -1351,21 +1349,24 @@ async def add_new_active_member(member_data: dict, user_id: str | None = None):
                 relays = excluded.relays,
                 metadata_last_checked_at = excluded.metadata_last_checked_at,
                 is_active = 1
-            """,
-            values,
-        )
-    except Exception as e:
-        err_msg = str(e).lower()
-        # If table missing, attempt bootstrap then re-raise meaningful error
-        if any(t in err_msg for t in ["undefinedtable", "does not exist", "no such table"]):
-            await _bootstrap_cyberherd_tables()
-            # Re-raise so calling code/test can surface the issue; migrations should have run
-            raise RuntimeError("cyberherd: add_new_active_member failed because cyber_herd table was missing; migrations must run") from e
-        # If user_id column is missing or other schema mismatch, fail fast
-        if any(t in err_msg for t in ["no such column", "column", "user_id"]):
-            logger.error(f"cyberherd: add_new_active_member failed: missing user_id column in cyber_herd schema: {e}")
-            raise RuntimeError("cyberherd: add_new_active_member failed because user_id column is missing; run migrations") from e
-        raise
+            """
+    for attempt in range(2):
+        try:
+            await db.execute(insert_sql, values)
+            break
+        except Exception as e:
+            err_msg = str(e).lower()
+            if attempt == 0 and any(
+                t in err_msg for t in ["undefinedtable", "does not exist", "no such table", "no such column", "undefined column"]
+            ):
+                await _bootstrap_cyberherd_tables()
+                continue
+            if any(t in err_msg for t in ["no such column", "undefined column"]):
+                logger.error(f"cyberherd: add_new_active_member failed due to missing column: {e}")
+                raise RuntimeError(
+                    "cyberherd: add_new_active_member failed because the cyber_herd schema is missing required columns; run migrations"
+                ) from e
+            raise
     
     try:
         await recompute_member_payouts(user_id)
@@ -1473,8 +1474,7 @@ async def update_and_activate_member(
         except Exception:
             nip05_normalized = None
 
-    result = await db.execute(
-        f"""
+    update_sql = f"""
         UPDATE {db.references_schema}cyber_herd
         SET amount = amount + :amount_increase,
             payouts = payouts + :payouts_increase,
@@ -1483,17 +1483,34 @@ async def update_and_activate_member(
             event_id = COALESCE(:event_id, event_id),
             nip05 = COALESCE(:nip05, nip05)
         WHERE pubkey = :pubkey AND user_id = :user_id
-        """,
-        {
-            "amount_increase": ai,
-            "payouts_increase": payouts_increase,
-            "ts": int(time.time()),
-            "pubkey": normalized_pubkey,
-            "user_id": user_id,
-            "event_id": event_id,
-            "nip05": nip05_normalized,
-        },
-    )
+        """
+    params = {
+        "amount_increase": ai,
+        "payouts_increase": payouts_increase,
+        "ts": int(time.time()),
+        "pubkey": normalized_pubkey,
+        "user_id": user_id,
+        "event_id": event_id,
+        "nip05": nip05_normalized,
+    }
+    result = None
+    for attempt in range(2):
+        try:
+            result = await db.execute(update_sql, params)
+            break
+        except Exception as e:
+            err_msg = str(e).lower()
+            if attempt == 0 and any(
+                t in err_msg for t in ["undefinedtable", "does not exist", "no such table", "no such column", "undefined column"]
+            ):
+                await _bootstrap_cyberherd_tables()
+                continue
+            if any(t in err_msg for t in ["no such column", "undefined column"]):
+                logger.error(f"cyberherd: update_and_activate_member failed due to missing column: {e}")
+                raise RuntimeError(
+                    "cyberherd: update_and_activate_member failed because the cyber_herd schema is missing required columns; run migrations"
+                ) from e
+            raise
     # If no rows were updated, target row doesn't exist for this user. Fail fast
     # to avoid mutating legacy/global rows.
     if result.rowcount == 0:
@@ -1686,8 +1703,15 @@ async def _bootstrap_cyberherd_tables():
 
     Mirrors middleware structure; safe, idempotent. Called on UndefinedTableError.
     """
+    schema_prefix = db.references_schema or ""
+    table_name = f"{schema_prefix}cyber_herd"
+    if schema_prefix.endswith("."):
+        schema_table = f"{schema_prefix[:-1]}.cyber_herd"
+    else:
+        schema_table = table_name
+
     stmts = [
-        """CREATE TABLE IF NOT EXISTS cyber_herd (
+        f"""CREATE TABLE IF NOT EXISTS {table_name} (
             pubkey TEXT PRIMARY KEY,
             user_id TEXT,
             display_name TEXT,
@@ -1706,15 +1730,15 @@ async def _bootstrap_cyberherd_tables():
             is_active INTEGER DEFAULT 0
         );""",
         # Basic helpful indexes
-        "CREATE INDEX IF NOT EXISTS idx_cyberherd_active ON cyber_herd(is_active);",
-        "CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_id ON cyber_herd(user_id);",
-        "CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_active ON cyber_herd(user_id, is_active);",
+        f"CREATE INDEX IF NOT EXISTS idx_cyberherd_active ON {table_name}(is_active);",
+        f"CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_id ON {table_name}(user_id);",
+        f"CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_active ON {table_name}(user_id, is_active);",
     ]
     # Ensure processed_events table exists for idempotent runtime self-heal
     # This table tracks processed payments to prevent duplicate member_increase posts
     stmts.append(
-        """
-        CREATE TABLE IF NOT EXISTS processed_events (
+        f"""
+        CREATE TABLE IF NOT EXISTS {db.references_schema}processed_events (
             user_id TEXT NOT NULL,
             event_hash TEXT NOT NULL,
             note_id TEXT,
@@ -1726,8 +1750,8 @@ async def _bootstrap_cyberherd_tables():
     )
     # Legacy processed_zaps table (kept for backward compatibility)
     stmts.append(
-        """
-        CREATE TABLE IF NOT EXISTS processed_zaps (
+        f"""
+        CREATE TABLE IF NOT EXISTS {db.references_schema}processed_zaps (
             user_id TEXT,
             event_id TEXT,
             note_id TEXT,
@@ -1738,8 +1762,8 @@ async def _bootstrap_cyberherd_tables():
         """
     )
     stmts.append(
-        """
-        CREATE TABLE IF NOT EXISTS zap_totals (
+        f"""
+        CREATE TABLE IF NOT EXISTS {db.references_schema}zap_totals (
             user_id TEXT NOT NULL,
             zapper_pubkey TEXT NOT NULL,
             total_sats INTEGER NOT NULL DEFAULT 0,
@@ -1753,12 +1777,16 @@ async def _bootstrap_cyberherd_tables():
         );
         """
     )
-    stmts.append("ALTER TABLE cyber_herd ADD COLUMN nip05 TEXT;")
     for s in stmts:
         try:
             await db.execute(s)
         except Exception:
             pass
+    try:
+        if not await _column_exists(schema_table, "nip05"):
+            await db.execute(f"ALTER TABLE {table_name} ADD COLUMN nip05 TEXT;")
+    except Exception:
+        pass
     try:
         logger.info("Cyberherd runtime bootstrap: ensured cyber_herd table with user_id")
     except Exception:
