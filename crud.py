@@ -1285,6 +1285,44 @@ async def add_new_active_member(member_data: dict, user_id: str | None = None):
     except Exception:
         values["kinds"] = member_data.get("kinds")
     
+    # Merge sanitized kinds with any existing stored kinds so we never overwrite
+    # previous engagement categories (e.g. keep both zap=9735 and reaction=7)
+    existing_kinds_row = None
+    try:
+        existing_kinds_row = await db.fetchone(
+            f"SELECT kinds FROM {db.references_schema}cyber_herd WHERE pubkey = :pubkey AND user_id = :user_id",
+            {"pubkey": normalized_pubkey, "user_id": user_id},
+        )
+    except Exception as e:
+        try:
+            logger.debug(f"cyberherd: add_new_active_member kinds lookup skipped: {e}")
+        except Exception:
+            pass
+
+    if existing_kinds_row:
+        existing_raw = None
+        try:
+            existing_raw = existing_kinds_row.get("kinds")
+        except Exception:
+            try:
+                existing_raw = existing_kinds_row["kinds"]  # type: ignore[index]
+            except Exception:
+                existing_raw = None
+
+        existing_set = {k for k in (existing_raw or "").split(",") if k}
+        new_set = {k for k in (values.get("kinds") or "").split(",") if k}
+
+        merged_set = existing_set.union(new_set) if new_set else existing_set
+
+        if merged_set:
+            try:
+                merged_list = sorted(merged_set, key=lambda x: int(x))
+            except Exception:
+                merged_list = sorted(merged_set)
+            values["kinds"] = ",".join(merged_list)
+        else:
+            values["kinds"] = None
+
     try:
         await db.execute(
             f"""INSERT INTO {db.references_schema}cyber_herd (
