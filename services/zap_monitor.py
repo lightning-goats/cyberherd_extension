@@ -26,7 +26,7 @@ import asyncio
 import json
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional, cast
+from typing import Any, Optional, Tuple, cast
 import re
 
 from loguru import logger
@@ -151,6 +151,107 @@ class ZapMonitorService:
             if re.fullmatch(r"[0-9a-f]{64}", candidate):
                 return candidate
         return None
+
+    @staticmethod
+    def _parse_a_tag_address(address: str) -> tuple[int | None, str | None, str | None]:
+        """Parse an 'a' tag address string into (kind, pubkey, identifier)."""
+        if not isinstance(address, str):
+            return None, None, None
+        parts = address.split(":")
+        if len(parts) < 3:
+            return None, None, None
+        kind_part, pubkey_part, *rest = parts
+        try:
+            kind = int(kind_part)
+        except Exception:
+            return None, None, None
+        pubkey = pubkey_part.strip().lower() if pubkey_part else None
+        identifier = ":".join(rest).strip() if rest else None
+        if identifier == "":
+            identifier = None
+        return kind, pubkey, identifier
+
+    async def _resolve_note_from_addresses(
+        self,
+        settings,
+        address_candidates: list[str],
+    ) -> tuple[str | None, str | None]:
+        """Resolve note id and author from provided NIP-33 address candidates."""
+        if not address_candidates:
+            return None, None
+
+        try:
+            address_map = dict(getattr(settings, "tracked_event_addresses", {}) or {})
+        except Exception:
+            address_map = {}
+
+        # Prefer address matches already cached in settings
+        inverse: dict[str, str] = {}
+        for note_id, addr in address_map.items():
+            if isinstance(note_id, str) and isinstance(addr, str):
+                inverse[addr] = note_id.strip().lower()
+
+        for address in address_candidates:
+            note_id = inverse.get(address)
+            if note_id and re.fullmatch(r"[0-9a-f]{64}", note_id):
+                _, author, _ = self._parse_a_tag_address(address)
+                author_norm = author.strip().lower() if isinstance(author, str) else None
+                return note_id, author_norm
+
+        # Fallback to querying relays when cache is missing
+        if not nostr_helpers or not hasattr(nostr_helpers, "check_availability"):
+            return None, None
+        try:
+            available = nostr_helpers.check_availability()
+        except Exception:
+            available = False
+        if not available:
+            return None, None
+
+        for address in address_candidates:
+            kind, author, identifier = self._parse_a_tag_address(address)
+            if kind is None or not author:
+                continue
+            filters = {"kinds": [kind], "authors": [author]}
+            if identifier:
+                filters["#d"] = [identifier]
+            try:
+                events = await nostr_helpers.query_events(filters, limit=1, timeout=6.0)
+            except Exception as exc:
+                logger.debug(
+                    f"Zap monitor: failed to resolve address {address} for user {self.user_id}: {exc}"
+                )
+                continue
+            if not events:
+                continue
+            event = events[0]
+            note_id_raw = event.get("id")
+            if not isinstance(note_id_raw, str):
+                continue
+            note_id_norm = note_id_raw.strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", note_id_norm):
+                continue
+
+            # Cache the resolved address for future lookups
+            address_map[note_id_norm] = address
+            try:
+                apply_event_address(address_map, event)
+            except Exception:
+                pass
+            try:
+                settings.tracked_event_addresses = address_map
+            except Exception:
+                pass
+            if self.user_id:
+                try:
+                    await crud.upsert_settings(settings, self.user_id)
+                except Exception as exc:
+                    logger.debug(
+                        f"Zap monitor: failed to persist address mapping for user {self.user_id}: {exc}"
+                    )
+            return note_id_norm, author
+
+        return None, None
 
     async def start_monitoring(self):
         """Start monitoring Nostr events for tracked notes."""
@@ -378,27 +479,44 @@ class ZapMonitorService:
                 self.last_error = "missing_zapper_pubkey"
                 return False
             
-            # Extract target note ID from tags (NIP-57 format)
-            # Look for ["e", "<note_id>", ...] tag
-            target_note_id_raw = None
-            target_author_raw = None
+            # Extract target note references from tags (NIP-57 format)
+            target_note_id_raw: Optional[str] = None
+            target_author_raw: Optional[str] = None
+            address_candidates: list[str] = []
+
             tags = zap_request.get("tags", [])
             for tag in tags:
-                if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "e":
-                    target_note_id_raw = tag[1]
-                elif isinstance(tag, list) and len(tag) >= 2 and tag[0] == "p" and not target_author_raw:
-                    target_author_raw = tag[1]
+                if not (isinstance(tag, list) and len(tag) >= 2):
+                    continue
+                marker = tag[0]
+                value = tag[1]
+                if marker == "e" and value and target_note_id_raw is None:
+                    target_note_id_raw = value
+                elif marker == "p" and value and target_author_raw is None:
+                    target_author_raw = value
+                elif marker == "a" and isinstance(value, str) and value:
+                    address_candidates.append(value)
 
-            # Fallback: check for top-level "e" field (non-standard but handle it)
+            # Fallbacks for non-standard fields
             if not target_note_id_raw:
                 target_note_id_raw = zap_request.get("e")
-
             if not target_author_raw:
                 target_author_raw = zap_request.get("p")
 
+            extra_address = zap_request.get("a")
+            if isinstance(extra_address, str) and extra_address:
+                address_candidates.append(extra_address)
+
+            if not target_note_id_raw and address_candidates:
+                resolved_id, resolved_author = await self._resolve_note_from_addresses(settings, address_candidates)
+                if resolved_id:
+                    target_note_id_raw = resolved_id
+                    if not target_author_raw and resolved_author:
+                        target_author_raw = resolved_author
+
             if not target_note_id_raw:
                 logger.warning(
-                    f"Zap request missing target note ID (no 'e' tag found). "
+                    f"Zap request missing target note ID (no resolvable 'e' or 'a' tag). "
                     f"Tags: {tags[:3] if tags else []}"
                 )
                 self.last_error = "profile_zap_no_e_tag"
