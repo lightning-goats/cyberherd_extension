@@ -19,6 +19,7 @@ from .crud import (
 from .services.splits import reset_splits_to_predefined_wallet
 from .services.zap_monitor import get_zap_monitor
 from . import crud as crud_module
+from .views_api import _clear_cached_notes_for_user
 
 # Conditional import for cyberherd_messaging
 try:
@@ -30,6 +31,7 @@ except ImportError:
 
 INVOICE_LISTENER_NAME = "ext_cyberherd"
 INVOICE_TASK_NAME = "ext_cyberherd_invoice_listener"
+_APP_REF: Any | None = None
 
 
 def parse_bool(value: str | bool | None, default: bool = False) -> bool:
@@ -195,7 +197,10 @@ def get_invoice_listener_status() -> dict[str, Any]:
         "name": INVOICE_LISTENER_NAME,
     }
 
-async def midnight_reset_job():
+async def midnight_reset_job(app: Any | None = None):
+    global _APP_REF
+    if app is None:
+        app = _APP_REF
     """Deactivate all members and reset splits for every tracking-enabled settings row.
 
     Previously only the first/global row was handled which could skip multi-tenant users
@@ -266,6 +271,12 @@ async def midnight_reset_job():
                     error_msg = f"Failed to reset tracked events for user {user_id[:12]}...: {e}"
                     logger.warning(f"CyberHerd midnight reset: {error_msg}")
                     errors.append(error_msg)
+                # Clear cached today notes similar to manual reset behaviour
+                if app is not None:
+                    try:
+                        _clear_cached_notes_for_user(app, user_id=user_id)
+                    except Exception as e:
+                        logger.debug(f"CyberHerd midnight reset: note cache clear skipped for user {user_id[:12]}...: {e}")
         
         # Reset splits for each source wallet (only for settings that opted in)
         for s in settings_rows:
@@ -376,7 +387,10 @@ async def schedule_midnight_reset():
         await midnight_reset_job()
 
 
-def cyberherd_tasks():
+def cyberherd_tasks(app: Any | None = None):
+    global _APP_REF
+    if app is not None:
+        _APP_REF = app
     """
     Creates a permanent unique task to schedule the midnight reset job.
     """

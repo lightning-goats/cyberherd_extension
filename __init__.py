@@ -111,7 +111,7 @@ def init_extension(app):
     _register_services(app)
     # Schedule midnight reset recurring task
     try:
-        cyberherd_tasks()
+        cyberherd_tasks(app)
     except Exception as e:
         logger.warning(f"Cyberherd tasks init failed: {e}")
     # Start subscriptions (startup scan + realtime stream)
