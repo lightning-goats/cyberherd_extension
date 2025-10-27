@@ -734,6 +734,10 @@ class EnhancedHeadbuttService:
                 raw_event_id = getattr(attacker, "event_id", None)
                 event_id_value = _normalize_event_id(raw_event_id) or raw_event_id
                 event_type = "member_increase" if was_active else "new_member"
+                message_event_id = None
+                if event_id_value:
+                    event_id_str = str(event_id_value)
+                    message_event_id = event_id_str if event_id_str.startswith("msg:") else f"msg:{event_id_str}"
                 increase_amount_int = int(increase_amount or 0)
                 new_total_int = int(new_total or 0)
                 member_picture = (
@@ -751,7 +755,8 @@ class EnhancedHeadbuttService:
                     new_total=new_total_int,
                     initial_amount=increase_amount_int if not was_active else None,
                     note_id=note_id,
-                    event_id=event_id_value,
+                    event_id=message_event_id,
+                    source_event_id=event_id_value,
                     member_picture=member_picture,
                 )
 
@@ -1048,6 +1053,7 @@ class EnhancedHeadbuttService:
         initial_amount: int | None = None,
         note_id: str | None = None,
         event_id: str | None = None,
+        source_event_id: str | None = None,
         member_picture: str | None = None,
     ):
         if self.recovery_mode:
@@ -1077,9 +1083,11 @@ class EnhancedHeadbuttService:
                 "member_display_name": display_name,
                 "member_pubkey": member_pubkey,
                 "member_nprofile": member_nprofile,
-                "event_id": event_id,
+                "event_id": source_event_id if source_event_id is not None else event_id,
                 "note_id": note_id,
             }
+            if source_event_id is not None:
+                msg_kwargs["source_event_id"] = source_event_id
             spots_remaining = await self._compute_spots_remaining()
             if spots_remaining is not None:
                 msg_kwargs["spots_remaining"] = spots_remaining
@@ -1162,6 +1170,8 @@ class EnhancedHeadbuttService:
                 values["difference"] = feeder_difference
             if spots_remaining is not None:
                 values["spots_remaining"] = spots_remaining
+            if source_event_id is not None:
+                values.setdefault("source_event_id", source_event_id)
             picture_value = (
                 member_picture
                 or msg_kwargs.get("picture")
@@ -1298,6 +1308,10 @@ class EnhancedHeadbuttService:
             note_id = _normalize_event_id(raw_note_id)
             raw_event_id = getattr(attacker, "event_id", None)
             event_id = _normalize_event_id(raw_event_id) or raw_event_id
+            message_event_id = None
+            if event_id:
+                event_id_str = str(event_id)
+                message_event_id = event_id_str if event_id_str.startswith("msg:") else f"msg:{event_id_str}"
 
             tracked_raw = []
             try:
@@ -1354,7 +1368,8 @@ class EnhancedHeadbuttService:
                 new_total=amount_total,
                 initial_amount=contribution,
                 note_id=note_id,
-                event_id=event_id,
+                event_id=message_event_id,
+                source_event_id=event_id,
                 member_picture=(getattr(attacker, "picture", None) or (member_row or {}).get("picture")),
             )
         except Exception as exc:
