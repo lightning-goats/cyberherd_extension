@@ -343,7 +343,7 @@ class ZapMonitorService:
                 logger.error(f"Error stopping Nostr monitor: {e}")
             self.nostr_monitor = None
     
-    async def _process_payment_for_zap(self, payment):
+    async def _process_payment_for_zap(self, payment, *, allow_outside_today: bool = False):
         """Process a payment notification to detect LNURLp zaps.
         
         This method is called by the invoice listener and parses zap requests from
@@ -351,6 +351,7 @@ class ZapMonitorService:
         
         Args:
             payment: Payment object with extra data containing zap request
+            allow_outside_today: When True, bypass today's note window check (used for recovery scans).
         """
         try:
             # Only process payments to the configured herd wallet
@@ -589,11 +590,17 @@ class ZapMonitorService:
             today_success, today_note_ids = await self._get_today_note_ids(settings)
             if today_success:
                 if target_note_id not in today_note_ids:
-                    logger.info(
-                        f"Zap target {target_note_id[:8]}... is not in today's active note set. Ignoring zap."
-                    )
-                    self.last_error = "note_not_today"
-                    return False
+                    if allow_outside_today:
+                        logger.debug(
+                            f"Zap monitor recovery: allowing zap for note {target_note_id[:8]}... "
+                            f"outside today's active note window"
+                        )
+                    else:
+                        logger.info(
+                            f"Zap target {target_note_id[:8]}... is not in today's active note set. Ignoring zap."
+                        )
+                        self.last_error = "note_not_today"
+                        return False
             else:
                 logger.debug(
                     "Zap monitor: unable to resolve today's note list for user %s; continuing with tracked note fallback",
@@ -622,12 +629,18 @@ class ZapMonitorService:
                     is_tracked = target_note_id in tracked_notes
 
             if not is_tracked:
-                logger.debug(
-                    f"Zap target {target_note_id[:16]}... is not a tracked note ID "
-                    f"(tracking {len(tracked_notes)} notes). Ignoring."
-                )
-                self.last_error = "note_not_tracked"
-                return False
+                if allow_outside_today:
+                    logger.debug(
+                        f"Zap monitor recovery: processing untracked note {target_note_id[:16]}... "
+                        f"(tracked list size={len(tracked_notes)})."
+                    )
+                else:
+                    logger.debug(
+                        f"Zap target {target_note_id[:16]}... is not a tracked note ID "
+                        f"(tracking {len(tracked_notes)} notes). Ignoring."
+                    )
+                    self.last_error = "note_not_tracked"
+                    return False
             else:
                 logger.debug(
                     f"✅ Zap target {target_note_id[:16]}... IS in tracked notes. "
@@ -1657,7 +1670,7 @@ class ZapMonitorService:
                     # Reuse existing payment processing path which includes
                     # duplicate guards and zap parsing logic.
                     processed += 1
-                    res = await self._process_payment_for_zap(payment)
+                    res = await self._process_payment_for_zap(payment, allow_outside_today=True)
                     # Treat truthy result as success (some code paths may return True)
                     if res:
                         successful += 1
