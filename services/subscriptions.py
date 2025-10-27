@@ -14,7 +14,7 @@ Key changes:
 - Diagnostics report helper failures
 
 Legacy per-relay websocket code has been removed in favour of pooled
-subscriptions managed via nostr_adapter. In-memory cache handling and 
+subscriptions managed via nostr_adapter. In-memory cache handling and
 status remain here for reuse by the adapter.
 """
 
@@ -312,6 +312,8 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
     - Checks event.created_at against LOCAL day boundaries (user's "today" concept)
     - Cache key uses UTC date for storage consistency
     """
+    global _refresh_event
+
     eid = event.get("id")
     if not eid:
         return False
@@ -412,6 +414,16 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
                         try:
                             st = getattr(app, "state", app)
                             setattr(st, "cyberherd_force_subscription_refresh", True)
+                            if _refresh_event is None:
+                                try:
+                                    _refresh_event = asyncio.Event()
+                                except Exception:
+                                    _refresh_event = None
+                            if _refresh_event is not None:
+                                try:
+                                    _refresh_event.set()
+                                except Exception:
+                                    pass
                             _dbg("Set force refresh flag after adding event {} for user {}", eid, user_id)
                         except Exception as e:
                             logger.warning(f"Failed to set subscription refresh flag: {e}")
@@ -571,6 +583,7 @@ def start_subscriptions(app):
         import asyncio
 
         async def _kick():
+            global _refresh_event
             try:
                 # Wait for nostrclient relays to be ready before starting subscriptions
                 from .relay_readiness import wait_for_relays_ready
@@ -600,6 +613,16 @@ def start_subscriptions(app):
                 try:
                     st = getattr(app, "state", app)
                     setattr(st, "cyberherd_force_subscription_refresh", True)
+                    if _refresh_event is None:
+                        try:
+                            _refresh_event = asyncio.Event()
+                        except Exception:
+                            _refresh_event = None
+                    if _refresh_event is not None:
+                        try:
+                            _refresh_event.set()
+                        except Exception:
+                            pass
                 except Exception as e:
                     logger.warning(f"Could not set subscription refresh flag: {e}")
                 
@@ -1018,7 +1041,7 @@ async def _is_tracked_event(user_id: str, note_event_id: str, settings, app, cac
                 return False
             
             events = await nostr_helpers.query_events(
-                {"ids": [reposted_event_id]},
+                {"ids": [note_event_id]},
                 limit=1,
                 timeout=5.0
             )

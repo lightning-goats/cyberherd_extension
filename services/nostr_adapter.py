@@ -820,7 +820,12 @@ async def force_requery_for_user(app, user_id: str | None):
     try:
         from ..views_api import _get_cached_effective_pubkey as _eff
         from .. import crud
-        from .subscriptions import _append_today, _get_cache, _local_midnight_timestamp
+        from .subscriptions import (
+            _append_today,
+            _get_cache,
+            _local_midnight_timestamp,
+            process_event_for_user,
+        )
     except Exception as e:
         logger.warning(f"force_requery import error: {e}")
         return []
@@ -863,9 +868,17 @@ async def force_requery_for_user(app, user_id: str | None):
         appended_ids = []
         for ev in events or []:
             try:
-                if _append_today(cache, user_id, eff, tags_norm, ev):
-                    if isinstance(ev.get('id'), str):
-                        appended_ids.append(ev['id'])
+                kind = int(ev.get('kind') or 0)
+            except Exception:
+                kind = 0
+
+            try:
+                if kind == 1:
+                    if await _append_today(cache, user_id, eff, tags_norm, ev):
+                        if isinstance(ev.get('id'), str):
+                            appended_ids.append(ev['id'])
+                elif kind in (6, 7):
+                    await process_event_for_user(user_id, ev, settings, app, recovery_mode=True)
             except Exception:
                 pass
         if CYBERHERD_DIAG:
@@ -1450,7 +1463,7 @@ async def _event_pump(app):
                 # instead of gating on explicit 't' tags here.
                 if int(ev.get('kind') or 0) == 1:
                     try:
-                        if _append_today(cache, user_id, eff_pub, tags, ev):
+                        if await _append_today(cache, user_id, eff_pub, tags, ev):
                             meta['appended'] += 1
                             if CYBERHERD_DIAG:
                                 _diag_counts['events_matched'] += 1
