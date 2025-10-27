@@ -458,8 +458,23 @@ class ZapMonitorService:
                     f"registry updates deferred for note {target_note_id[:8]}...)"
                 )
             
-            # Check if target note is tracked (use settings directly as fallback)
+            # Check if target note is in today's active note list
             tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
+            today_success, today_note_ids = await self._get_today_note_ids(settings)
+            if today_success:
+                if target_note_id not in today_note_ids:
+                    logger.info(
+                        f"Zap target {target_note_id[:8]}... is not in today's active note set. Ignoring zap."
+                    )
+                    self.last_error = "note_not_today"
+                    return False
+            else:
+                logger.debug(
+                    "Zap monitor: unable to resolve today's note list for user %s; continuing with tracked note fallback",
+                    self.user_id,
+                )
+
+            timestamps_map = getattr(settings, 'tracked_event_timestamps', {}) or {}
             is_tracked = target_note_id in tracked_notes
 
             # Opportunistically register the note if it isn't tracked yet. This can happen
@@ -747,6 +762,37 @@ class ZapMonitorService:
         if self._event_has_tracked_tag(event, tag_norm):
             return event
         return None
+
+    async def _get_today_note_ids(self, settings) -> tuple[bool, list[str]]:
+        """Return (success, note_ids) for today's #CyberHerd notes."""
+        if not self.app:
+            return False, []
+
+        try:
+            from .headbutt import EnhancedHeadbuttService
+
+            helper = EnhancedHeadbuttService(
+                db=crud,
+                messaging_module=self.messaging,
+                app=self.app,
+                user_id=self.user_id,
+            )
+            notes = await helper._get_today_cyberherd_notes()
+            if not isinstance(notes, list):
+                return True, []
+            # Normalize to lowercase 64-hex strings
+            cleaned = []
+            for nid in notes:
+                if isinstance(nid, str):
+                    cleaned.append(nid.strip().lower())
+            return True, cleaned
+        except Exception as exc:
+            logger.debug(
+                "Zap monitor: failed to fetch today's note list for user %s: %s",
+                self.user_id,
+                exc,
+            )
+            return False, []
 
     @staticmethod
     def _event_has_tracked_tag(event: dict, tracked_tags: list[str]) -> bool:
