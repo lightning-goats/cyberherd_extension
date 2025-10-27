@@ -2346,31 +2346,60 @@ async def _get_detected_cyberherd_notes_for_settings(settings, since_days_ago: i
     # For ENGAGEMENTS (reposts/reactions), we use #e (event reference) not #t
     # This is handled separately in nostr_event_monitor.py
     
-    filters = {
-        "kinds": [1, 30311],  # Notes and long-form content
+    base_filter = {
+        "kinds": [1, 30311],
         "since": since_timestamp,
         "authors": [eff_pub] if eff_pub else [],
-        # Include #t filtering to leverage relay indexes when available
-        "#t": filter_tags,
     }
-    
-    logger.info(f"🔍 Querying notes: kinds=[1,30311], author={eff_pub[:16] if eff_pub else 'none'}..., "
-               f"since={since_timestamp}, tags={filter_tags[:3]}, local_check_enabled=True")
-    
+
+    filter_list = []
+    if filter_tags:
+        filter_with_tags = dict(base_filter)
+        filter_with_tags["#t"] = filter_tags
+        filter_list.append(filter_with_tags)
+    filter_list.append(dict(base_filter))  # author-only fallback (catches content-only hashtags)
+
+    logger.info(
+        "\U0001F50D Querying notes: author=%s..., since=%s, filters=%d (tags=%s)",
+        eff_pub[:16] if eff_pub else "none",
+        since_timestamp,
+        len(filter_list),
+        filter_tags[:3],
+    )
+
     try:
-        # Import locally to avoid circular imports
-        # Import nostr_helpers for queries
         from .services import nostr_helpers
-        
-        # Query events with tag filtering only
-        raw_events = await nostr_helpers.query_events(filters, limit=100, timeout=6.0)
-        
-        logger.info(f"get_cyberherd_notes_for_settings: fetched {len(raw_events or [])} raw events for filters {filters}")
+
+        raw_events = []
+        for idx, filt in enumerate(filter_list, start=1):
+            try:
+                fetched = await nostr_helpers.query_events(filt, limit=100, timeout=6.0)
+                logger.info(
+                    "get_cyberherd_notes_for_settings: filter %d returned %d events (has_t=%s)",
+                    idx,
+                    len(fetched or []),
+                    "#t" in filt,
+                )
+                raw_events.extend(fetched or [])
+            except Exception as sub_exc:
+                logger.warning(
+                    "get_cyberherd_notes_for_settings: filter %d failed: %s", idx, sub_exc
+                )
+
+        # Deduplicate events by id while preserving order of appearance (tagged-first preferred)
+        deduped_events = []
+        seen_ids: set[str] = set()
+        for ev in raw_events:
+            ev_id = ev.get("id") if isinstance(ev, dict) else None
+            if isinstance(ev_id, str) and ev_id not in seen_ids:
+                seen_ids.add(ev_id)
+                deduped_events.append(ev)
+
         note_ids: list[str] = []
         debug_reasons: list[str] = []
         
         # Use the until_timestamp from the authoritative calculation
-        for ev in raw_events or []:
+        for ev in deduped_events:
             try:
                 ca = int(ev.get("created_at") or 0)
             except Exception:
