@@ -730,7 +730,7 @@ class ZapMonitorService:
                                 "note_id": target_note_id,
                                 "zapper_pubkey": zapper_pubkey,
                                 "amount": int(amount_sats),
-                                "processed_at": str(int(datetime.now(timezone.utc).timestamp())),
+                                "processed_at": int(datetime.now(timezone.utc).timestamp()),
                             }
                         )
                 except Exception as exc:

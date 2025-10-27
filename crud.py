@@ -5,6 +5,7 @@ import string
 import time
 from datetime import datetime, timezone
 import asyncio
+from typing import Any
 
 from loguru import logger
 
@@ -1803,6 +1804,60 @@ async def _bootstrap_cyberherd_tables():
         pass
 
 
+def _parse_timestamp_field(value: Any) -> int | None:
+    """Best-effort coercion of timestamps stored as ints, floats, or ISO strings."""
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return None
+        if candidate.isdigit():
+            try:
+                return int(candidate)
+            except Exception:
+                return None
+        if candidate.startswith(("+", "-")) and candidate[1:].isdigit():
+            try:
+                return int(candidate)
+            except Exception:
+                return None
+        try:
+            return int(float(candidate))
+        except Exception:
+            pass
+        try:
+            iso = candidate
+            if iso.endswith("Z"):
+                iso = iso[:-1] + "+00:00"
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except Exception:
+            return None
+
+    return None
+
+
+def _normalize_hex(value: Any) -> str | None:
+    """Normalize hex strings (zap IDs, note IDs, pubkeys) to lowercase."""
+    if not value:
+        return None
+    try:
+        candidate = str(value).strip().lower()
+    except Exception:
+        return None
+    return candidate or None
+
+
 async def get_zap_totals_row(user_id: str, zapper_pubkey: str) -> dict | None:
     """Fetch persisted zap totals for a zapper."""
     if not user_id:
@@ -1978,14 +2033,47 @@ async def get_processed_zap(user_id: str, event_id: str):
 
 async def create_processed_zap(processed_zap_data: dict):
     """Create a processed zap record."""
+    if not processed_zap_data:
+        return None
+
+    payload = dict(processed_zap_data)
+    user_id = payload.get("user_id")
+    if not user_id:
+        logger.debug("create_processed_zap: missing user_id, skipping insert")
+        return None
+
+    payload["user_id"] = str(user_id)
+    payload["event_id"] = _normalize_hex(payload.get("event_id")) or payload.get(
+        "event_id"
+    )
+    payload["note_id"] = _normalize_hex(payload.get("note_id")) or payload.get(
+        "note_id"
+    )
+    payload["zapper_pubkey"] = (
+        _normalize_hex(payload.get("zapper_pubkey")) or payload.get("zapper_pubkey")
+    )
+
+    amount_raw = payload.get("amount")
+    if amount_raw is None:
+        amount_raw = payload.get("amount_sats")
+    try:
+        payload["amount"] = int(amount_raw) if amount_raw is not None else None
+    except Exception:
+        payload["amount"] = None
+
+    processed_at = _parse_timestamp_field(payload.get("processed_at"))
+    if processed_at is None:
+        processed_at = int(time.time())
+    payload["processed_at"] = processed_at
+
     try:
         await db.execute(
             f"""INSERT INTO {db.references_schema}processed_zaps (user_id, event_id, note_id, zapper_pubkey, amount, processed_at)
             VALUES (:user_id, :event_id, :note_id, :zapper_pubkey, :amount, :processed_at)
             """,
-            processed_zap_data,
+            payload,
         )
-        return processed_zap_data
+        return payload
     except Exception as e:
         msg = str(e).lower()
         if any(t in msg for t in ("undefinedtable", "does not exist", "no such table")):
@@ -1995,9 +2083,9 @@ async def create_processed_zap(processed_zap_data: dict):
                     f"""INSERT INTO {db.references_schema}processed_zaps (user_id, event_id, note_id, zapper_pubkey, amount, processed_at)
                     VALUES (:user_id, :event_id, :note_id, :zapper_pubkey, :amount, :processed_at)
                     """,
-                    processed_zap_data,
+                    payload,
                 )
-                return processed_zap_data
+                return payload
             except Exception as e2:
                 logger.error(f"Error creating processed zap after bootstrap: {e2}")
                 return None
@@ -2009,20 +2097,19 @@ async def fetch_processed_zaps(
     limit: int | None = 100,
     note_id: str | None = None,
     zapper_pubkey: str | None = None,
-) -> list[dict]:
-    """Fetch processed zap records for diagnostics or debugging."""
+    *,
+    fetch_multiplier: int = 4,
+) -> tuple[list[dict], bool]:
+    """Fetch processed zap records for diagnostics or debugging.
+
+    Returns:
+        (rows, has_more) tuple ordered by newest first.
+    """
     if not user_id:
-        return []
+        return [], False
 
     clauses = ["user_id = :user_id"]
     params: dict[str, object] = {"user_id": user_id}
-
-    if since is not None:
-        try:
-            params["since"] = int(since)
-            clauses.append("processed_at >= :since")
-        except Exception:
-            pass
 
     if note_id:
         params["note_id"] = note_id.strip()
@@ -2038,20 +2125,60 @@ async def fetch_processed_zaps(
     where_sql = " AND ".join(clauses)
     sql = (
         f"SELECT * FROM {db.references_schema}processed_zaps "
-        f"WHERE {where_sql} ORDER BY processed_at DESC"
+        f"WHERE {where_sql}"
     )
 
-    if limit:
+    try:
+        base_limit = max(1, min(int(limit) if limit else 100, 500))
+    except Exception:
+        base_limit = 100
+
+    if since is not None:
         try:
-            lim = max(1, min(int(limit), 500))
+            multiplier = max(1, int(fetch_multiplier))
         except Exception:
-            lim = 100
-        params["limit"] = lim
-        sql += " LIMIT :limit"
+            multiplier = 4
+        fetch_limit = min(base_limit * multiplier, 2000)
+    else:
+        fetch_limit = base_limit
+
+    sql += " ORDER BY processed_at DESC"
+    params["limit"] = fetch_limit
+    sql += " LIMIT :limit"
 
     try:
         rows = await db.fetchall(sql, params)
-        return rows or []
+        candidate_rows: list[dict[str, Any]] = []
+        for row in rows or []:
+            data = dict(row)
+            parsed_ts = _parse_timestamp_field(data.get("processed_at"))
+            data["_processed_ts"] = parsed_ts
+            if parsed_ts is not None:
+                data.setdefault("processed_at_ts", parsed_ts)
+            candidate_rows.append(data)
+
+        if since is not None:
+            try:
+                since_value = int(since)
+            except Exception:
+                since_value = None
+            if since_value is not None:
+                candidate_rows = [
+                    r for r in candidate_rows if (r.get("_processed_ts") or 0) >= since_value
+                ]
+
+        candidate_rows.sort(
+            key=lambda r: r.get("_processed_ts")
+            or _parse_timestamp_field(r.get("processed_at"))
+            or 0,
+            reverse=True,
+        )
+
+        has_more = len(candidate_rows) > base_limit
+        trimmed = candidate_rows[:base_limit]
+        for r in trimmed:
+            r.pop("_processed_ts", None)
+        return trimmed, has_more
     except Exception as e:
         msg = str(e).lower()
         if any(
@@ -2060,12 +2187,18 @@ async def fetch_processed_zaps(
         ):
             try:
                 await _bootstrap_cyberherd_tables()
-                rows = await db.fetchall(sql, params)
-                return rows or []
+                return await fetch_processed_zaps(
+                    user_id=user_id,
+                    since=since,
+                    limit=limit,
+                    note_id=note_id,
+                    zapper_pubkey=zapper_pubkey,
+                    fetch_multiplier=fetch_multiplier,
+                )
             except Exception:
-                return []
+                return [], False
         logger.warning(f"Failed fetching processed zaps for user {user_id}: {e}")
-        return []
+        return [], False
 
 
 async def count_processed_zaps(user_id: str) -> int:
@@ -2252,7 +2385,7 @@ async def register_processed_payment(
                         "user_id": user_id,
                         "event_hash": payment_hash,
                         "note_id": note_id,
-                        "pubkey": pubkey,
+                        "pubkey": _normalize_hex(pubkey) or pubkey,
                         "processed_at": int(time.time()),
                         "event_type": event_type,
                     },
@@ -2289,7 +2422,7 @@ async def register_processed_payment(
                                 "user_id": user_id,
                                 "event_hash": payment_hash,
                                 "note_id": note_id,
-                                "pubkey": pubkey,
+                                "pubkey": _normalize_hex(pubkey) or pubkey,
                                 "processed_at": int(time.time()),
                                 "event_type": event_type,
                             },

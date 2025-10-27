@@ -2571,7 +2571,7 @@ async def api_query_zap_events(
         except Exception:
             since_ts = None
 
-    rows = await crud.fetch_processed_zaps(
+    rows, has_more = await crud.fetch_processed_zaps(
         user_id=user_id,
         since=since_ts,
         limit=limit,
@@ -2620,7 +2620,9 @@ async def api_query_zap_events(
         except Exception:
             amount_sats = None
 
-        processed_ts = _coerce_timestamp(row.get("processed_at"))
+        processed_ts = row.get("processed_at_ts")
+        if processed_ts is None:
+            processed_ts = _coerce_timestamp(row.get("processed_at"))
         processed_iso = (
             datetime.fromtimestamp(processed_ts, tz=timezone.utc)
             .isoformat()
@@ -2653,7 +2655,7 @@ async def api_query_zap_events(
             "zapper_pubkey": zapper_pubkey,
             "limit": capped_limit,
         },
-        "has_more": len(events) == capped_limit and len(rows or []) == capped_limit,
+        "has_more": bool(has_more),
     }
 
 
