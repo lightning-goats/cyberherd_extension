@@ -106,61 +106,84 @@ async def _verify_nip05_relaxed(pubkey: str, nip05: str) -> tuple[Optional[bool]
         return False, "invalid_format"
 
     errors: list[str] = []
+    last_reason: str | None = None
 
+    def _normalize_candidate(value: str | None) -> Optional[str]:
+        if not value or not isinstance(value, str):
+            return None
+        candidate = value.strip()
+        if not candidate:
+            return None
+        try:
+            from lnbits.utils.nostr import normalize_public_key  # type: ignore
+
+            normalized = normalize_public_key(candidate)  # type: ignore[assignment]
+        except Exception:
+            normalized = candidate.strip().lower()
+        else:
+            normalized = normalized.strip().lower()
+        return normalized
+
+    # Prefer LNbits helper for canonical mapping
+    try:
+        from lnbits.core.services.nostr import fetch_nip5_details  # type: ignore
+
+        fetched_pubkey, _relays = await fetch_nip5_details(identity)
+        fetched_norm = _normalize_candidate(fetched_pubkey)
+        if fetched_norm and fetched_norm == pubkey_norm:
+            return True, "fallback_match"
+        if fetched_norm:
+            last_reason = "fallback_mismatch"
+            errors.append(f"fallback_mismatch:{fetched_norm}")
+        else:
+            last_reason = "fallback_missing"
+            errors.append("fallback_missing")
+    except Exception as exc:
+        errors.append(f"fallback:{exc}")
+
+    # First attempt: direct ?name= lookup
     url = f"https://{domain}/.well-known/nostr.json?name={username}"
+    data: dict[str, Any] | None = None
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, timeout=10)
             resp.raise_for_status()
-            data = resp.json()
-        mapped = None
-        try:
-            mapped = data.get("names", {}).get(username)
-        except Exception:
-            mapped = None
-
-        if isinstance(mapped, str):
-            candidate = mapped.strip()
-            if candidate:
-                try:
-                    from lnbits.utils.nostr import normalize_public_key  # type: ignore
-
-                    candidate = normalize_public_key(candidate)  # type: ignore[assignment]
-                except Exception:
-                    candidate = candidate.lower()
-                else:
-                    candidate = candidate.strip().lower()
-                if candidate == pubkey_norm:
-                    return True, "direct_match"
-                return False, "direct_mismatch"
-        return False, "mapping_missing"
+            parsed = resp.json()
+        if isinstance(parsed, dict):
+            data = parsed
     except Exception as exc:
         errors.append(f"direct:{exc}")
 
-    try:
-        from lnbits.core.services.nostr import fetch_nip5_details  # type: ignore
-    except Exception as exc:
-        errors.append(f"fallback_import:{exc}")
-    else:
+    if data is not None:
+        candidate_raw = None
         try:
-            resolved, _ = await fetch_nip5_details(identity)
-        except Exception as exc:
-            errors.append(f"fallback:{exc}")
+            names = data.get("names", {}) if isinstance(data, dict) else {}
+            if isinstance(names, dict):
+                for key, value in names.items():
+                    if isinstance(key, str) and key.strip().lower() == username:
+                        candidate_raw = value
+                        break
+            if candidate_raw is None:
+                profiles = data.get("profiles") if isinstance(data, dict) else None
+                if isinstance(profiles, dict):
+                    profile_entry = profiles.get(username)
+                    if isinstance(profile_entry, dict):
+                        candidate_raw = profile_entry.get("pubkey")
+        except Exception:
+            candidate_raw = None
+
+        candidate_norm = _normalize_candidate(candidate_raw)
+        if candidate_norm and candidate_norm == pubkey_norm:
+            return True, "direct_match"
+        if candidate_norm:
+            last_reason = "direct_mismatch"
+            errors.append(f"direct_mismatch:{candidate_norm}")
         else:
-            if resolved:
-                try:
-                    from lnbits.utils.nostr import normalize_public_key  # type: ignore
+            last_reason = "mapping_missing"
+            errors.append("mapping_missing")
 
-                    resolved = normalize_public_key(resolved)  # type: ignore[assignment]
-                except Exception:
-                    resolved = resolved.strip().lower()
-                else:
-                    resolved = resolved.strip().lower()
-                if resolved == pubkey_norm:
-                    return True, "fallback_match"
-                return False, "fallback_mismatch"
-            return False, "fallback_missing"
-
+    if last_reason:
+        return False, last_reason
     if errors:
         return None, "; ".join(errors)
     return None, "unknown"
