@@ -38,6 +38,14 @@ from .note_metadata import apply_event_address
 
 # NostrEventMonitor was planned but not implemented - monitoring happens via subscriptions.py
 _monitoring_available = False
+_register_invoice_listener = None  # type: ignore
+
+try:  # pragma: no cover
+    from lnbits.tasks import register_invoice_listener as _register_invoice_listener  # type: ignore
+except Exception:  # pragma: no cover
+    _register_invoice_listener = None  # type: ignore
+else:  # pragma: no cover
+    _monitoring_available = True
 
 try:  # pragma: no cover
     from . import nostr_lookup as nl  # type: ignore
@@ -668,6 +676,7 @@ class ZapMonitorService:
                         payment_hash=event_id,
                         note_id=target_note_id,
                         pubkey=zapper_pubkey,
+                        event_type="zap",
                     )
             except Exception:
                 # Best-effort: ignore persistence failures in tests/mocks
@@ -710,6 +719,24 @@ class ZapMonitorService:
                 logger.info(
                     f"✅ Successfully processed LNURLp zap: {amount_sats} sats from {zapper_pubkey[:8]}..."
                 )
+
+                # Persist zap record for diagnostics and historical counters
+                try:
+                    if self.user_id:
+                        await crud.create_processed_zap(
+                            {
+                                "user_id": cast(str, self.user_id),
+                                "event_id": event_id or "",
+                                "note_id": target_note_id,
+                                "zapper_pubkey": zapper_pubkey,
+                                "amount": int(amount_sats),
+                                "processed_at": str(int(datetime.now(timezone.utc).timestamp())),
+                            }
+                        )
+                except Exception as exc:
+                    logger.debug(
+                        f"Zap monitor: failed to persist processed zap for user {self.user_id}: {exc}"
+                    )
                 
                 # Best-effort registry update when subscriptions become ready
                 if not subscriptions_ready and not is_tracked:
@@ -1001,23 +1028,50 @@ class ZapMonitorService:
         This is a background task that should be started when monitoring begins.
         It registers with the LNbits invoice listener system (once) and processes payments.
         """
+        global _register_invoice_listener, _monitoring_available
         try:
-            from lnbits.tasks import register_invoice_listener
-            
+            if _register_invoice_listener is None:
+                from lnbits.tasks import register_invoice_listener as _imported  # type: ignore
+
+                _register_invoice_listener = _imported  # type: ignore
+                _monitoring_available = True
+        except Exception as e:  # pragma: no cover - defensive import guard
+            logger.error(
+                f"Cyberherd payment listener unavailable for user {self.user_id}: {e}"
+            )
+            self.last_error = str(e)
+            _monitoring_available = False
+            return
+
+        if _register_invoice_listener is None:
+            logger.error(
+                f"Cyberherd payment listener could not be registered for user {self.user_id} (missing handler)"
+            )
+            self.last_error = "invoice_listener_unavailable"
+            _monitoring_available = False
+            return
+
+        try:
             # Register listener only once per monitor instance (idempotent)
             if self._invoice_queue is None:
                 self._invoice_queue = asyncio.Queue()
-                register_invoice_listener(self._invoice_queue, f"cyberherd_zap_monitor_{self.user_id}")
+                _register_invoice_listener(  # type: ignore[misc]
+                    self._invoice_queue, f"cyberherd_zap_monitor_{self.user_id}"
+                )
                 logger.info(f"✅ Payment listener registered for user {self.user_id}")
             else:
-                logger.debug(f"Payment listener already registered for user {self.user_id}, reusing queue")
-            
+                logger.debug(
+                    f"Payment listener already registered for user {self.user_id}, reusing queue"
+                )
+
             logger.info(f"Payment listener started for user {self.user_id}")
-            
+
             while self._running:
                 try:
                     # Wait for payment with timeout to allow checking _running flag
-                    payment = await asyncio.wait_for(self._invoice_queue.get(), timeout=1.0)
+                    payment = await asyncio.wait_for(
+                        self._invoice_queue.get(), timeout=1.0
+                    )
                     await self._process_payment_for_zap(payment)
                 except asyncio.TimeoutError:
                     # Normal timeout, check if still running
@@ -1025,9 +1079,9 @@ class ZapMonitorService:
                 except Exception as e:
                     logger.error(f"Error in payment listener for user {self.user_id}: {e}")
                     await asyncio.sleep(1)  # Brief pause before retrying
-            
+
             logger.info(f"Payment listener stopped for user {self.user_id}")
-            
+
         except Exception as e:
             logger.error(f"Fatal error in payment listener for user {self.user_id}: {e}")
             self.last_error = str(e)
@@ -1326,6 +1380,7 @@ class ZapMonitorService:
                                 event_id,
                                 reposted_note_id,
                                 reposter_pubkey,
+                                event_type="repost",
                             )
                             # Metrics: increment counters on success/failure when app available
                             try:
@@ -1439,6 +1494,7 @@ class ZapMonitorService:
                                 event_id,
                                 reacted_note_id,
                                 reactor_pubkey,
+                                event_type="reaction",
                             )
                             try:
                                 st = getattr(self.app, 'state', self.app)
@@ -1479,18 +1535,41 @@ class ZapMonitorService:
             logger.error(f"Error handling Nostr reaction: {e}")
             self.last_error = str(e)
 
-    def status(self) -> dict[str, Any]:
+    async def status(self) -> dict[str, Any]:
         """Get current monitoring status and statistics."""
+        persisted_totals: dict[str, int] = {}
+        user_id = cast(Optional[str], self.user_id)
+        if user_id:
+            try:
+                persisted_totals = await crud.get_monitoring_totals(user_id)
+            except Exception as exc:
+                logger.debug(
+                    f"Zap monitor: failed to fetch persisted totals for user {user_id}: {exc}"
+                )
+                persisted_totals = {}
+        else:
+            persisted_totals = {}
+
+        total_zaps = max(self.total_zaps_processed, persisted_totals.get("zap", 0))
+        total_reposts = max(
+            self.total_reposts_processed, persisted_totals.get("repost", 0)
+        )
+        total_reactions = max(
+            self.total_reactions_processed, persisted_totals.get("reaction", 0)
+        )
+
         status = {
             'running': bool(self._running),
             'last_message_at': self.last_message_at,
             'last_zap_at': self.last_zap_at,
             'last_error': self.last_error,
             'mode': 'nostr',  # Nostr-only implementation
-            'monitoring_available': _monitoring_available,
-            'total_zaps_processed': self.total_zaps_processed,
-            'total_reposts_processed': self.total_reposts_processed,
-            'total_reactions_processed': self.total_reactions_processed,
+            'monitoring_available': bool(
+                _monitoring_available or self._invoice_queue is not None
+            ),
+            'total_zaps_processed': total_zaps,
+            'total_reposts_processed': total_reposts,
+            'total_reactions_processed': total_reactions,
             'total_recovery_scans': getattr(self, 'total_recovery_scans', 0),
             'nostr_monitoring_enabled': self.nostr_monitor is not None,
         }

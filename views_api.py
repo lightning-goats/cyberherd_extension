@@ -630,7 +630,7 @@ async def api_get_diagnostics(
     try:
         zap_monitor = get_zap_monitor(app=request.app, db=crud, user_id=user_id)
         diagnostics["zap_monitor"] = (
-            zap_monitor.status() if zap_monitor else {"running": False}
+            (await zap_monitor.status()) if zap_monitor else {"running": False}
         )
     except Exception as e:
         diagnostics["zap_monitor"] = {"error": str(e)}
@@ -2083,7 +2083,13 @@ async def api_post_member(
                     try:
                         if published and thread_event_id:
                             try:
-                                await crud.register_processed_event(user_id, thread_event_id, note_id=thread_event_id, pubkey=pubkey)
+                                await crud.register_processed_event(
+                                    user_id,
+                                    thread_event_id,
+                                    note_id=thread_event_id,
+                                    pubkey=pubkey,
+                                    event_type="message",
+                                )
                                 logger.debug("Registered processed event %s after views_api publish", thread_event_id)
                             except Exception:
                                 logger.warning(f"Failed to register processed event {thread_event_id} after publish")
@@ -2277,7 +2283,13 @@ async def api_put_member(
                         try:
                             if event_type == "new_member" and published and publish_thread_id:
                                 try:
-                                    await crud.register_processed_event(user_id, publish_thread_id, note_id=publish_thread_id, pubkey=pubkey)
+                                    await crud.register_processed_event(
+                                        user_id,
+                                        publish_thread_id,
+                                        note_id=publish_thread_id,
+                                        pubkey=pubkey,
+                                        event_type="message",
+                                    )
                                     logger.debug("Registered processed event %s after put-member publish", publish_thread_id)
                                 except Exception:
                                     logger.warning(f"Failed to register processed event {publish_thread_id} after publish")
@@ -2526,7 +2538,7 @@ async def api_get_zap_monitor_status(request: Request, auth=Depends(auth_wallet_
         user_id = auth["value"].id
     try:
         zm = get_zap_monitor(app=request.app, db=crud, user_id=user_id)
-        st = zm.status() if zm else {}
+        st = await zm.status() if zm else {}
         return {"status": st}
     except Exception as e:
         logger.warning(f"Cyberherd: zap monitor status failed: {e}")

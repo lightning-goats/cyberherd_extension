@@ -1268,7 +1268,13 @@ class EnhancedHeadbuttService:
                         if event_id:
                             from .. import crud
                             try:
-                                await crud.register_processed_event(self.user_id, event_id, note_id=note_id, pubkey=member_pubkey)
+                                await crud.register_processed_event(
+                                    self.user_id,
+                                    event_id,
+                                    note_id=note_id,
+                                    pubkey=member_pubkey,
+                                    event_type="message",
+                                )
                                 logger.debug("Registered processed event %s after membership publish", event_id)
                             except Exception:
                                 logger.warning(f"Failed to register processed event {event_id} after membership publish")

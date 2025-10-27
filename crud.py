@@ -1750,9 +1750,13 @@ async def _bootstrap_cyberherd_tables():
             note_id TEXT,
             pubkey TEXT,
             processed_at INTEGER NOT NULL,
+            event_type TEXT,
             UNIQUE(user_id, event_hash)
         );
         """
+    )
+    stmts.append(
+        f"ALTER TABLE {db.references_schema}processed_events ADD COLUMN event_type TEXT;"
     )
     # Legacy processed_zaps table (kept for backward compatibility)
     stmts.append(
@@ -2064,6 +2068,111 @@ async def fetch_processed_zaps(
         return []
 
 
+async def count_processed_zaps(user_id: str) -> int:
+    """Return the number of persisted zaps processed for a user."""
+    if not user_id:
+        return 0
+
+    sql = f"SELECT COUNT(*) AS count FROM {db.references_schema}processed_zaps WHERE user_id = :user_id"
+    params = {"user_id": user_id}
+
+    async def _fetch() -> int:
+        row = await db.fetchone(sql, params)
+        if not row:
+            return 0
+        try:
+            return int(row.get("count") or 0)
+        except Exception:
+            try:
+                return int(row["count"])  # type: ignore[index]
+            except Exception:
+                return 0
+
+    try:
+        return await _fetch()
+    except Exception as e:
+        msg = str(e).lower()
+        if any(
+            keyword in msg
+            for keyword in (
+                "undefinedtable",
+                "does not exist",
+                "no such table",
+                "no such column",
+                "undefined column",
+            )
+        ):
+            try:
+                await _bootstrap_cyberherd_tables()
+                return await _fetch()
+            except Exception:
+                return 0
+        logger.debug(f"Failed counting processed zaps for user {user_id}: {e}")
+        return 0
+
+
+async def get_monitoring_totals(user_id: str) -> dict[str, int]:
+    """Return persisted monitoring totals for zap/repost/reaction events."""
+    totals = {"zap": 0, "repost": 0, "reaction": 0}
+    if not user_id:
+        return totals
+
+    totals["zap"] = await count_processed_zaps(user_id)
+
+    sql = (
+        f"SELECT event_type, COUNT(*) AS count "
+        f"FROM {db.references_schema}processed_events "
+        f"WHERE user_id = :user_id AND event_type IS NOT NULL "
+        f"GROUP BY event_type"
+    )
+    params = {"user_id": user_id}
+
+    async def _fetch() -> None:
+        rows = await db.fetchall(sql, params)
+        for row in rows or []:
+            event_type_raw = row.get("event_type")
+            try:
+                event_type = str(event_type_raw).strip().lower()
+            except Exception:
+                continue
+            try:
+                count = int(row.get("count") or 0)
+            except Exception:
+                try:
+                    count = int(row["count"])  # type: ignore[index]
+                except Exception:
+                    count = 0
+
+            if event_type in ("repost", "reaction"):
+                totals[event_type] = count
+            elif event_type == "zap":
+                totals["zap"] = max(totals["zap"], count)
+
+    try:
+        await _fetch()
+    except Exception as e:
+        msg = str(e).lower()
+        if any(
+            keyword in msg
+            for keyword in (
+                "undefinedtable",
+                "does not exist",
+                "no such table",
+                "no such column",
+                "undefined column",
+            )
+        ):
+            try:
+                await _bootstrap_cyberherd_tables()
+                await _fetch()
+            except Exception:
+                return totals
+        else:
+            logger.debug(f"Failed fetching monitoring totals for user {user_id}: {e}")
+
+    return totals
+
+
 async def is_payment_processed(user_id: str, payment_hash: str) -> bool:
     """Check if a payment has already been processed.
     
@@ -2098,7 +2207,13 @@ async def is_payment_processed(user_id: str, payment_hash: str) -> bool:
         return False
 
 
-async def register_processed_payment(user_id: str, payment_hash: str, note_id: str | None = None, pubkey: str | None = None) -> bool:
+async def register_processed_payment(
+    user_id: str,
+    payment_hash: str,
+    note_id: str | None = None,
+    pubkey: str | None = None,
+    event_type: str | None = None,
+) -> bool:
     """Register a payment as processed to prevent duplicate handling.
     
     Args:
@@ -2106,6 +2221,7 @@ async def register_processed_payment(user_id: str, payment_hash: str, note_id: s
         payment_hash: Payment hash to register.
         note_id: Optional note ID for reference.
         pubkey: Optional pubkey for reference.
+        event_type: Optional classification for the processed event (e.g., "zap").
     
     Returns:
         True if successfully registered (new), False if already existed (ON CONFLICT).
@@ -2128,8 +2244,8 @@ async def register_processed_payment(user_id: str, payment_hash: str, note_id: s
 
                 # Not present — insert and report True
                 await db.execute(
-                    f"""INSERT INTO {db.references_schema}processed_events (user_id, event_hash, note_id, pubkey, processed_at)
-                    VALUES (:user_id, :event_hash, :note_id, :pubkey, :processed_at)
+                    f"""INSERT INTO {db.references_schema}processed_events (user_id, event_hash, note_id, pubkey, processed_at, event_type)
+                    VALUES (:user_id, :event_hash, :note_id, :pubkey, :processed_at, :event_type)
                     ON CONFLICT(user_id, event_hash) DO NOTHING
                     """,
                     {
@@ -2138,12 +2254,22 @@ async def register_processed_payment(user_id: str, payment_hash: str, note_id: s
                         "note_id": note_id,
                         "pubkey": pubkey,
                         "processed_at": int(time.time()),
+                        "event_type": event_type,
                     },
                 )
                 return True
             except Exception as e:
                 msg = str(e).lower()
-                if any(t in msg for t in ("undefinedtable", "does not exist", "no such table")):
+                if any(
+                    t in msg
+                    for t in (
+                        "undefinedtable",
+                        "does not exist",
+                        "no such table",
+                        "no such column",
+                        "undefined column",
+                    )
+                ):
                     # Try to bootstrap tables and retry once
                     try:
                         await _bootstrap_cyberherd_tables()
@@ -2155,8 +2281,8 @@ async def register_processed_payment(user_id: str, payment_hash: str, note_id: s
                         if row:
                             return False
                         await db.execute(
-                            f"""INSERT INTO {db.references_schema}processed_events (user_id, event_hash, note_id, pubkey, processed_at)
-                            VALUES (:user_id, :event_hash, :note_id, :pubkey, :processed_at)
+                            f"""INSERT INTO {db.references_schema}processed_events (user_id, event_hash, note_id, pubkey, processed_at, event_type)
+                            VALUES (:user_id, :event_hash, :note_id, :pubkey, :processed_at, :event_type)
                             ON CONFLICT(user_id, event_hash) DO NOTHING
                             """,
                             {
@@ -2165,6 +2291,7 @@ async def register_processed_payment(user_id: str, payment_hash: str, note_id: s
                                 "note_id": note_id,
                                 "pubkey": pubkey,
                                 "processed_at": int(time.time()),
+                                "event_type": event_type,
                             },
                         )
                         return True
@@ -2242,12 +2369,24 @@ async def is_event_processed(user_id: str, event_hash: str) -> bool:
     return await is_payment_processed(user_id, event_hash)
 
 
-async def register_processed_event(user_id: str, event_hash: str, note_id: str | None = None, pubkey: str | None = None) -> bool:
+async def register_processed_event(
+    user_id: str,
+    event_hash: str,
+    note_id: str | None = None,
+    pubkey: str | None = None,
+    event_type: str | None = None,
+) -> bool:
     """Alias for register_processed_payment with clearer naming for nostr events.
 
     Returns True if a new record was inserted, False if it already existed or on failure.
     """
-    return await register_processed_payment(user_id, event_hash, note_id=note_id, pubkey=pubkey)
+    return await register_processed_payment(
+        user_id,
+        event_hash,
+        note_id=note_id,
+        pubkey=pubkey,
+        event_type=event_type,
+    )
 
 
 async def get_member_by_pubkey(user_id: str, pubkey: str):

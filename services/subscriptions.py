@@ -732,7 +732,13 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                     if result and eid:
                         from .. import crud
                         try:
-                            res = await crud.register_processed_event(user_id, eid, note_id=target_id, pubkey=pubkey)
+                            res = await crud.register_processed_event(
+                                user_id,
+                                eid,
+                                note_id=target_id,
+                                pubkey=pubkey,
+                                event_type="repost",
+                            )
                             try:
                                 st = getattr(app, 'state', app)
                                 metrics = getattr(st, 'cyberherd_metrics', None)
@@ -800,7 +806,13 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                     if result and eid:
                         from .. import crud
                         try:
-                            res = await crud.register_processed_event(user_id, eid, note_id=reacted_id, pubkey=pubkey)
+                            res = await crud.register_processed_event(
+                                user_id,
+                                eid,
+                                note_id=reacted_id,
+                                pubkey=pubkey,
+                                event_type="reaction",
+                            )
                             try:
                                 st = getattr(app, 'state', app)
                                 metrics = getattr(st, 'cyberherd_metrics', None)
