@@ -28,6 +28,7 @@ All relay_manager access is routed through nostr_helpers for:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import secrets
@@ -39,6 +40,7 @@ from loguru import logger
 from .subscriptions import (
     _append_today,
     _get_cache,
+    _get_cache_note_ids,
     _local_midnight_timestamp,
     _refresh_event,
     get_subscription_status,
@@ -83,6 +85,261 @@ _diag_counts = {
     'eose_total': 0,
     'fallback_resubs': 0,
 }
+
+
+def _normalize_tracked_tags(settings) -> tuple[list[str], tuple[str, ...]]:
+    """Return (stripped_tags, normalized_tags_tuple) for subscription filters."""
+    stripped_tags: list[str] = []
+    try:
+        raw_tags = getattr(settings, 'tracked_tags', []) or []
+    except Exception:
+        raw_tags = []
+
+    for tag in raw_tags:
+        if not isinstance(tag, str):
+            continue
+        cleaned = tag.strip()
+        if not cleaned:
+            continue
+        stripped = cleaned.lstrip('#').strip()
+        if stripped:
+            stripped_tags.append(stripped)
+
+    normalized = sorted({t.lower() for t in stripped_tags})
+    return stripped_tags, tuple(normalized)
+
+
+def _collect_tracked_event_ids_for_subscription(settings, app, eff_pub: Optional[str], tags_norm: tuple[str, ...]) -> list[str]:
+    """Gather tracked event ids prioritizing today's cache, then persisted settings."""
+    seen: set[str] = set()
+    collected: list[str] = []
+
+    if eff_pub and tags_norm:
+        try:
+            cache = _get_cache(app)
+            boundaries = _get_today_boundaries_utc()
+            day = boundaries.utc_day_str
+        except Exception:
+            cache = None
+            day = None
+
+        if cache is not None and day is not None:
+            keys = [
+                (day, getattr(settings, 'user_id', None), eff_pub, tags_norm),
+                (day, None, eff_pub, tags_norm),
+            ]
+            for key in keys:
+                try:
+                    for eid in _get_cache_note_ids(cache, key):
+                        if isinstance(eid, str) and eid not in seen:
+                            seen.add(eid)
+                            collected.append(eid)
+                except Exception:
+                    continue
+
+    try:
+        persisted_ids = getattr(settings, 'tracked_event_ids', []) or []
+    except Exception:
+        persisted_ids = []
+
+    for eid in persisted_ids:
+        if isinstance(eid, str) and eid not in seen:
+            seen.add(eid)
+            collected.append(eid)
+
+    return collected
+
+
+def _prepare_websocket_subscription(user_id: str, settings, app) -> Optional[dict[str, Any]]:
+    """Build filters/meta/signature for a websocket subscription update."""
+    try:
+        stripped_tags, tags_norm = _normalize_tracked_tags(settings)
+    except Exception:
+        stripped_tags, tags_norm = [], tuple()
+
+    try:
+        eff_pub = get_effective_pubkey(settings)
+    except Exception:
+        eff_pub = getattr(settings, 'effective_pubkey', None)
+
+    ukey = user_id if user_id is not None else 'None'
+    overlap_seconds = int(os.getenv("CYBERHERD_SINCE_OVERLAP_SECONDS", "300") or 300)
+    initial_limit = int(os.getenv("CYBERHERD_INITIAL_LIMIT", "500") or 500)
+
+    base_since = _local_midnight_timestamp()
+    try:
+        st = getattr(app, 'state', app)
+        shared = int(getattr(st, 'cyberherd_social_last_seen_ts', 0) or 0)
+    except Exception:
+        shared = 0
+    local_last = int(_last_seen.get(ukey, 0) or 0)
+    watermark = max(shared, local_last, base_since)
+    since = max(base_since, watermark - overlap_seconds)
+
+    filters: list[dict[str, Any]] = []
+    if eff_pub:
+        if stripped_tags:
+            notes_tagged_filter = {"kinds": [1], "#t": stripped_tags, "authors": [eff_pub], "since": since}
+            if _first_cycle.get(ukey, True) and initial_limit > 0:
+                notes_tagged_filter['limit'] = initial_limit
+            filters.append(notes_tagged_filter)
+
+        notes_author_filter = {"kinds": [1], "authors": [eff_pub], "since": since}
+        if _first_cycle.get(ukey, True) and initial_limit > 0:
+            notes_author_filter['limit'] = initial_limit
+        filters.append(notes_author_filter)
+
+    tracked_event_ids = _collect_tracked_event_ids_for_subscription(settings, app, eff_pub, tags_norm)
+
+    react_kinds: list[int] = []
+    repost_enabled = bool(getattr(settings, 'repost_tracking_enabled', False))
+    likes_enabled = bool(getattr(settings, 'likes_tracking_enabled', False))
+    if repost_enabled:
+        react_kinds.append(6)
+    if likes_enabled:
+        react_kinds.append(7)
+
+    if react_kinds and tracked_event_ids:
+        filters.append({"kinds": react_kinds, "#e": tracked_event_ids, "since": since})
+        if 6 in react_kinds and repost_enabled:
+            filters.append({"kinds": [6], "since": since, "limit": CYBERHERD_BROAD_REPOST_LIMIT})
+
+    meta = {
+        'tags': list(tags_norm),
+        'eff_pub': eff_pub,
+        'fallback': False,
+        'appended': 0,
+        'initial_done': False,
+        'since': since,
+        'websocket': True,
+        'repost_enabled': repost_enabled,
+        'likes_enabled': likes_enabled,
+    }
+
+    signature_payload = [
+        (eff_pub or "").lower(),
+        "|".join(tags_norm),
+        "1" if repost_enabled else "0",
+        "1" if likes_enabled else "0",
+        "|".join(sorted(eid.lower() for eid in tracked_event_ids)),
+    ]
+    signature = hashlib.sha256("::".join(signature_payload).encode("utf-8")).hexdigest()
+
+    return {
+        "filters": filters,
+        "meta": meta,
+        "signature": signature,
+        "tracked_event_ids": tracked_event_ids,
+    }
+
+
+async def _issue_websocket_subscription(
+    user_id: str,
+    settings,
+    app,
+    *,
+    replace: bool = False,
+    prepared: Optional[dict[str, Any]] = None,
+    reason: str | None = None,
+) -> bool:
+    """Send or refresh a WebSocket REQ for the given user."""
+    ws_info = _websocket_connections.get(user_id)
+    if not ws_info:
+        return False
+
+    websocket = ws_info.get('websocket')
+    if websocket is None or getattr(websocket, 'closed', False):
+        return False
+
+    if prepared is None:
+        prepared = _prepare_websocket_subscription(user_id, settings, app)
+
+    if not prepared:
+        return False
+
+    filters = list(prepared.get('filters') or [])
+    signature = prepared.get('signature')
+    meta_source = prepared.get('meta') or {}
+    tracked_event_ids = list(prepared.get('tracked_event_ids') or [])
+
+    old_sub_id = ws_info.get('sub_id')
+
+    if not filters:
+        if replace and old_sub_id:
+            try:
+                await websocket.send(json.dumps(["CLOSE", old_sub_id]))
+            except Exception as e:
+                logger.debug(f"Cyberherd: failed to close websocket sub {old_sub_id} for user {user_id}: {e}")
+            if old_sub_id in _subscriptions:
+                del _subscriptions[old_sub_id]
+        ws_info['sub_id'] = None
+        ws_info['config_signature'] = signature
+        ws_info['tracked_event_ids'] = tracked_event_ids
+        if reason:
+            logger.info(f"Cyberherd: skipping websocket subscription update for user {user_id} (no filters; reason={reason})")
+        else:
+            logger.info(f"Cyberherd: skipping websocket subscription update for user {user_id} (no filters)")
+        return False
+
+    new_sub_id = secrets.token_hex(6) if (replace or not old_sub_id) else old_sub_id
+
+    if replace and old_sub_id and old_sub_id != new_sub_id:
+        try:
+            await websocket.send(json.dumps(["CLOSE", old_sub_id]))
+        except Exception as e:
+            logger.debug(f"Cyberherd: failed to close websocket sub {old_sub_id} for user {user_id}: {e}")
+        if old_sub_id in _subscriptions:
+            del _subscriptions[old_sub_id]
+
+    try:
+        await websocket.send(json.dumps(["REQ", new_sub_id] + filters))
+    except Exception as e:
+        logger.error(f"Cyberherd: failed to send websocket REQ for user {user_id}: {e}")
+        return False
+
+    subscription_meta = dict(meta_source)
+    subscription_meta.update({'user_id': user_id})
+    _subscriptions[new_sub_id] = subscription_meta
+
+    ws_info['sub_id'] = new_sub_id
+    ws_info['config_signature'] = signature
+    ws_info['tracked_event_ids'] = tracked_event_ids
+    ws_info['last_subscription_at'] = datetime.now(timezone.utc)
+
+    action = "Refreshed" if replace and old_sub_id else "Issued"
+    logger.info(
+        f"Cyberherd: {action} WebSocket subscription {new_sub_id} for user {user_id} "
+        f"(filters={len(filters)}, tracked={len(tracked_event_ids)})"
+    )
+    if reason:
+        _dbg("WebSocket subscription update for %s reason=%s", user_id, reason)
+
+    return True
+
+
+async def _ensure_websocket_subscription_current(user_id: str, settings, app, *, reason: str | None = None) -> bool:
+    """Ensure active websocket subscription matches latest configuration."""
+    ws_info = _websocket_connections.get(user_id)
+    if not ws_info:
+        return False
+
+    prepared = _prepare_websocket_subscription(user_id, settings, app)
+    if not prepared:
+        return False
+
+    current_sig = ws_info.get('config_signature')
+    replace = bool(ws_info.get('sub_id'))
+    if replace and current_sig == prepared.get('signature'):
+        return False
+
+    return await _issue_websocket_subscription(
+        user_id,
+        settings,
+        app,
+        replace=replace,
+        prepared=prepared,
+        reason=reason or "config_change",
+    )
 
 def get_diagnostics_snapshot():
     if not CYBERHERD_DIAG:
@@ -334,7 +591,6 @@ async def _connect_websocket_for_user(user_id: str, settings, app) -> bool:
     port = getattr(app.state, 'port', None) or os.getenv('LNBITS_PORT', '5000')
     ws_url = f"ws://localhost:{port}/nostrclient/api/v1/relay"
 
-    sub_id = secrets.token_hex(6)
     reconnect_attempts = 0
 
     while reconnect_attempts < CYBERHERD_WS_MAX_RECONNECT_ATTEMPTS:
@@ -345,7 +601,9 @@ async def _connect_websocket_for_user(user_id: str, settings, app) -> bool:
             # Store connection info
             _websocket_connections[user_id] = {
                 'websocket': websocket,
-                'sub_id': sub_id,
+                'sub_id': None,
+                'config_signature': None,
+                'tracked_event_ids': [],
                 'connected_at': datetime.now(timezone.utc),
                 'reconnect_attempts': reconnect_attempts
             }
@@ -354,9 +612,16 @@ async def _connect_websocket_for_user(user_id: str, settings, app) -> bool:
             asyncio.create_task(_handle_websocket_messages(user_id, websocket, settings, app))
 
             # Send subscription request
-            await _send_websocket_subscription(user_id, websocket, settings, app)
+            success = await _send_websocket_subscription(user_id, websocket, settings, app)
 
-            logger.info(f"WebSocket connection established for user {user_id} with sub_id {sub_id}")
+            ws_info = _websocket_connections.get(user_id, {})
+            active_sub_id = ws_info.get('sub_id')
+            if success:
+                logger.info(
+                    f"WebSocket connection established for user {user_id} with sub_id {active_sub_id}"
+                )
+                return True
+            logger.info(f"WebSocket connection established for user {user_id} (no active subscription yet)")
             return True
 
         except (ConnectionClosedError, WebSocketException, OSError) as e:
@@ -480,118 +745,7 @@ async def _process_eose_message(user_id: str, sub_id: str, settings, app):
 
 async def _send_websocket_subscription(user_id: str, websocket, settings, app):
     """Send subscription request over WebSocket."""
-    sub_id = _websocket_connections[user_id]['sub_id']
-
-    overlap_seconds = int(os.getenv("CYBERHERD_SINCE_OVERLAP_SECONDS", "300") or 300)
-    initial_limit = int(os.getenv("CYBERHERD_INITIAL_LIMIT", "500") or 500)
-    broad_repost_limit = CYBERHERD_BROAD_REPOST_LIMIT
-
-    base_since = _local_midnight_timestamp()
-    # Prefer shared monotonic watermark from app.state when available
-    st = getattr(app, 'state', app)
-    shared = int(getattr(st, 'cyberherd_social_last_seen_ts', 0) or 0)
-    local = int(_last_seen.get(user_id or 'None', 0) or 0)
-    watermark = max(shared, local, base_since)
-    since = max(base_since, watermark - overlap_seconds)
-
-    # Build filters list
-    filters = []
-
-    # Strip # from tracked tags for Nostr filter (kept for cache normalization)
-    stripped_tags = [t.lstrip('#') for t in (getattr(settings, 'tracked_tags', []) or [])]
-
-    # Filter 1a: Notes (kind 1) authored by the effective pubkey with #t tag filter
-    eff_pub = None
-    try:
-        eff_pub = get_effective_pubkey(settings)
-    except Exception:
-        eff_pub = getattr(settings, 'effective_pubkey', None)
-
-    if eff_pub:
-        if stripped_tags:
-            notes_tagged_filter = {"kinds": [1], "#t": stripped_tags, "authors": [eff_pub], "since": since}
-            if _first_cycle.get(user_id or 'None', True) and initial_limit > 0:
-                notes_tagged_filter['limit'] = initial_limit
-            filters.append(notes_tagged_filter)
-        # Filter 1b: Notes (kind 1) authored by the effective pubkey WITHOUT #t filter (catches all author's notes)
-        notes_author_filter = {"kinds": [1], "authors": [eff_pub], "since": since}
-        if _first_cycle.get(user_id or 'None', True) and initial_limit > 0:
-            notes_author_filter['limit'] = initial_limit
-        filters.append(notes_author_filter)
-
-    # Get tracked event IDs
-    # Prefer today's detected note ids from the in-memory cache. Only open
-    # engagement subscriptions when there are today note ids (filter by #e tags).
-    try:
-        cache = _get_cache(app)
-        try:
-            boundaries = _get_today_boundaries_utc()
-            day = boundaries.utc_day_str
-        except Exception:
-            day = None
-        eff = get_effective_pubkey(settings)
-        tags_norm = tuple(sorted([t.lstrip('#').lower() for t in (getattr(settings, 'tracked_tags', []) or []) if t]))
-        tracked_event_ids = []
-        if day is not None:
-            keys = [(day, getattr(settings, 'user_id', None), eff, tags_norm), (day, None, eff, tags_norm)]
-            seen = set()
-            for k in keys:
-                try:
-                    lst = cache.get(k) or []
-                    for e in lst:
-                        if isinstance(e, str) and e not in seen:
-                            seen.add(e)
-                except Exception:
-                    continue
-            tracked_event_ids = list(seen)
-        # Fallback: if no today ids in cache, also consider persisted tracked_event_ids
-        if not tracked_event_ids:
-            tracked_event_ids = getattr(settings, 'tracked_event_ids', []) or []
-    except Exception as _e:
-        # On any error reading the runtime cache, fall back to persisted configured IDs
-        logger.debug(f"Could not read today cache for engagement filters: {_e}")
-        tracked_event_ids = getattr(settings, 'tracked_event_ids', []) or []
-    
-    # Filter 2: Reposts/reactions (kinds 6/7) - ONLY #e filter, NO #t restriction
-    react_kinds = []
-    if getattr(settings, 'repost_tracking_enabled', False):
-        react_kinds.append(6)
-    if getattr(settings, 'likes_tracking_enabled', False):
-        react_kinds.append(7)
-    
-    # Only create engagement filter when we have event ids to track (prefer today ids)
-    if react_kinds and tracked_event_ids:
-        # Only filter by #e (tracked event IDs) - no #t tag requirement for reposts/reactions
-        react_filter = {"kinds": react_kinds, "#e": tracked_event_ids, "since": since}
-        filters.append(react_filter)
-        # Safety-net: also subscribe to broad kind=6 (reposts) without #e so we can
-        # detect content-only reposts client-side. Use a larger limit for the broad
-        # filter and rely on client-side filtering to reduce false positives.
-        try:
-            if 6 in react_kinds and getattr(settings, 'repost_tracking_enabled', False):
-                # Only add broad repost safety-net when we have at least one tracked id
-                broad_repost_filter = {"kinds": [6], "since": since, "limit": CYBERHERD_BROAD_REPOST_LIMIT}
-                filters.append(broad_repost_filter)
-        except Exception:
-            pass
-
-    # Send REQ message with multiple filters
-    req_message = ["REQ", sub_id] + filters
-    await websocket.send(json.dumps(req_message))
-
-    # Store subscription metadata
-    _subscriptions[sub_id] = {
-        'user_id': user_id,
-        'tags': [t.lower() for t in stripped_tags],
-        'eff_pub': settings.effective_pubkey,
-        'fallback': False,
-        'appended': 0,
-        'initial_done': False,
-        'since': since,
-        'websocket': True
-    }
-
-    logger.info(f"Sent WebSocket subscription {sub_id} for user {user_id}")
+    return await _issue_websocket_subscription(user_id, settings, app, replace=False, reason="initial")
 
 
 async def _disconnect_websocket_for_user(user_id: str):
@@ -1347,7 +1501,20 @@ async def _manager_loop(app):
                         })
                         del _subscriptions[sid]
                         _dbg("Resubscribed (config change) user=%s old=%s new=%s pubkey=%s tags=%s", ctx['user_id'], sid, new_id, ctx['eff_pub'], ctx['tags'])
-            
+
+                try:
+                    ws_user_id = ctx.get('user_id')
+                    if ws_user_id is not None and ws_user_id in _websocket_connections:
+                        await _ensure_websocket_subscription_current(
+                            ws_user_id,
+                            ctx.get('settings'),
+                            app,
+                            reason="force_refresh" if force_refresh else "reconcile",
+                        )
+                except Exception as e:
+                    logger.debug(f"Cyberherd: websocket refresh check failed for user {ctx.get('user_id')}: {e}")
+                    continue
+
             # Update status
             st_status = getattr(st, 'cyberherd_subscription_status', {}) or {}
             st_status['users'] = sorted({m['user_id'] for m in _subscriptions.values()})
