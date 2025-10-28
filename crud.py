@@ -1768,7 +1768,10 @@ async def _bootstrap_cyberherd_tables():
             note_id TEXT,
             zapper_pubkey TEXT,
             amount INTEGER,
-            processed_at TEXT
+            processed_at TEXT,
+            zap_receipt_id TEXT,
+            payment_hash TEXT,
+            amount_sats INTEGER
         );
         """
     )
@@ -1793,6 +1796,59 @@ async def _bootstrap_cyberherd_tables():
             await db.execute(s)
         except Exception:
             pass
+    processed_zaps_table = f"{db.references_schema}processed_zaps"
+    if db.references_schema.endswith("."):
+        processed_zaps_schema_table = f"{db.references_schema[:-1]}.processed_zaps"
+    else:
+        processed_zaps_schema_table = processed_zaps_table
+    processed_zap_columns = {
+        "event_id": "TEXT",
+        "note_id": "TEXT",
+        "zapper_pubkey": "TEXT",
+        "amount": "INTEGER",
+        "processed_at": "TEXT",
+        "zap_receipt_id": "TEXT",
+        "payment_hash": "TEXT",
+        "amount_sats": "INTEGER",
+    }
+    for column, column_type in processed_zap_columns.items():
+        try:
+            has_column = await _column_exists(processed_zaps_schema_table, column)
+        except Exception:
+            has_column = False
+        if not has_column:
+            try:
+                await db.execute(
+                    f"ALTER TABLE {processed_zaps_table} ADD COLUMN {column} {column_type};"
+                )
+            except Exception:
+                pass
+    index_statements = [
+        f"CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_event ON {processed_zaps_table}(user_id, event_id);",
+        f"CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_note ON {processed_zaps_table}(user_id, note_id);",
+        f"CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_zapper ON {processed_zaps_table}(user_id, zapper_pubkey);",
+    ]
+    for stmt in index_statements:
+        try:
+            await db.execute(stmt)
+        except Exception:
+            pass
+    unique_statements = [
+        f"CREATE UNIQUE INDEX IF NOT EXISTS uq_processed_zaps_user_event ON {processed_zaps_table}(user_id, event_id) WHERE event_id IS NOT NULL;",
+        f"CREATE UNIQUE INDEX IF NOT EXISTS uq_processed_zaps_user_receipt ON {processed_zaps_table}(user_id, zap_receipt_id) WHERE zap_receipt_id IS NOT NULL;",
+    ]
+    for stmt in unique_statements:
+        try:
+            await db.execute(stmt)
+        except Exception:
+            pass
+    try:
+        await db.execute(
+            f"ALTER TABLE {processed_zaps_table} ALTER COLUMN processed_at TYPE TEXT USING processed_at::text;"
+        )
+    except Exception:
+        # SQLite and other backends may not support ALTER COLUMN; ignore
+        pass
     try:
         if not await _column_exists(schema_table, "nip05"):
             await db.execute(f"ALTER TABLE {table_name} ADD COLUMN nip05 TEXT;")
@@ -2017,7 +2073,17 @@ async def get_processed_zap(user_id: str, event_id: str):
     except Exception as e:
         msg = str(e).lower()
         # If the table is missing in Postgres/SQLite, attempt runtime bootstrap then retry once
-        if any(t in msg for t in ("undefinedtable", "does not exist", "no such table")):
+        if any(
+            t in msg
+            for t in (
+                "undefinedtable",
+                "does not exist",
+                "no such table",
+                "undefinedcolumn",
+                "undefined column",
+                "no such column",
+            )
+        ):
             try:
                 await _bootstrap_cyberherd_tables()
                 row = await db.fetchone(
@@ -2076,7 +2142,17 @@ async def create_processed_zap(processed_zap_data: dict):
         return payload
     except Exception as e:
         msg = str(e).lower()
-        if any(t in msg for t in ("undefinedtable", "does not exist", "no such table")):
+        if any(
+            t in msg
+            for t in (
+                "undefinedtable",
+                "does not exist",
+                "no such table",
+                "undefinedcolumn",
+                "undefined column",
+                "no such column",
+            )
+        ):
             try:
                 await _bootstrap_cyberherd_tables()
                 await db.execute(
@@ -2183,7 +2259,13 @@ async def fetch_processed_zaps(
         msg = str(e).lower()
         if any(
             keyword in msg
-            for keyword in ("undefinedtable", "does not exist", "no such table")
+            for keyword in (
+                "undefinedtable",
+                "does not exist",
+                "no such table",
+                "no such column",
+                "undefined column",
+            )
         ):
             try:
                 await _bootstrap_cyberherd_tables()

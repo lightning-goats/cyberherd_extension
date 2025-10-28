@@ -99,10 +99,11 @@ async def _verify_nip05_relaxed(pubkey: str, nip05: str) -> tuple[Optional[bool]
     if not identity or "@" not in identity:
         return False, "invalid_format"
 
-    username, domain = identity.split("@", 1)
-    username = username.strip().lower()
+    username_raw, domain = identity.split("@", 1)
+    username_raw = username_raw.strip()
     domain = domain.strip()
-    if not username or not domain:
+    username_lower = username_raw.lower()
+    if not username_raw or not domain:
         return False, "invalid_format"
 
     errors: list[str] = []
@@ -142,33 +143,41 @@ async def _verify_nip05_relaxed(pubkey: str, nip05: str) -> tuple[Optional[bool]
         errors.append(f"fallback:{exc}")
 
     # First attempt: direct ?name= lookup
-    url = f"https://{domain}/.well-known/nostr.json?name={username}"
-    data: dict[str, Any] | None = None
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, timeout=10)
-            resp.raise_for_status()
-            parsed = resp.json()
-        if isinstance(parsed, dict):
-            data = parsed
-    except Exception as exc:
-        errors.append(f"direct:{exc}")
+    async def _try_lookup(query_name: str | None, label: str) -> tuple[Optional[bool], Optional[str]]:
+        url = f"https://{domain}/.well-known/nostr.json"
+        if query_name is not None:
+            url = f"{url}?name={query_name}"
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, timeout=10)
+                resp.raise_for_status()
+                parsed = resp.json()
+        except Exception as exc:
+            errors.append(f"{label}:{exc}")
+            return None, None
 
-    if data is not None:
+        if not isinstance(parsed, dict):
+            errors.append(f"{label}:invalid_payload")
+            return None, "invalid_payload"
+
         candidate_raw = None
         try:
-            names = data.get("names", {}) if isinstance(data, dict) else {}
+            names = parsed.get("names")
             if isinstance(names, dict):
                 for key, value in names.items():
-                    if isinstance(key, str) and key.strip().lower() == username:
+                    if isinstance(key, str) and key.strip().lower() == username_lower:
                         candidate_raw = value
                         break
             if candidate_raw is None:
-                profiles = data.get("profiles") if isinstance(data, dict) else None
+                profiles = parsed.get("profiles")
                 if isinstance(profiles, dict):
-                    profile_entry = profiles.get(username)
-                    if isinstance(profile_entry, dict):
-                        candidate_raw = profile_entry.get("pubkey")
+                    for key, value in profiles.items():
+                        if isinstance(key, str) and key.strip().lower() == username_lower:
+                            if isinstance(value, dict):
+                                candidate_raw = value.get("pubkey")
+                            elif isinstance(value, str):
+                                candidate_raw = value
+                            break
         except Exception:
             candidate_raw = None
 
@@ -176,11 +185,30 @@ async def _verify_nip05_relaxed(pubkey: str, nip05: str) -> tuple[Optional[bool]
         if candidate_norm and candidate_norm == pubkey_norm:
             return True, "direct_match"
         if candidate_norm:
-            last_reason = "direct_mismatch"
-            errors.append(f"direct_mismatch:{candidate_norm}")
-        else:
-            last_reason = "mapping_missing"
-            errors.append("mapping_missing")
+            errors.append(f"{label}:mismatch:{candidate_norm}")
+            return False, "direct_mismatch"
+        errors.append(f"{label}:mapping_missing")
+        return False, "mapping_missing"
+
+    lookup_attempts: list[tuple[Optional[str], str]] = []
+    if username_lower:
+        lookup_attempts.append((username_lower, "direct_lower"))
+    if username_raw and username_raw != username_lower:
+        lookup_attempts.append((username_raw, "direct_case"))
+    lookup_attempts.append((None, "direct_full"))
+
+    for query_name, label in lookup_attempts:
+        result, reason = await _try_lookup(query_name, label)
+        if result is True:
+            return True, reason or "direct_match"
+        if result is False:
+            last_reason = reason
+            if reason != "mapping_missing":
+                return False, reason
+            # mapping missing - try next variant
+            continue
+        # result is None - keep trying other strategies
+        continue
 
     if last_reason:
         return False, last_reason

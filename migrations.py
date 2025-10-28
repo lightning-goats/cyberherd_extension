@@ -26,6 +26,7 @@ __all__ = [
     'm025_migrate_legacy_userids',
     'm026_add_zap_totals_table',
     'm027_add_feeder_trigger_sats',
+    'm028_sync_processed_zaps_schema',
 ]
 
 logger.info(f"CYBERHERD MIGRATIONS: Registered {len(__all__)} migrations: {__all__}")
@@ -165,12 +166,15 @@ async def m001_consolidated_schema(db: Database):
         CREATE TABLE IF NOT EXISTS cyberherd.processed_zaps (
             id {db.serial_primary_key},
             user_id TEXT NOT NULL,
-            zap_receipt_id TEXT NOT NULL,
-            payment_hash TEXT NOT NULL,
-            note_id TEXT NOT NULL,
-            zapper_pubkey TEXT NOT NULL,
-            amount_sats INTEGER NOT NULL,
-            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            event_id TEXT,
+            note_id TEXT,
+            zapper_pubkey TEXT,
+            amount INTEGER,
+            processed_at TEXT,
+            zap_receipt_id TEXT,
+            payment_hash TEXT,
+            amount_sats INTEGER,
+            UNIQUE(user_id, event_id),
             UNIQUE(user_id, zap_receipt_id)
         );
         """
@@ -179,11 +183,20 @@ async def m001_consolidated_schema(db: Database):
     # Indices for processed_zaps
     try:
         await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_event ON cyberherd.processed_zaps(user_id, event_id);"
+        )
+        await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_note ON cyberherd.processed_zaps(user_id, note_id);"
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_zapper ON cyberherd.processed_zaps(user_id, zapper_pubkey);"
         )
+        try:
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_receipt ON cyberherd.processed_zaps(user_id, zap_receipt_id) WHERE zap_receipt_id IS NOT NULL;"
+            )
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -384,3 +397,78 @@ async def m026_add_zap_totals_table(db: Database):
         logger.info("CyberHerd m026: zap_totals table ready")
     except Exception as e:
         logger.warning(f"CyberHerd m026: failed ensuring zap_totals table: {e}")
+
+
+async def m028_sync_processed_zaps_schema(db: Database):
+    """Ensure processed_zaps table has the unified legacy/new columns."""
+    logger.info("CYBERHERD m028: syncing processed_zaps table schema")
+    table_name = "cyberherd.processed_zaps"
+    try:
+        await db.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                id {db.serial_primary_key},
+                user_id TEXT NOT NULL,
+                event_id TEXT,
+                note_id TEXT,
+                zapper_pubkey TEXT,
+                amount INTEGER,
+                processed_at TEXT,
+                zap_receipt_id TEXT,
+                payment_hash TEXT,
+                amount_sats INTEGER,
+                UNIQUE(user_id, event_id),
+                UNIQUE(user_id, zap_receipt_id)
+            );
+            """
+        )
+    except Exception as e:
+        logger.debug(f"CYBERHERD m028: base table ensure failed (may already exist): {e}")
+    alter_statements = [
+        f"ALTER TABLE {table_name} ADD COLUMN event_id TEXT;",
+        f"ALTER TABLE {table_name} ADD COLUMN note_id TEXT;",
+        f"ALTER TABLE {table_name} ADD COLUMN zapper_pubkey TEXT;",
+        f"ALTER TABLE {table_name} ADD COLUMN amount INTEGER;",
+        f"ALTER TABLE {table_name} ADD COLUMN processed_at TEXT;",
+        f"ALTER TABLE {table_name} ADD COLUMN zap_receipt_id TEXT;",
+        f"ALTER TABLE {table_name} ADD COLUMN payment_hash TEXT;",
+        f"ALTER TABLE {table_name} ADD COLUMN amount_sats INTEGER;",
+    ]
+    for stmt in alter_statements:
+        try:
+            await db.execute(stmt)
+        except Exception as e:
+            msg = str(e).lower()
+            if any(token in msg for token in ("duplicate", "already exists", "syntax error", "duplicate column")):
+                continue
+            logger.debug(f"CYBERHERD m028: alter skipped ({stmt}): {e}")
+
+    index_statements = [
+        "CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_event ON cyberherd.processed_zaps(user_id, event_id);",
+        "CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_note ON cyberherd.processed_zaps(user_id, note_id);",
+        "CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_zapper ON cyberherd.processed_zaps(user_id, zapper_pubkey);",
+    ]
+    for stmt in index_statements:
+        try:
+            await db.execute(stmt)
+        except Exception:
+            pass
+    try:
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_processed_zaps_user_event ON cyberherd.processed_zaps(user_id, event_id) WHERE event_id IS NOT NULL;"
+        )
+    except Exception:
+        pass
+    try:
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_processed_zaps_user_receipt ON cyberherd.processed_zaps(user_id, zap_receipt_id) WHERE zap_receipt_id IS NOT NULL;"
+        )
+    except Exception:
+        pass
+    try:
+        await db.execute(
+            "ALTER TABLE cyberherd.processed_zaps ALTER COLUMN processed_at TYPE TEXT USING processed_at::text;"
+        )
+    except Exception:
+        pass
+    logger.info("CYBERHERD m028: processed_zaps schema sync complete")
