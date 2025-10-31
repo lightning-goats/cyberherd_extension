@@ -98,6 +98,20 @@ _diag_counts = {
     'fallback_resubs': 0,
 }
 
+# Optional provider callback that returns prepared filters for a user.
+# Signature: async def provider(app, ctx) -> dict | None  (should return {'filters': [...], optional keys})
+_filter_provider: Optional[Any] = None
+
+
+def register_filter_provider(cb: Any):
+    """Register a provider callback used to build per-user filters.
+
+    The provider should accept (app, ctx) and return either None or a dict
+    containing at least a 'filters' key with a list of nostr filters.
+    """
+    global _filter_provider
+    _filter_provider = cb
+
 
 def _normalize_tracked_tags(settings) -> tuple[list[str], tuple[str, ...]]:
     """Return (stripped_tags, normalized_tags_tuple) for subscription filters."""
@@ -1331,90 +1345,106 @@ async def _manager_loop(app):
                     watermark = max(shared, local, base_since)
                     since = max(base_since, watermark - overlap_seconds)
                     
-                    # Build filters
+                    # Allow external provider to supply prepared filters for this user
                     filters = []
-                    
-                    # Filter 1a: Notes (kind 1) with #t tags by effective pubkey
-                    if ctx.get('filter_tags') or ctx['tags']:
-                        notes_tagged_filter = {
+                    try:
+                        if _filter_provider is not None:
+                            prepared = _filter_provider(app, ctx)
+                            if asyncio.iscoroutine(prepared):
+                                prepared = await prepared
+                            if prepared and isinstance(prepared, dict) and prepared.get('filters'):
+                                filters = prepared.get('filters') or []
+                                _dbg("Using provider-supplied filters for user=%s filters=%s", ctx.get('user_id'), len(filters))
+                                # If provider returned filters, skip local construction
+                                # (provider is authoritative)
+                                pass
+                    except Exception:
+                        # Fall back to local construction on any provider error
+                        filters = []
+
+                    # If provider did not supply filters, continue with local construction
+                    if not filters:
+                        # Filter 1a: Notes (kind 1) with #t tags by effective pubkey
+                        if ctx.get('filter_tags') or ctx['tags']:
+                            notes_tagged_filter = {
+                                "kinds": [1], 
+                                "#t": ctx.get('filter_tags', ctx['tags']), 
+                                "authors": [ctx['eff_pub']], 
+                                "since": since
+                            }
+                            if _first_cycle.get(ukey, True) and initial_limit > 0:
+                                notes_tagged_filter['limit'] = initial_limit
+                            filters.append(notes_tagged_filter)
+                        
+                        # Filter 1b: Notes (kind 1) by effective pubkey WITHOUT #t filter (catches all author's notes)
+                        notes_author_filter = {
                             "kinds": [1], 
-                            "#t": ctx.get('filter_tags', ctx['tags']), 
                             "authors": [ctx['eff_pub']], 
                             "since": since
                         }
                         if _first_cycle.get(ukey, True) and initial_limit > 0:
-                            notes_tagged_filter['limit'] = initial_limit
-                        filters.append(notes_tagged_filter)
-                    
-                    # Filter 1b: Notes (kind 1) by effective pubkey WITHOUT #t filter (catches all author's notes)
-                    notes_author_filter = {
-                        "kinds": [1], 
-                        "authors": [ctx['eff_pub']], 
-                        "since": since
-                    }
-                    if _first_cycle.get(ukey, True) and initial_limit > 0:
-                        notes_author_filter['limit'] = initial_limit
-                    filters.append(notes_author_filter)
-                    
-                    # Filter 2: Engagement events (kinds 6/7) - ONLY #e filter, NO #t restriction
-                    # Zaps are handled via invoice listener and are not subscribed here
-                    engagement_kinds = []
-                    if ctx.get('repost_tracking_enabled', False):
-                        engagement_kinds.append(6)
-                    if ctx.get('likes_tracking_enabled', False):
-                        engagement_kinds.append(7)
-                    
-                    # Log engagement tracking status for debugging
-                    logger.info(
-                        f"Engagement tracking for user {ctx['user_id']}: "
-                        f"repost={ctx.get('repost_tracking_enabled', False)}, "
-                        f"likes={ctx.get('likes_tracking_enabled', False)}, "
-                        f"kinds={engagement_kinds}"
-                    )
-                    
-                    if engagement_kinds:
-                        # Get tracked event IDs from settings
-                        try:
-                            settings = ctx.get('settings', {})
-                            tracked_event_ids = getattr(settings, 'tracked_event_ids', []) or []
-                            
-                            logger.info(
-                                f"📝 Tracked event IDs for user {ctx['user_id']}: "
-                                f"count={len(tracked_event_ids)}, "
-                                f"sample={tracked_event_ids[:3] if tracked_event_ids else 'none'}"
-                            )
-                            
-                            if tracked_event_ids:
-                                # Only create subscription if we have specific event IDs to track
-                                # This prevents unnecessary relay queries and ensures efficient filtering
-                                engagement_filter = {"kinds": engagement_kinds, "#e": tracked_event_ids, "since": since}
-                                filters.append(engagement_filter)
-                                # Safety-net: also add a broad kind=6 only filter (no #e) so content-only
-                                # reposts can be recovered client-side. Use a higher limit controlled
-                                # by CYBERHERD_BROAD_REPOST_LIMIT.
-                                try:
-                                    if 6 in engagement_kinds:
-                                        broad_repost_filter = {"kinds": [6], "since": since, "limit": CYBERHERD_BROAD_REPOST_LIMIT}
-                                        filters.append(broad_repost_filter)
-                                except Exception:
-                                    pass
+                            notes_author_filter['limit'] = initial_limit
+                        filters.append(notes_author_filter)
+                        
+                        # Filter 2: Engagement events (kinds 6/7) - ONLY #e filter, NO #t restriction
+                        # Zaps are handled via invoice listener and are not subscribed here
+                        engagement_kinds = []
+                        if ctx.get('repost_tracking_enabled', False):
+                            engagement_kinds.append(6)
+                        if ctx.get('likes_tracking_enabled', False):
+                            engagement_kinds.append(7)
+                        
+                        # Log engagement tracking status for debugging
+                        logger.info(
+                            f"Engagement tracking for user {ctx['user_id']}: "
+                            f"repost={ctx.get('repost_tracking_enabled', False)}, "
+                            f"likes={ctx.get('likes_tracking_enabled', False)}, "
+                            f"kinds={engagement_kinds}"
+                        )
+                        
+                        if engagement_kinds:
+                            # Get tracked event IDs from settings
+                            try:
+                                settings = ctx.get('settings', {})
+                                tracked_event_ids = getattr(settings, 'tracked_event_ids', []) or []
+                                
                                 logger.info(
-                                    f"✅ Created engagement subscription for user {ctx['user_id']}: "
-                                    f"kinds={engagement_kinds}, tracking {len(tracked_event_ids)} event(s)"
+                                    f"📝 Tracked event IDs for user {ctx['user_id']}: "
+                                    f"count={len(tracked_event_ids)}, "
+                                    f"sample={tracked_event_ids[:3] if tracked_event_ids else 'none'}"
                                 )
-                                _dbg("Created engagement subscription for user=%s kinds=%s event_count=%d", ctx['user_id'], engagement_kinds, len(tracked_event_ids))
-                            else:
-                                # Log why no subscription was created
-                                logger.warning(
-                                    f"⚠️ No engagement subscription created for user {ctx['user_id']}: "
-                                    f"tracked_event_ids is empty (kinds would be {engagement_kinds})"
-                                )
-                            # Note: No subscription created if tracked_event_ids is empty
-                            # Subscriptions will be created automatically via refresh when:
-                            # 1. Startup initialization populates tracked_event_ids with recent notes
-                            # 2. New notes are detected and auto-added to tracked_event_ids
-                        except Exception as e:
-                            logger.warning(f"Error creating engagement filter: {e}")
+                                
+                                if tracked_event_ids:
+                                    # Only create subscription if we have specific event IDs to track
+                                    # This prevents unnecessary relay queries and ensures efficient filtering
+                                    engagement_filter = {"kinds": engagement_kinds, "#e": tracked_event_ids, "since": since}
+                                    filters.append(engagement_filter)
+                                    # Safety-net: also add a broad kind=6 only filter (no #e) so content-only
+                                    # reposts can be recovered client-side. Use a higher limit controlled
+                                    # by CYBERHERD_BROAD_REPOST_LIMIT.
+                                    try:
+                                        if 6 in engagement_kinds:
+                                            broad_repost_filter = {"kinds": [6], "since": since, "limit": CYBERHERD_BROAD_REPOST_LIMIT}
+                                            filters.append(broad_repost_filter)
+                                    except Exception:
+                                        pass
+                                    logger.info(
+                                        f"✅ Created engagement subscription for user {ctx['user_id']}: "
+                                        f"kinds={engagement_kinds}, tracking {len(tracked_event_ids)} event(s)"
+                                    )
+                                    _dbg("Created engagement subscription for user=%s kinds=%s event_count=%d", ctx['user_id'], engagement_kinds, len(tracked_event_ids))
+                                else:
+                                    # Log why no subscription was created
+                                    logger.warning(
+                                        f"⚠️ No engagement subscription created for user {ctx['user_id']}: "
+                                        f"tracked_event_ids is empty (kinds would be {engagement_kinds})"
+                                    )
+                                # Note: No subscription created if tracked_event_ids is empty
+                                # Subscriptions will be created automatically via refresh when:
+                                # 1. Startup initialization populates tracked_event_ids with recent notes
+                                # 2. New notes are detected and auto-added to tracked_event_ids
+                            except Exception as e:
+                                logger.warning(f"Error creating engagement filter: {e}")
                     
                     if CYBERHERD_DIAG:
                         _dbg("DIAG add_sub user=%s sub=%s filter=%s", ctx['user_id'], sub_id, filters)
@@ -1466,50 +1496,63 @@ async def _manager_loop(app):
                         watermark = max(shared, local, base_since)
                         since = max(base_since, watermark - overlap_seconds)
                         
-                        # Build filters
+                        # Allow external provider to supply prepared filters for this user
                         filters = []
-                        
-                        # Filter 1a: Notes (kind 1) with #t tags
-                        if ctx.get('filter_tags') or ctx['tags']:
-                            notes_tagged_filter = {
+                        try:
+                            if _filter_provider is not None:
+                                prepared = _filter_provider(app, ctx)
+                                if asyncio.iscoroutine(prepared):
+                                    prepared = await prepared
+                                if prepared and isinstance(prepared, dict) and prepared.get('filters'):
+                                    filters = prepared.get('filters') or []
+                                    _dbg("Using provider-supplied filters for user=%s (resub) filters=%s", ctx.get('user_id'), len(filters))
+                                    # provider provided filters; skip local build
+                                    pass
+                        except Exception:
+                            filters = []
+
+                        if not filters:
+                            # Filter 1a: Notes (kind 1) with #t tags
+                            if ctx.get('filter_tags') or ctx['tags']:
+                                notes_tagged_filter = {
+                                    "kinds": [1], 
+                                    "#t": ctx.get('filter_tags', ctx['tags']), 
+                                    "authors": [ctx['eff_pub']], 
+                                    "since": since
+                                }
+                                if _first_cycle.get(ukey, True) and initial_limit > 0:
+                                    notes_tagged_filter['limit'] = initial_limit
+                                filters.append(notes_tagged_filter)
+                            
+                            # Filter 1b: Notes (kind 1) WITHOUT #t filter (all author's notes)
+                            notes_author_filter = {
                                 "kinds": [1], 
-                                "#t": ctx.get('filter_tags', ctx['tags']), 
                                 "authors": [ctx['eff_pub']], 
                                 "since": since
                             }
                             if _first_cycle.get(ukey, True) and initial_limit > 0:
-                                notes_tagged_filter['limit'] = initial_limit
-                            filters.append(notes_tagged_filter)
-                        
-                        # Filter 1b: Notes (kind 1) WITHOUT #t filter (all author's notes)
-                        notes_author_filter = {
-                            "kinds": [1], 
-                            "authors": [ctx['eff_pub']], 
-                            "since": since
-                        }
-                        if _first_cycle.get(ukey, True) and initial_limit > 0:
-                            notes_author_filter['limit'] = initial_limit
-                        filters.append(notes_author_filter)
-                        
-                        # Filter 2: Engagement events (reposts/reactions) - ONLY #e filter, NO #t restriction
-                        engagement_kinds = []
-                        if ctx.get('repost_tracking_enabled', False):
-                            engagement_kinds.append(6)
-                        if ctx.get('likes_tracking_enabled', False):
-                            engagement_kinds.append(7)
-                        
-                        if engagement_kinds:
-                            try:
-                                settings = ctx.get('settings', {})
-                                tracked_event_ids = getattr(settings, 'tracked_event_ids', []) or []
-                                if tracked_event_ids:
-                                    # Only create subscription if we have specific event IDs to track
-                                    engagement_filter = {"kinds": engagement_kinds, "#e": tracked_event_ids, "since": since}
-                                    filters.append(engagement_filter)
-                                    _dbg("Created engagement subscription (resub) for user=%s kinds=%s event_ids=%d", ctx.get('user_id'), engagement_kinds, len(tracked_event_ids))
-                                # Note: No subscription created if tracked_event_ids is empty
-                            except Exception as e:
-                                logger.warning(f"Error creating engagement filter (resub): {e}")
+                                notes_author_filter['limit'] = initial_limit
+                            filters.append(notes_author_filter)
+                            
+                            # Filter 2: Engagement events (reposts/reactions) - ONLY #e filter, NO #t restriction
+                            engagement_kinds = []
+                            if ctx.get('repost_tracking_enabled', False):
+                                engagement_kinds.append(6)
+                            if ctx.get('likes_tracking_enabled', False):
+                                engagement_kinds.append(7)
+                            
+                            if engagement_kinds:
+                                try:
+                                    settings = ctx.get('settings', {})
+                                    tracked_event_ids = getattr(settings, 'tracked_event_ids', []) or []
+                                    if tracked_event_ids:
+                                        # Only create subscription if we have specific event IDs to track
+                                        engagement_filter = {"kinds": engagement_kinds, "#e": tracked_event_ids, "since": since}
+                                        filters.append(engagement_filter)
+                                        _dbg("Created engagement subscription (resub) for user=%s kinds=%s event_ids=%d", ctx.get('user_id'), engagement_kinds, len(tracked_event_ids))
+                                    # Note: No subscription created if tracked_event_ids is empty
+                                except Exception as e:
+                                    logger.warning(f"Error creating engagement filter (resub): {e}")
                         
                         if CYBERHERD_DIAG:
                             _dbg("DIAG resub user=%s old=%s new=%s filter=%s", ctx['user_id'], sid, new_id, filters)

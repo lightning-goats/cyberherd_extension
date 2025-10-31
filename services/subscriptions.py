@@ -670,6 +670,35 @@ def trigger_subscription_refresh(app, reason: str | None = None):
     except Exception:
         pass
 
+    # Try to sync the event to the nostr_adapter module so the adapter's
+    # manager loop (which may be waiting on its own _refresh_event) is
+    # reliably woken up immediately instead of waiting for the loop timeout.
+    try:
+        from . import nostr_adapter
+        try:
+            # If adapter has its own _refresh_event, set it or replace it with ours
+            a_ev = getattr(nostr_adapter, '_refresh_event', None)
+            if a_ev is None:
+                try:
+                    setattr(nostr_adapter, '_refresh_event', _refresh_event)
+                except Exception:
+                    pass
+            else:
+                try:
+                    # If adapter event exists, prefer to set it so its wait wakes
+                    a_ev.set()
+                except Exception:
+                    # If setting fails, try to replace it
+                    try:
+                        setattr(nostr_adapter, '_refresh_event', _refresh_event)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    except Exception:
+        # Adapter may not be importable in some contexts; ignore
+        pass
+
     try:
         logger.info(f"Triggered subscription refresh{f' - {reason}' if reason else ''}")
     except Exception:
@@ -771,6 +800,36 @@ def start_subscriptions(app):
 
                     try:
                         nostr_adapter.register_filter_update_callback(_adapter_notify_cb)
+                    except Exception:
+                        pass
+                    try:
+                        # Register a richer provider so the adapter can request
+                        # per-user prepared filters (Option A). The provider will
+                        # delegate to the adapter's internal prepare helper if
+                        # available to avoid duplicating logic.
+                        async def _adapter_filter_provider(a, ctx):
+                            try:
+                                # Attempt to use adapter's prepare helper if present
+                                prep = getattr(nostr_adapter, '_prepare_websocket_subscription', None)
+                                if callable(prep):
+                                    # prep expects (user_id, settings, app)
+                                    uid = ctx.get('user_id')
+                                    settings = ctx.get('settings')
+                                    try:
+                                        res = prep(uid, settings, a)
+                                        if asyncio.iscoroutine(res):
+                                            res = await res
+                                        return res
+                                    except Exception:
+                                        return None
+                                return None
+                            except Exception:
+                                return None
+
+                        try:
+                            nostr_adapter.register_filter_provider(_adapter_filter_provider)
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                 except Exception:
