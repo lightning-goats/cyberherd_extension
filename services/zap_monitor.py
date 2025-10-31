@@ -459,13 +459,18 @@ class ZapMonitorService:
                         pass
 
             # Ensure normalized storage back into payment.extra for future calls
+            # IMPORTANT: Do not store a dict under the "nostr" key because other
+            # parts of the system (e.g. lnbits lnurlp.send_zap) expect a JSON
+            # string and will call json.loads() on it. Store a JSON string to
+            # remain compatible and avoid TypeError: json.loads(dict).
             if zap_request:
                 try:
+                    nostr_str = json.dumps(zap_request)
                     if isinstance(extra_obj, dict):
-                        extra_obj["nostr"] = zap_request
+                        extra_obj["nostr"] = nostr_str
                         payment.extra = extra_obj
                     else:
-                        payment.extra = {"nostr": zap_request}
+                        payment.extra = {"nostr": nostr_str}
                 except Exception:
                     # Best-effort; do not fail if assignment fails
                     pass
