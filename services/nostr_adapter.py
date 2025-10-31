@@ -75,6 +75,18 @@ _websocket_connections: Dict[str, Dict[str, Any]] = {}  # user_id -> ws connecti
 _last_seen: Dict[str, int] = {}  # key: user_id or 'None' -> last seen created_at
 _first_cycle: Dict[str, bool] = {}  # user key -> first cycle pending
 
+# Optional callback for driving filter updates. Signature: async def callback(app, reason:str|None) -> None
+_filter_update_callback: Optional[Any] = None
+
+
+def register_filter_update_callback(cb: Any):
+    """Register a callback to be invoked when subscription updates are considered.
+
+    The callback should accept (app, reason) and may be a coroutine function.
+    """
+    global _filter_update_callback
+    _filter_update_callback = cb
+
 # Diagnostics counters (aggregate)
 _diag_counts = {
     'events_total': 0,
@@ -1257,6 +1269,15 @@ async def _manager_loop(app):
 
     while True:
         try:
+            # Allow external callback to run at the start of each manager cycle.
+            try:
+                if _filter_update_callback is not None:
+                    res = _filter_update_callback(app, None)
+                    if asyncio.iscoroutine(res):
+                        await res
+            except Exception:
+                pass
+
             # Check if forced refresh was requested (e.g., after tracked_event_ids initialization)
             force_refresh = False
             try:
@@ -1265,6 +1286,14 @@ async def _manager_loop(app):
                     force_refresh = True
                     setattr(st, "cyberherd_force_subscription_refresh", False)
                     logger.info("Cyberherd: Processing forced subscription refresh")
+                    # Also notify external callback about the forced refresh
+                    try:
+                        if _filter_update_callback is not None:
+                            cres = _filter_update_callback(app, 'forced_refresh')
+                            if asyncio.iscoroutine(cres):
+                                await cres
+                    except Exception:
+                        pass
             except Exception:
                 pass
             

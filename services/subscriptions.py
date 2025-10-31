@@ -565,6 +565,142 @@ async def _initialize_tracked_event_ids_on_startup(app):
         logger.warning(f"Error in tracked_event_ids initialization: {e}")
 
 
+async def _any_tracked_event_ids_exist(app) -> bool:
+    """Return True if any user with tracking enabled already has tracked_event_ids.
+
+    This is used to decide whether it's safe to start realtime engagement
+    subscriptions that depend on tracked_event_ids.
+    """
+    try:
+        from .. import crud
+        import importlib
+        get_users = None
+        try:
+            core_mod = importlib.import_module('lnbits.core.crud')
+            get_users = getattr(core_mod, 'get_users', None)
+        except Exception:
+            try:
+                from lnbits.core.crud import get_users as _gu  # type: ignore
+                get_users = _gu
+            except Exception:
+                get_users = None
+
+        users = await get_users() if get_users and asyncio.iscoroutinefunction(get_users) else []
+        for user in users:
+            try:
+                settings = await crud.get_settings(user.id)
+                if not settings:
+                    continue
+                if not (getattr(settings, 'repost_tracking_enabled', False) or getattr(settings, 'likes_tracking_enabled', False)):
+                    continue
+                tracked = getattr(settings, 'tracked_event_ids', []) or []
+                if tracked:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
+async def _wait_for_tracked_event_ids(app, timeout_seconds: float = 30.0) -> bool:
+    """Wait up to timeout_seconds for any tracked_event_ids to appear.
+
+    Returns True if tracked_event_ids were detected, False on timeout.
+    """
+    global _refresh_event
+    try:
+        # Fast path: already present
+        if await _any_tracked_event_ids_exist(app):
+            return True
+
+        # Ensure event exists so _append_today can set it when it auto-adds IDs
+        if _refresh_event is None:
+            try:
+                _refresh_event = asyncio.Event()
+            except Exception:
+                _refresh_event = None
+
+        if _refresh_event is None:
+            # Can't rely on event waking, just sleep a bit and re-check
+            await asyncio.sleep(timeout_seconds)
+            return await _any_tracked_event_ids_exist(app)
+
+        try:
+            await asyncio.wait_for(_refresh_event.wait(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            try:
+                _refresh_event.clear()
+            except Exception:
+                pass
+
+        # Give a small moment for DB writes to complete
+        await asyncio.sleep(0.1)
+        return await _any_tracked_event_ids_exist(app)
+    except Exception:
+        return False
+
+
+def trigger_subscription_refresh(app, reason: str | None = None):
+    """Signal the adapter manager to refresh subscriptions immediately.
+
+    This sets a flag on app.state and fires the module-level _refresh_event if present.
+    Can be called by other modules when tracked_event_ids are added/updated.
+    """
+    try:
+        st = getattr(app, 'state', app)
+        setattr(st, 'cyberherd_force_subscription_refresh', True)
+    except Exception:
+        pass
+
+    global _refresh_event
+    try:
+        if _refresh_event is None:
+            try:
+                _refresh_event = asyncio.Event()
+            except Exception:
+                _refresh_event = None
+        if _refresh_event is not None:
+            try:
+                _refresh_event.set()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        logger.info(f"Triggered subscription refresh{f' - {reason}' if reason else ''}")
+    except Exception:
+        pass
+
+
+async def _tracked_ids_monitor(app, check_interval: float = 10.0):
+    """Background monitor that polls for the appearance of tracked_event_ids.
+
+    When a change from no tracked ids to some tracked ids is detected, this
+    triggers a subscription refresh. It runs indefinitely to pick up future
+    additions as well.
+    """
+    try:
+        prev = False
+        while True:
+            try:
+                now_has = await _any_tracked_event_ids_exist(app)
+                if not prev and now_has:
+                    trigger_subscription_refresh(app, reason="tracked_event_ids_detected")
+                prev = now_has
+            except Exception:
+                # Ignore transient errors and continue polling
+                pass
+            await asyncio.sleep(check_interval)
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
+
+
 async def _authoritative_tag_subscription(app):  # kept for backward import paths
     # Delegate start to adapter (idempotent)
     from . import nostr_adapter
@@ -598,8 +734,47 @@ def start_subscriptions(app):
                 # Initialize tracked_event_ids with recent notes before starting subscriptions
                 await _initialize_tracked_event_ids_on_startup(app)
                 
+                # Wait for tracked_event_ids to be initialized before starting the
+                # adapter so engagement subscriptions (kinds 6/7) can be created
+                # immediately. This avoids starting realtime subscriptions too
+                # early when there are no tracked ids.
+                try:
+                    wait_secs = float(os.getenv('CYBERHERD_WAIT_FOR_TRACKED_IDS_SECONDS', '30') or 30)
+                except Exception:
+                    wait_secs = 30.0
+
+                got_tracked = False
+                try:
+                    got_tracked = await _wait_for_tracked_event_ids(app, timeout_seconds=wait_secs)
+                except Exception:
+                    got_tracked = False
+
+                if not got_tracked:
+                    logger.warning(
+                        f"Timed out waiting {wait_secs}s for tracked_event_ids; starting adapter without guaranteed engagement filters"
+                    )
+
                 # Start the adapter (which creates initial subscriptions)
                 await _authoritative_tag_subscription(app)
+                # Register a simple callback with nostr_adapter so it can notify
+                # this module when it considers updating filters. The callback
+                # will trigger a subscription refresh which the adapter already
+                # responds to via its manager loop.
+                try:
+                    from . import nostr_adapter
+
+                    def _adapter_notify_cb(a, reason=None):
+                        try:
+                            trigger_subscription_refresh(a, reason=f"adapter_notify:{reason}")
+                        except Exception:
+                            pass
+
+                    try:
+                        nostr_adapter.register_filter_update_callback(_adapter_notify_cb)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
                 logger.info("Cyberherd nostr adapter started")
                 
                 # CRITICAL: Wait a moment for initial subscriptions to be created,
@@ -628,6 +803,20 @@ def start_subscriptions(app):
                 
                 # Recover missed reposts and reactions on startup
                 await _recover_missed_reposts_and_reactions_on_startup(app)
+                # Start background monitor to watch for tracked_event_ids added later
+                try:
+                    st = getattr(app, 'state', app)
+                    monitor_task = asyncio.create_task(_tracked_ids_monitor(app))
+                    bg = getattr(st, 'cyberherd_bg_tasks', None)
+                    if bg is None:
+                        bg = []
+                        try:
+                            setattr(st, 'cyberherd_bg_tasks', bg)
+                        except Exception:
+                            pass
+                    bg.append(monitor_task)
+                except Exception:
+                    pass
             except Exception as e:  # pragma: no cover
                 logger.warning(f"Cyberherd adapter start failed: {e}")
 
