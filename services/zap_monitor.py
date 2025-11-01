@@ -569,78 +569,118 @@ class ZapMonitorService:
                 f"source: {zap_request_source})"
             )
             
-            # Check subscription readiness for registry operations (non-blocking for headbutt)
-            # Headbutt can proceed independently with its own today-notes validation
-            status = get_subscription_status(self.app)
-            subscriptions_ready = bool(status.get("connected"))
+            # Check if zapper is already an existing active member
+            # Existing members can zap ANY Lightning Goats note to increase their amount
+            # New members must zap today's #CyberHerd tagged note
+            is_existing_member = False
+            try:
+                existing_member = await crud.get_cyberherd_member_by_pubkey(zapper_pubkey, user_id=self.user_id)
+                is_existing_member = bool(existing_member and existing_member.get('is_active'))
+                if is_existing_member:
+                    logger.info(
+                        f"✅ Zapper {zapper_pubkey[:8]}... is an existing active member - "
+                        f"allowing zap to ANY Lightning Goats note"
+                    )
+            except Exception as e:
+                logger.debug(f"Error checking existing membership for {zapper_pubkey[:8]}...: {e}")
+                is_existing_member = False
             
-            if not subscriptions_ready:
-                logger.info(
-                    f"ℹ️  Zap monitor: subscriptions not ready (will proceed with headbutt anyway, "
-                    f"registry updates deferred for note {target_note_id[:8]}...)"
-                )
-            
-            # Check if target note is in today's active note list
-            tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
-            today_success, today_note_ids = await self._get_today_note_ids(settings)
-            if today_success:
-                if target_note_id not in today_note_ids:
-                    if allow_outside_today:
-                        logger.debug(
-                            f"Zap monitor recovery: allowing zap for note {target_note_id[:8]}... "
-                            f"outside today's active note window"
-                        )
-                    else:
-                        logger.info(
-                            f"Zap target {target_note_id[:8]}... is not in today's active note set. Ignoring zap."
-                        )
-                        self.last_error = "note_not_today"
-                        return False
+            # For existing members, only verify the note is authored by Lightning Goats (effective pubkey)
+            # For new members, enforce strict tracking requirements
+            if is_existing_member:
+                # Verify note author matches effective pubkey (Lightning Goats)
+                if target_author:
+                    try:
+                        eff_pub = resolve_effective_pubkey(settings)
+                        if eff_pub and target_author.lower() != eff_pub.lower():
+                            logger.info(
+                                f"Zap target {target_note_id[:8]}... by author {target_author[:8]}... "
+                                f"does not match Lightning Goats pubkey {eff_pub[:8]}... - rejecting"
+                            )
+                            self.last_error = "note_author_mismatch"
+                            return False
+                    except Exception as e:
+                        logger.debug(f"Could not verify note author: {e}")
+                        # Continue optimistically if verification fails
+                else:
+                    logger.debug(
+                        f"No author information for note {target_note_id[:8]}... - "
+                        f"allowing zap for existing member {zapper_pubkey[:8]}..."
+                    )
             else:
-                logger.debug(
-                    "Zap monitor: unable to resolve today's note list for user %s; continuing with tracked note fallback",
-                    self.user_id,
-                )
+                # New member: enforce strict tracking requirements
+                # Check subscription readiness for registry operations (non-blocking for headbutt)
+                # Headbutt can proceed independently with its own today-notes validation
+                status = get_subscription_status(self.app)
+                subscriptions_ready = bool(status.get("connected"))
+                
+                if not subscriptions_ready:
+                    logger.info(
+                        f"ℹ️  Zap monitor: subscriptions not ready (will proceed with headbutt anyway, "
+                        f"registry updates deferred for note {target_note_id[:8]}...)"
+                    )
+                
+                # Check if target note is in today's active note list
+                tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
+                today_success, today_note_ids = await self._get_today_note_ids(settings)
+                if today_success:
+                    if target_note_id not in today_note_ids:
+                        if allow_outside_today:
+                            logger.debug(
+                                f"Zap monitor recovery: allowing zap for note {target_note_id[:8]}... "
+                                f"outside today's active note window"
+                            )
+                        else:
+                            logger.info(
+                                f"Zap target {target_note_id[:8]}... is not in today's active note set. Ignoring zap."
+                            )
+                            self.last_error = "note_not_today"
+                            return False
+                else:
+                    logger.debug(
+                        "Zap monitor: unable to resolve today's note list for user %s; continuing with tracked note fallback",
+                        self.user_id,
+                    )
 
-            timestamps_map = getattr(settings, 'tracked_event_timestamps', {}) or {}
-            is_tracked = target_note_id in tracked_notes
+                timestamps_map = getattr(settings, 'tracked_event_timestamps', {}) or {}
+                is_tracked = target_note_id in tracked_notes
 
-            # Opportunistically register the note if it isn't tracked yet. This can happen
-            # when invoice settlements arrive before subscriptions finish populating
-            # tracked_event_ids on startup or after restarts.
-            # NOTE: Only do this during normal operation, not during recovery mode
-            if not is_tracked and not allow_outside_today:
-                created_at_hint = None
-                try:
-                    candidate = zap_request.get("created_at")
-                    if candidate is not None:
-                        created_at_hint = int(candidate)
-                        if created_at_hint <= 0:
-                            created_at_hint = None
-                except Exception:
+                # Opportunistically register the note if it isn't tracked yet. This can happen
+                # when invoice settlements arrive before subscriptions finish populating
+                # tracked_event_ids on startup or after restarts.
+                # NOTE: Only do this during normal operation, not during recovery mode
+                if not is_tracked and not allow_outside_today:
                     created_at_hint = None
+                    try:
+                        candidate = zap_request.get("created_at")
+                        if candidate is not None:
+                            created_at_hint = int(candidate)
+                            if created_at_hint <= 0:
+                                created_at_hint = None
+                    except Exception:
+                        created_at_hint = None
 
-                if target_author and await self._ensure_note_tracked(settings, target_note_id, created_at_hint, target_author):
-                    tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
-                    is_tracked = target_note_id in tracked_notes
+                    if target_author and await self._ensure_note_tracked(settings, target_note_id, created_at_hint, target_author):
+                        tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
+                        is_tracked = target_note_id in tracked_notes
 
-            # CRITICAL: Always require the note to be in tracked_event_ids
-            # The allow_outside_today flag should only bypass the "today's notes" temporal check,
-            # NOT the requirement that the note must be tracked
-            if not is_tracked:
-                logger.debug(
-                    f"Zap target {target_note_id[:16]}... is not a tracked note ID "
-                    f"(tracking {len(tracked_notes)} notes). Ignoring."
-                    f"{' [recovery mode]' if allow_outside_today else ''}"
-                )
-                self.last_error = "note_not_tracked"
-                return False
-            else:
-                logger.debug(
-                    f"✅ Zap target {target_note_id[:16]}... IS in tracked notes. "
-                    f"Proceeding with headbutt processing..."
-                    f"{' [recovery mode]' if allow_outside_today else ''}"
-                )
+                # CRITICAL: Always require the note to be in tracked_event_ids for new members
+                # The allow_outside_today flag should only bypass the "today's notes" temporal check,
+                # NOT the requirement that the note must be tracked
+                if not is_tracked:
+                    logger.debug(
+                        f"Zap target {target_note_id[:16]}... is not a tracked note ID "
+                        f"(tracking {len(tracked_notes)} notes). Ignoring."
+                        f"{' [recovery mode]' if allow_outside_today else ''}"
+                    )
+                    self.last_error = "note_not_tracked"
+                    return False
+                else:
+                    logger.debug(
+                        f"✅ Zap target {target_note_id[:16]}... IS in tracked notes. "
+                        f"Proceeding with headbutt processing..."
+                        f"{' [recovery mode]' if allow_outside_today else ''}"
+                    )
             
             # Check for duplicate processing using payment hash as event ID
             event_id_raw = getattr(payment, "payment_hash", None) or getattr(payment, "checking_id", None)
