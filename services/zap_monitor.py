@@ -608,7 +608,8 @@ class ZapMonitorService:
             # Opportunistically register the note if it isn't tracked yet. This can happen
             # when invoice settlements arrive before subscriptions finish populating
             # tracked_event_ids on startup or after restarts.
-            if not is_tracked:
+            # NOTE: Only do this during normal operation, not during recovery mode
+            if not is_tracked and not allow_outside_today:
                 created_at_hint = None
                 try:
                     candidate = zap_request.get("created_at")
@@ -623,23 +624,22 @@ class ZapMonitorService:
                     tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
                     is_tracked = target_note_id in tracked_notes
 
+            # CRITICAL: Always require the note to be in tracked_event_ids
+            # The allow_outside_today flag should only bypass the "today's notes" temporal check,
+            # NOT the requirement that the note must be tracked
             if not is_tracked:
-                if allow_outside_today:
-                    logger.debug(
-                        f"Zap monitor recovery: processing untracked note {target_note_id[:16]}... "
-                        f"(tracked list size={len(tracked_notes)})."
-                    )
-                else:
-                    logger.debug(
-                        f"Zap target {target_note_id[:16]}... is not a tracked note ID "
-                        f"(tracking {len(tracked_notes)} notes). Ignoring."
-                    )
-                    self.last_error = "note_not_tracked"
-                    return False
+                logger.debug(
+                    f"Zap target {target_note_id[:16]}... is not a tracked note ID "
+                    f"(tracking {len(tracked_notes)} notes). Ignoring."
+                    f"{' [recovery mode]' if allow_outside_today else ''}"
+                )
+                self.last_error = "note_not_tracked"
+                return False
             else:
                 logger.debug(
                     f"✅ Zap target {target_note_id[:16]}... IS in tracked notes. "
                     f"Proceeding with headbutt processing..."
+                    f"{' [recovery mode]' if allow_outside_today else ''}"
                 )
             
             # Check for duplicate processing using payment hash as event ID
@@ -1604,6 +1604,14 @@ class ZapMonitorService:
             if not herd_wallet:
                 msg = "No herd_wallet configured in settings; cannot recover payments"
                 logger.warning(msg)
+                return {"scanned": 0, "processed": 0, "error": msg}
+
+            # CRITICAL: Recovery should only run after tracked_event_ids are populated
+            # This prevents scanning payments before subscriptions have detected today's notes
+            tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
+            if not tracked_notes:
+                msg = "No tracked_event_ids found; recovery deferred until notes are detected"
+                logger.info(msg)
                 return {"scanned": 0, "processed": 0, "error": msg}
 
             # Use UTC midnight as conservative since timestamp for recovery

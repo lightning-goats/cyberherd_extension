@@ -475,6 +475,76 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
     return True
 
 
+async def _trigger_recovery_for_all_users(app):
+    """Trigger zap recovery for all users with tracking enabled after tracked_event_ids are detected.
+    
+    This is called automatically after startup when tracked_event_ids are first populated.
+    It runs recovery in the background to avoid blocking startup.
+    """
+    try:
+        from .. import crud
+        import importlib
+        
+        # Get all users
+        get_users = None
+        try:
+            core_mod = importlib.import_module('lnbits.core.crud')
+            get_users = getattr(core_mod, 'get_users', None)
+        except Exception:
+            try:
+                from lnbits.core.crud import get_users as _gu  # type: ignore
+                get_users = _gu
+            except Exception:
+                get_users = None
+
+        if get_users and asyncio.iscoroutinefunction(get_users):
+            users = await get_users()
+        else:
+            users = []
+        
+        recovery_count = 0
+        for user in users:
+            try:
+                settings = await crud.get_settings(user.id)
+                if not settings:
+                    continue
+                
+                # Only recover for users with zap tracking enabled
+                if not getattr(settings, 'zap_tracking_enabled', False):
+                    continue
+                
+                # Check if they have tracked_event_ids (recovery requires this)
+                tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
+                if not tracked_notes:
+                    continue
+                
+                # Get zap monitor and trigger recovery
+                try:
+                    from ..views_api import get_zap_monitor
+                    zap_monitor = get_zap_monitor(app=app, db=crud, user_id=user.id)
+                    
+                    if zap_monitor and hasattr(zap_monitor, "_recover_missed_payment_zaps"):
+                        # Run recovery in background (don't await to avoid blocking startup)
+                        asyncio.create_task(
+                            zap_monitor._recover_missed_payment_zaps(settings)
+                        )
+                        recovery_count += 1
+                        logger.info(f"Triggered automatic zap recovery for user {user.id}")
+                except Exception as e:
+                    logger.warning(f"Failed to trigger zap recovery for user {user.id}: {e}")
+                    
+            except Exception as e:
+                logger.warning(f"Error processing recovery for user {user.id}: {e}")
+        
+        if recovery_count > 0:
+            logger.info(f"Triggered automatic zap recovery for {recovery_count} user(s)")
+        else:
+            logger.info("No users required automatic zap recovery")
+            
+    except Exception as e:
+        logger.error(f"Error in _trigger_recovery_for_all_users: {e}")
+
+
 async def _initialize_tracked_event_ids_on_startup(app):
     """Initialize tracked_event_ids with recent notes on startup.
     
@@ -801,6 +871,14 @@ def start_subscriptions(app):
                     logger.warning(
                         f"Timed out waiting {wait_secs}s for tracked_event_ids; starting adapter without guaranteed engagement filters"
                     )
+                else:
+                    # CRITICAL: Trigger zap recovery now that tracked_event_ids are populated
+                    # This ensures missed zaps are recovered after startup initialization
+                    logger.info("Tracked event IDs detected, triggering automatic zap recovery for all users")
+                    try:
+                        await _trigger_recovery_for_all_users(app)
+                    except Exception as e:
+                        logger.warning(f"Failed to trigger automatic zap recovery after tracked_event_ids detection: {e}")
 
                 # Start the adapter (which creates initial subscriptions)
                 await _authoritative_tag_subscription(app)
