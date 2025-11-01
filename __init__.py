@@ -447,8 +447,6 @@ async def _warm_start_today_cache_and_recovery(app):
                                     # Start monitoring with timestamps for event recovery
                                     await zm.start_monitoring_with_timestamps(existing_timestamps)
                                     logger.info(f"Warm start: started subscriptions for user {uid} with {len(ids)} tracked notes, earliest timestamp: {min(existing_timestamps.values()) if existing_timestamps else 'none'}")
-                                else:
-                                    logger.info(f"Warm start: monitor already running for user {uid}, skipping start")
                             except Exception as e:
                                 logger.warning(f"Warm start: failed to start subscriptions for user {uid}: {e}")
                         elif ids:

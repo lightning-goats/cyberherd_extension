@@ -263,12 +263,6 @@ class ZapMonitorService:
 
     async def start_monitoring(self):
         """Start monitoring Nostr events for tracked notes."""
-        logger.info(f"Nostr event monitor starting for user {self.user_id}")
-        logger.info(
-            "ℹ️  Zap detection mode: Payment listener only (LNURLp). "
-            "Nostr-based zap detection (kinds 9734/9735) is disabled."
-        )
-        
         # Get user settings
         settings = await crud.get_settings(self.user_id)
         if not getattr(settings, 'zap_tracking_enabled', False):
@@ -278,15 +272,14 @@ class ZapMonitorService:
             return
         
         if self._running:
-            logger.debug(f"Monitor already running for user {self.user_id}")
             return
             
         self._running = True
         
-        # Start payment listener for LNURLp zaps
+        # Start payment listener for LNURLp zaps (FIRST - this is the primary zap detection mechanism)
         self._payment_listener_task = asyncio.create_task(self.payment_listener())
         
-        # Start Nostr event monitoring
+        # Start Nostr event monitoring (handled by subscriptions.py, not by this class)
         await self._start_nostr_monitoring(settings)
 
     async def start_monitoring_with_timestamps(self, note_timestamps: dict[str, int]):
@@ -295,8 +288,6 @@ class ZapMonitorService:
         Args:
             note_timestamps: Dict mapping note_id -> created_at timestamp
         """
-        logger.info(f"Starting Nostr event monitor with timestamps for user {self.user_id}")
-        
         # Get user settings
         settings = await crud.get_settings(self.user_id)
         if not getattr(settings, 'zap_tracking_enabled', False):
@@ -306,15 +297,14 @@ class ZapMonitorService:
             return
         
         if self._running:
-            logger.debug(f"Monitor already running for user {self.user_id}")
             return
             
         self._running = True
         
-        # Start payment listener for LNURLp zaps
+        # Start payment listener for LNURLp zaps (FIRST - this is the primary zap detection mechanism)
         self._payment_listener_task = asyncio.create_task(self.payment_listener())
         
-        # Start Nostr event monitoring with timestamps for recovery
+        # Start Nostr event monitoring with timestamps for recovery (handled by subscriptions.py)
         await self._start_nostr_monitoring(settings, note_timestamps=note_timestamps)
 
     async def stop_monitoring(self):
@@ -1081,8 +1071,6 @@ class ZapMonitorService:
                 logger.debug(
                     f"Payment listener already registered for user {self.user_id}, reusing queue"
                 )
-
-            logger.info(f"Payment listener started for user {self.user_id}")
 
             while self._running:
                 try:

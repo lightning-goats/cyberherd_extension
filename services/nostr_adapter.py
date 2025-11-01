@@ -1211,7 +1211,6 @@ async def start_adapter(app):
     try:
         asyncio.create_task(_manager_loop(app))
         asyncio.create_task(_event_pump(app))
-        logger.info("Cyberherd: Started subscription-based realtime detection")
     except Exception as e:
         logger.warning(f"Cyberherd: Subscription system failed, falling back to polling: {e}")
 
@@ -1635,7 +1634,6 @@ async def _event_pump(app):
         return
 
     cache = _get_cache(app)
-    logger.info("Cyberherd: Event pump started successfully")
 
     while True:
         try:

@@ -750,7 +750,6 @@ def start_subscriptions(app):
     before the event loop cycles.
     """
     try:
-        logger.info("Cyberherd subscriptions starting")
         import asyncio
 
         async def _kick():

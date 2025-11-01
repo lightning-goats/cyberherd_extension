@@ -514,14 +514,6 @@ def _row_to_settings(row) -> CyberherdSettings:
     except Exception:
         tracked_addresses_dict = {}
 
-    # Debug: log the tracking settings from DB
-    try:
-        logger.info(f"🔧 Settings from DB: zap_tracking_enabled={row.get('zap_tracking_enabled')}, "
-                   f"repost_tracking_enabled={row.get('repost_tracking_enabled')}, "
-                   f"likes_tracking_enabled={row.get('likes_tracking_enabled')}")
-    except Exception:
-        pass
-
     tracked_events_set = {eid for eid in tracked_events_list if eid}
     tracked_events_set.update(eid for eid in manual_events_list if eid)
     tracked_events_set.update(tracked_addresses_dict.keys())
