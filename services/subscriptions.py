@@ -38,9 +38,10 @@ from .time_utils import (
 
 # Import package-level CRUD helpers (lnbits/extensions/cyberherd/crud.py)
 from .. import crud
+from ..utils.common import parse_bool_env, parse_int_env, parse_float_env, utc_now
 
 # Enable verbose logging with: export CYBERHERD_DEBUG=true
-CYBERHERD_DEBUG = os.getenv("CYBERHERD_DEBUG", "false").lower() in ("1", "true", "yes", "y")
+CYBERHERD_DEBUG = parse_bool_env("CYBERHERD_DEBUG", False)
 
 # Diagnostics for nostr_helpers interactions
 _helper_diagnostics = {
@@ -83,11 +84,11 @@ def _record_helper_query(success: bool, error: str | None = None):
     if success:
         _helper_diagnostics['queries_succeeded'] += 1
         # Rolling last-success timestamp for diagnostics
-        _helper_diagnostics['last_success'] = datetime.now(timezone.utc).isoformat()
+        _helper_diagnostics['last_success'] = utc_now().isoformat()
     else:
         _helper_diagnostics['queries_failed'] += 1
         # UTC timestamp for consistency across timezones
-        _helper_diagnostics['last_failure'] = datetime.now(timezone.utc).isoformat()
+        _helper_diagnostics['last_failure'] = utc_now().isoformat()
         _helper_diagnostics['last_failure_reason'] = error
 
 def _record_availability_check(available: bool):
@@ -483,19 +484,10 @@ async def _trigger_recovery_for_all_users(app):
     """
     try:
         from .. import crud
-        import importlib
+        from ..utils.common import get_lnbits_users_function
         
         # Get all users
-        get_users = None
-        try:
-            core_mod = importlib.import_module('lnbits.core.crud')
-            get_users = getattr(core_mod, 'get_users', None)
-        except Exception:
-            try:
-                from lnbits.core.crud import get_users as _gu  # type: ignore
-                get_users = _gu
-            except Exception:
-                get_users = None
+        get_users = get_lnbits_users_function()
 
         if get_users and asyncio.iscoroutinefunction(get_users):
             users = await get_users()
@@ -565,18 +557,10 @@ async def _initialize_tracked_event_ids_on_startup(app):
         
         # Get all users with tracking enabled
         from .. import crud
+        from ..utils.common import get_lnbits_users_function
+        
         # Dynamic import for get_users to avoid static-analysis import errors
-        import importlib
-        get_users = None
-        try:
-            core_mod = importlib.import_module('lnbits.core.crud')
-            get_users = getattr(core_mod, 'get_users', None)
-        except Exception:
-            try:
-                from lnbits.core.crud import get_users as _gu  # type: ignore
-                get_users = _gu
-            except Exception:
-                get_users = None
+        get_users = get_lnbits_users_function()
 
         # Only await if we obtained an async function
         if get_users and asyncio.iscoroutinefunction(get_users):
@@ -586,14 +570,13 @@ async def _initialize_tracked_event_ids_on_startup(app):
         # By default initialize tracked_event_ids using events from a recent lookback window.
         # Configure lookback via CYBERHERD_TRACKED_EVENT_LOOKBACK_DAYS (default 3 days).
         try:
-            lookback_days = int(os.getenv("CYBERHERD_TRACKED_EVENT_LOOKBACK_DAYS", "3") or 3)
+            lookback_days = parse_int_env("CYBERHERD_TRACKED_EVENT_LOOKBACK_DAYS", 3)
             boundaries = get_day_boundaries_utc(days_ago=lookback_days)
             since_ts = boundaries.local_since_ts
             logger.info(f"Initializing tracked_event_ids on startup with lookback_days={lookback_days} since_ts={since_ts} local_day={boundaries.local_day_str}")
         except Exception as e:
             # Fallback to UTC now if helper fails
-            from datetime import datetime, timezone
-            since_ts = int(datetime.now(timezone.utc).timestamp())
+            since_ts = int(utc_now().timestamp())
             logger.warning(f"Failed to compute day boundaries for tracked_event_ids init: {e}; falling back to now since_ts={since_ts}")
         
         for user in users:
@@ -663,17 +646,9 @@ async def _any_tracked_event_ids_exist(app) -> bool:
     """
     try:
         from .. import crud
-        import importlib
-        get_users = None
-        try:
-            core_mod = importlib.import_module('lnbits.core.crud')
-            get_users = getattr(core_mod, 'get_users', None)
-        except Exception:
-            try:
-                from lnbits.core.crud import get_users as _gu  # type: ignore
-                get_users = _gu
-            except Exception:
-                get_users = None
+        from ..utils.common import get_lnbits_users_function
+        
+        get_users = get_lnbits_users_function()
 
         users = await get_users() if get_users and asyncio.iscoroutinefunction(get_users) else []
         for user in users:
@@ -856,10 +831,7 @@ def start_subscriptions(app):
                 # adapter so engagement subscriptions (kinds 6/7) can be created
                 # immediately. This avoids starting realtime subscriptions too
                 # early when there are no tracked ids.
-                try:
-                    wait_secs = float(os.getenv('CYBERHERD_WAIT_FOR_TRACKED_IDS_SECONDS', '30') or 30)
-                except Exception:
-                    wait_secs = 30.0
+                wait_secs = parse_float_env('CYBERHERD_WAIT_FOR_TRACKED_IDS_SECONDS', 30.0)
 
                 got_tracked = False
                 try:
@@ -872,13 +844,21 @@ def start_subscriptions(app):
                         f"Timed out waiting {wait_secs}s for tracked_event_ids; starting adapter without guaranteed engagement filters"
                     )
                 else:
-                    # CRITICAL: Trigger zap recovery now that tracked_event_ids are populated
-                    # This ensures missed zaps are recovered after startup initialization
-                    logger.info("Tracked event IDs detected, triggering automatic zap recovery for all users")
+                    # CRITICAL: Trigger event recovery now that tracked_event_ids are populated
+                    # This ensures missed zaps, reposts, and reactions are recovered after startup initialization
+                    logger.info("Tracked event IDs detected, triggering automatic event recovery for all users")
+                    
+                    # Recover zaps (payment-based)
                     try:
                         await _trigger_recovery_for_all_users(app)
                     except Exception as e:
                         logger.warning(f"Failed to trigger automatic zap recovery after tracked_event_ids detection: {e}")
+                    
+                    # Recover reposts and reactions (Nostr-based)
+                    try:
+                        await _recover_missed_reposts_and_reactions_on_startup(app)
+                    except Exception as e:
+                        logger.warning(f"Failed to trigger automatic repost/reaction recovery after tracked_event_ids detection: {e}")
 
                 # Start the adapter (which creates initial subscriptions)
                 await _authoritative_tag_subscription(app)
@@ -957,8 +937,6 @@ def start_subscriptions(app):
                 except Exception as e:
                     logger.warning(f"Could not set subscription refresh flag: {e}")
                 
-                # Recover missed reposts and reactions on startup
-                await _recover_missed_reposts_and_reactions_on_startup(app)
                 # Start background monitor to watch for tracked_event_ids added later
                 try:
                     st = getattr(app, 'state', app)
@@ -1230,12 +1208,8 @@ def _collect_reference_identifiers(event: dict, include_content: bool = False) -
             pass
 
         # NIP-19 note/nevent tokens embedded in content
-        try:
-            import importlib
-            nostr_mod = importlib.import_module('lnbits.utils.nostr')
-            nip19 = getattr(nostr_mod, 'nip19', None)
-        except Exception:
-            nip19 = None
+        from ..utils.common import get_nip19_decoder
+        nip19 = get_nip19_decoder()
 
         if nip19:
             for token in re.findall(r'(nevent1[0-9a-z]+|note1[0-9a-z]+)', content):
@@ -1279,12 +1253,9 @@ def _normalize_tracked_event_id(candidate: str | None) -> str | None:
         return lower
 
     if lower.startswith("note1") or lower.startswith("nevent1"):
-        try:
-            import importlib
-            nostr_mod = importlib.import_module('lnbits.utils.nostr')
-            nip19 = getattr(nostr_mod, 'nip19', None)
-        except Exception:
-            nip19 = None
+        from ..utils.common import get_nip19_decoder
+        nip19 = get_nip19_decoder()
+        
         if nip19:
             try:
                 kind, data = nip19.decode(lower)
@@ -1521,17 +1492,9 @@ async def _recover_missed_reposts_and_reactions_on_startup(app):
         
         # Get all users with repost tracking enabled
         from .. import crud
-        import importlib
-        get_users = None
-        try:
-            core_mod = importlib.import_module('lnbits.core.crud')
-            get_users = getattr(core_mod, 'get_users', None)
-        except Exception:
-            try:
-                from lnbits.core.crud import get_users as _gu  # type: ignore
-                get_users = _gu
-            except Exception:
-                get_users = None
+        from ..utils.common import get_lnbits_users_function
+        
+        get_users = get_lnbits_users_function()
 
         users = await get_users() if asyncio.iscoroutinefunction(get_users) else []
         recovery_attempted = 0
@@ -1678,8 +1641,7 @@ async def _recover_missed_reposts_and_reactions_for_user(user_id: str, settings,
             try:
                 lookback_since = max(_local_midnight_timestamp() - 24 * 3600, 0)
             except Exception:
-                from datetime import datetime, timezone
-                lookback_since = int(datetime.now(timezone.utc).timestamp()) - 24 * 3600
+                lookback_since = int(utc_now().timestamp()) - 24 * 3600
 
             # Broad query for kind 6 reposts in recent window
             broad_events = []

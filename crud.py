@@ -14,6 +14,7 @@ from lnbits.helpers import decrypt_internal_message, encrypt_internal_message # 
 
 from .models import CyberherdSettings, LegacyCyberherdMember
 from .services.shares import compute_member_share_percentages
+from .utils.common import extract_t_tags_from_event, utc_now
 
 db = Database("ext_cyberherd")
 # Serialize critical write operations in this module to reduce sqlite locking
@@ -2777,7 +2778,7 @@ async def _get_detected_cyberherd_notes_for_settings(settings, since_days_ago: i
             
             # Enhanced hashtag matching: check BOTH t-tags AND content
             content_l = (ev.get("content") or "").lower()
-            tag_values = {str(t[1]).lstrip('#').lower() for t in (ev.get("tags") or []) if isinstance(t, list) and len(t) > 1 and t[0] == 't'}
+            tag_values = extract_t_tags_from_event(ev)
             
             # Match if: (1) any tag appears in t-tags, OR (2) any tag appears as #tag in content
             has_t_tag = bool(set(tags_lower) & tag_values)

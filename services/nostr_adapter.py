@@ -49,16 +49,17 @@ from .subscriptions import (
 )  # reuse helpers
 from .. import crud
 from . import nostr_helpers
+from ..utils.common import parse_bool_env, parse_int_env, utc_now
 
 # Debug flag (shared with subscriptions module if set)
-CYBERHERD_DEBUG = os.getenv("CYBERHERD_DEBUG", "false").lower() in ("1","true","yes","y")
-CYBERHERD_DIAG = os.getenv("CYBERHERD_DIAG", "false").lower() in ("1","true","yes","y")
+CYBERHERD_DEBUG = parse_bool_env("CYBERHERD_DEBUG", False)
+CYBERHERD_DIAG = parse_bool_env("CYBERHERD_DIAG", False)
 
 # New configuration options
-CYBERHERD_USE_WEBSOCKET = os.getenv("CYBERHERD_USE_WEBSOCKET", "true").lower() in ("1", "true", "yes", "y")
-CYBERHERD_WS_RECONNECT_DELAY = int(os.getenv("CYBERHERD_WS_RECONNECT_DELAY", "5") or 5)
-CYBERHERD_WS_MAX_RECONNECT_ATTEMPTS = int(os.getenv("CYBERHERD_WS_MAX_RECONNECT_ATTEMPTS", "10") or 10)
-CYBERHERD_BROAD_REPOST_LIMIT = int(os.getenv("CYBERHERD_BROAD_REPOST_LIMIT", "800") or 800)
+CYBERHERD_USE_WEBSOCKET = parse_bool_env("CYBERHERD_USE_WEBSOCKET", True)
+CYBERHERD_WS_RECONNECT_DELAY = parse_int_env("CYBERHERD_WS_RECONNECT_DELAY", 5)
+CYBERHERD_WS_MAX_RECONNECT_ATTEMPTS = parse_int_env("CYBERHERD_WS_MAX_RECONNECT_ATTEMPTS", 10)
+CYBERHERD_BROAD_REPOST_LIMIT = parse_int_env("CYBERHERD_BROAD_REPOST_LIMIT", 800)
 
 
 def _dbg(msg: str, *args):
@@ -135,6 +136,113 @@ def _normalize_tracked_tags(settings) -> tuple[list[str], tuple[str, ...]]:
     return stripped_tags, tuple(normalized)
 
 
+def _build_note_filters(
+    eff_pub: str,
+    filter_tags: list[str] | None,
+    since: int,
+    limit: int | None = None,
+    include_tagged_filter: bool = True
+) -> list[dict[str, Any]]:
+    """Build standard note filters for kinds 1 and 30311.
+    
+    This consolidates the redundant filter creation logic used throughout the adapter.
+    
+    Args:
+        eff_pub: Effective pubkey (author) to filter by
+        filter_tags: List of tags for #t filter (if None or empty, tagged filter is skipped)
+        since: Timestamp to filter from
+        limit: Optional limit for number of events (applied if provided)
+        include_tagged_filter: If True and filter_tags provided, includes Filter 1a with #t tags
+        
+    Returns:
+        List of filter dictionaries:
+        - Filter 1a (optional): Notes with #t tags by author
+        - Filter 1b (always): All notes by author (no #t filter)
+    """
+    filters = []
+    
+    # Filter 1a: Notes (kind 1 and 30311) with #t tags by effective pubkey
+    if include_tagged_filter and filter_tags:
+        notes_tagged_filter = {
+            "kinds": [1, 30311],
+            "#t": filter_tags,
+            "authors": [eff_pub],
+            "since": since
+        }
+        if limit is not None and limit > 0:
+            notes_tagged_filter['limit'] = limit
+        filters.append(notes_tagged_filter)
+    
+    # Filter 1b: Notes (kind 1 and 30311) by effective pubkey WITHOUT #t filter (catches all author's notes)
+    notes_author_filter = {
+        "kinds": [1, 30311],
+        "authors": [eff_pub],
+        "since": since
+    }
+    if limit is not None and limit > 0:
+        notes_author_filter['limit'] = limit
+    filters.append(notes_author_filter)
+    
+    return filters
+
+
+def _get_user_key(user_id: str | None) -> str:
+    """Convert user_id to a consistent cache key string.
+    
+    Returns 'None' string for None user_id, otherwise returns the user_id string.
+    This is used for cache keys and last_seen tracking where we need a string key.
+    """
+    return user_id if user_id is not None else 'None'
+
+
+def _normalize_tag_list(tags: list[str]) -> list[str]:
+    """Normalize a list of tag strings by stripping # and lowercasing.
+    
+    Args:
+        tags: List of tag strings (may include # prefix)
+        
+    Returns:
+        List of normalized (no #, lowercase) tag strings
+    """
+    return [t.lstrip('#').lower() for t in tags if t]
+
+
+def _get_tracked_tags(settings) -> list[str]:
+    """Safely extract tracked_tags from settings with fallback.
+    
+    Returns:
+        List of tag strings (may be empty)
+    """
+    return getattr(settings, 'tracked_tags', []) or []
+
+
+def _get_tracked_event_ids(settings) -> list[str]:
+    """Safely extract tracked_event_ids from settings with fallback.
+    
+    Returns:
+        List of event ID strings (may be empty)
+    """
+    return getattr(settings, 'tracked_event_ids', []) or []
+
+
+def _build_engagement_kinds(settings) -> list[int]:
+    """Build list of engagement event kinds based on settings.
+    
+    Returns list containing:
+    - 6 (reposts) if repost_tracking_enabled
+    - 7 (reactions/likes) if likes_tracking_enabled
+    
+    Returns:
+        List of kind integers (may be empty)
+    """
+    kinds = []
+    if getattr(settings, 'repost_tracking_enabled', False):
+        kinds.append(6)
+    if getattr(settings, 'likes_tracking_enabled', False):
+        kinds.append(7)
+    return kinds
+
+
 def _collect_tracked_event_ids_for_subscription(settings, app, eff_pub: Optional[str], tags_norm: tuple[str, ...]) -> list[str]:
     """Gather tracked event ids prioritizing today's cache, then persisted settings."""
     seen: set[str] = set()
@@ -188,9 +296,9 @@ def _prepare_websocket_subscription(user_id: str, settings, app) -> Optional[dic
     except Exception:
         eff_pub = getattr(settings, 'effective_pubkey', None)
 
-    ukey = user_id if user_id is not None else 'None'
-    overlap_seconds = int(os.getenv("CYBERHERD_SINCE_OVERLAP_SECONDS", "300") or 300)
-    initial_limit = int(os.getenv("CYBERHERD_INITIAL_LIMIT", "500") or 500)
+    ukey = _get_user_key(user_id)
+    overlap_seconds = parse_int_env("CYBERHERD_SINCE_OVERLAP_SECONDS", 300)
+    initial_limit = parse_int_env("CYBERHERD_INITIAL_LIMIT", 500)
 
     base_since = _local_midnight_timestamp()
     try:
@@ -204,26 +312,22 @@ def _prepare_websocket_subscription(user_id: str, settings, app) -> Optional[dic
 
     filters: list[dict[str, Any]] = []
     if eff_pub:
-        if stripped_tags:
-            notes_tagged_filter = {"kinds": [1, 30311], "#t": stripped_tags, "authors": [eff_pub], "since": since}
-            if _first_cycle.get(ukey, True) and initial_limit > 0:
-                notes_tagged_filter['limit'] = initial_limit
-            filters.append(notes_tagged_filter)
-
-        notes_author_filter = {"kinds": [1, 30311], "authors": [eff_pub], "since": since}
-        if _first_cycle.get(ukey, True) and initial_limit > 0:
-            notes_author_filter['limit'] = initial_limit
-        filters.append(notes_author_filter)
+        # Use consolidated helper to build note filters (kinds 1 and 30311)
+        limit = initial_limit if _first_cycle.get(ukey, True) and initial_limit > 0 else None
+        filters.extend(_build_note_filters(
+            eff_pub=eff_pub,
+            filter_tags=stripped_tags if stripped_tags else None,
+            since=since,
+            limit=limit,
+            include_tagged_filter=True
+        ))
 
     tracked_event_ids = _collect_tracked_event_ids_for_subscription(settings, app, eff_pub, tags_norm)
 
-    react_kinds: list[int] = []
-    repost_enabled = bool(getattr(settings, 'repost_tracking_enabled', False))
-    likes_enabled = bool(getattr(settings, 'likes_tracking_enabled', False))
-    if repost_enabled:
-        react_kinds.append(6)
-    if likes_enabled:
-        react_kinds.append(7)
+    # Use helper to build engagement kinds list
+    react_kinds = _build_engagement_kinds(settings)
+    repost_enabled = 6 in react_kinds
+    likes_enabled = 7 in react_kinds
 
     if react_kinds and tracked_event_ids:
         filters.append({"kinds": react_kinds, "#e": tracked_event_ids, "since": since})
@@ -330,7 +434,7 @@ async def _issue_websocket_subscription(
     ws_info['sub_id'] = new_sub_id
     ws_info['config_signature'] = signature
     ws_info['tracked_event_ids'] = tracked_event_ids
-    ws_info['last_subscription_at'] = datetime.now(timezone.utc)
+    ws_info['last_subscription_at'] = utc_now()
 
     action = "Refreshed" if replace and old_sub_id else "Issued"
     logger.info(
@@ -752,7 +856,7 @@ async def _process_event_message(user_id: str, event: dict, settings, app):
 
 async def _process_eose_message(user_id: str, sub_id: str, settings, app):
     """Process EOSE (End of Stored Events) messages."""
-    ukey = user_id if user_id is not None else 'None'
+    ukey = _get_user_key(user_id)
 
     # Mark initial cycle as done
     _first_cycle[ukey] = False
@@ -815,10 +919,10 @@ async def start_subscription_for_user(user_id: str, settings, app):
 
     # Create subscription for user using nostr_helpers
     sub_id = secrets.token_hex(6)
-    ukey = user_id if user_id is not None else 'None'
+    ukey = _get_user_key(user_id)
 
-    overlap_seconds = int(os.getenv("CYBERHERD_SINCE_OVERLAP_SECONDS", "300") or 300)
-    initial_limit = int(os.getenv("CYBERHERD_INITIAL_LIMIT", "500") or 500)
+    overlap_seconds = parse_int_env("CYBERHERD_SINCE_OVERLAP_SECONDS", 300)
+    initial_limit = parse_int_env("CYBERHERD_INITIAL_LIMIT", 500)
 
     base_since = _local_midnight_timestamp()
     st = getattr(app, 'state', app)
@@ -831,20 +935,17 @@ async def start_subscription_for_user(user_id: str, settings, app):
     filters = []
     
     # Strip # from tracked tags for Nostr filter
-    stripped_tags = [t.lstrip('#') for t in (getattr(settings, 'tracked_tags', []) or [])]
+    stripped_tags = [t.lstrip('#') for t in _get_tracked_tags(settings)]
     
-    # Filter 1a: Notes (kind 1) with #t tags by effective pubkey
-    if stripped_tags:
-        notes_tagged_filter = {"kinds": [1], "#t": stripped_tags, "authors": [settings.effective_pubkey], "since": since}
-        if _first_cycle.get(ukey, True) and initial_limit > 0:
-            notes_tagged_filter['limit'] = initial_limit
-        filters.append(notes_tagged_filter)
-    
-    # Filter 1b: Notes (kind 1) by effective pubkey WITHOUT #t filter (catches all author's notes)
-    notes_author_filter = {"kinds": [1], "authors": [settings.effective_pubkey], "since": since}
-    if _first_cycle.get(ukey, True) and initial_limit > 0:
-        notes_author_filter['limit'] = initial_limit
-    filters.append(notes_author_filter)
+    # Use consolidated helper to build note filters (kinds 1 and 30311)
+    limit = initial_limit if _first_cycle.get(ukey, True) and initial_limit > 0 else None
+    filters.extend(_build_note_filters(
+        eff_pub=settings.effective_pubkey,
+        filter_tags=stripped_tags if stripped_tags else None,
+        since=since,
+        limit=limit,
+        include_tagged_filter=True
+    ))
 
     # Get tracked event IDs: prefer today's detected note ids from the runtime cache.
     try:
@@ -855,7 +956,7 @@ async def start_subscription_for_user(user_id: str, settings, app):
         except Exception:
             day = None
         eff = get_effective_pubkey(settings)
-        tags_norm = tuple(sorted([t.lstrip('#').lower() for t in (getattr(settings, 'tracked_tags', []) or []) if t]))
+        tags_norm = tuple(sorted(_normalize_tag_list(_get_tracked_tags(settings))))
         tracked_event_ids = []
         if day is not None:
             keys = [(day, getattr(settings, 'user_id', None), eff, tags_norm), (day, None, eff, tags_norm)]
@@ -870,29 +971,22 @@ async def start_subscription_for_user(user_id: str, settings, app):
                     continue
             tracked_event_ids = list(seen)
         if not tracked_event_ids:
-            tracked_event_ids = getattr(settings, 'tracked_event_ids', []) or []
+            tracked_event_ids = _get_tracked_event_ids(settings)
     except Exception as _e:
         logger.debug(f"Could not read today cache for engagement filters (websocket path): {_e}")
-        tracked_event_ids = getattr(settings, 'tracked_event_ids', []) or []
+        tracked_event_ids = _get_tracked_event_ids(settings)
     
     # Filter 2: Reposts/reactions (kinds 6/7) - ONLY #e filter, NO #t restriction
-    react_kinds = []
-    if getattr(settings, 'repost_tracking_enabled', False):
-        react_kinds.append(6)
-    if getattr(settings, 'likes_tracking_enabled', False):
-        react_kinds.append(7)
+    react_kinds = _build_engagement_kinds(settings)
     
     if react_kinds and tracked_event_ids:
         # Only filter by #e (tracked event IDs) - no #t tag requirement for reposts/reactions
         react_filter = {"kinds": react_kinds, "#e": tracked_event_ids, "since": since}
         filters.append(react_filter)
         # Add broad kind=6 safety-net subscription for content-only repost detection
-        try:
-            if 6 in react_kinds and getattr(settings, 'repost_tracking_enabled', False):
-                broad_repost_filter = {"kinds": [6], "since": since, "limit": CYBERHERD_BROAD_REPOST_LIMIT}
-                filters.append(broad_repost_filter)
-        except Exception:
-            pass
+        if 6 in react_kinds:
+            broad_repost_filter = {"kinds": [6], "since": since, "limit": CYBERHERD_BROAD_REPOST_LIMIT}
+            filters.append(broad_repost_filter)
 
     # Add subscription via nostr_helpers
     if not nostr_helpers.add_subscription(sub_id, filters):
@@ -1012,7 +1106,7 @@ async def force_requery_for_user(app, user_id: str | None):
     try:
         settings = await crud.get_settings(user_id)
         eff = _eff(settings)
-        raw_tags = [t.lstrip('#') for t in (getattr(settings, 'tracked_tags', []) or [])]
+        raw_tags = [t.lstrip('#') for t in _get_tracked_tags(settings)]
         tags_norm = sorted({t.lower() for t in raw_tags if t})
         if not eff or not tags_norm:
             return []
@@ -1020,23 +1114,27 @@ async def force_requery_for_user(app, user_id: str | None):
         # Build query filters
         filter_tags = list(dict.fromkeys([rt for rt in raw_tags if rt] + [rt.lower() for rt in raw_tags if rt]))
         
-        # Filter 1: Kind 1 notes with author + #t tags
-        kinds_1_filter = {"kinds": [1], "authors": [eff], "#t": filter_tags, "since": since}
+        # Build note filters using helper (gets both tagged and author-only filters)
+        note_filters = _build_note_filters(
+            eff_pub=eff,
+            filter_tags=filter_tags,
+            since=since,
+            limit=None,
+            include_tagged_filter=True
+        )
+        # For force_requery, we want to query all filters to be comprehensive
+        kinds_1_filter = note_filters[0] if note_filters else {"kinds": [1, 30311], "authors": [eff], "since": since}
         
         # Filter 2: Reposts/reactions (kinds 6/7) - ONLY #e filter, NO #t
-        react_kinds = []
-        if getattr(settings, 'repost_tracking_enabled', False):
-            react_kinds.append(6)
-        if getattr(settings, 'likes_tracking_enabled', False):
-            react_kinds.append(7)
+        react_kinds = _build_engagement_kinds(settings)
         
-        # Query kind 1 notes first
+        # Query kind 1/30311 notes first
         logger.info(f"Cyberherd force_requery: user={user_id} eff_pub={eff[:8]}... tags={tags_norm} since={since} query={kinds_1_filter}")
         events = await nostr_helpers.query_events(kinds_1_filter, limit=500, timeout=10.0)
         
         # Query reposts/reactions if enabled
         if react_kinds:
-            tracked_event_ids = getattr(settings, 'tracked_event_ids', []) or []
+            tracked_event_ids = _get_tracked_event_ids(settings)
             if tracked_event_ids:
                 react_filter = {"kinds": react_kinds, "#e": tracked_event_ids, "since": since}
                 logger.info(f"Cyberherd force_requery: user={user_id} querying reactions query={react_filter}")
@@ -1121,7 +1219,7 @@ async def _polling_fallback_loop(app):
     - CYBERHERD_POLLING_FALLBACK: Enable/disable polling (default: true)
     - CYBERHERD_POLLING_INTERVAL: Polling interval in seconds (default: 30)
     """
-    polling_interval = int(os.getenv("CYBERHERD_POLLING_INTERVAL", "30"))  # seconds
+    polling_interval = parse_int_env("CYBERHERD_POLLING_INTERVAL", 30)  # seconds
     logger.info(f"Cyberherd: Starting polling fallback (interval: {polling_interval}s)")
 
     while True:
@@ -1205,7 +1303,7 @@ async def start_adapter(app):
     _adapter_started = True
 
     # Check if polling fallback is enabled (default: enabled)
-    use_polling_fallback = os.getenv("CYBERHERD_POLLING_FALLBACK", "true").lower() in ("1", "true", "yes", "y")
+    use_polling_fallback = parse_bool_env("CYBERHERD_POLLING_FALLBACK", True)
 
     # Try subscription-based approach first
     try:
@@ -1220,7 +1318,7 @@ async def start_adapter(app):
 
     # Start invoice-listener based zap detection (preferred path)
     try:
-        use_invoice_listener = os.getenv("CYBERHERD_USE_INVOICE_LISTENER", "true").lower() in ("1","true","yes","y")
+        use_invoice_listener = parse_bool_env("CYBERHERD_USE_INVOICE_LISTENER", True)
         if use_invoice_listener:
             try:
                 # Import via importlib and getattr to avoid static import-time resolution issues
@@ -1249,9 +1347,9 @@ async def _manager_loop(app):
     """Reconcile desired user subscriptions with active ones.
     Each user -> one subscription; handles initial/fallback cycles.
     """
-    refresh_seconds = int(os.getenv("CYBERHERD_USER_SETTINGS_REFRESH_SECONDS", "60") or 60)
-    overlap_seconds = int(os.getenv("CYBERHERD_SINCE_OVERLAP_SECONDS", "300") or 300)
-    initial_limit = int(os.getenv("CYBERHERD_INITIAL_LIMIT", "500") or 500)
+    refresh_seconds = parse_int_env("CYBERHERD_USER_SETTINGS_REFRESH_SECONDS", 60)
+    overlap_seconds = parse_int_env("CYBERHERD_SINCE_OVERLAP_SECONDS", 300)
+    initial_limit = parse_int_env("CYBERHERD_INITIAL_LIMIT", 500)
 
     # Check nostrclient availability via nostr_helpers
     if not nostr_helpers.check_availability():
@@ -1370,27 +1468,16 @@ async def _manager_loop(app):
 
                     # If provider did not supply filters, continue with local construction
                     if not filters:
-                        # Filter 1a: Notes (kind 1) with #t tags by effective pubkey
-                        if ctx.get('filter_tags') or ctx['tags']:
-                            notes_tagged_filter = {
-                                "kinds": [1], 
-                                "#t": ctx.get('filter_tags', ctx['tags']), 
-                                "authors": [ctx['eff_pub']], 
-                                "since": since
-                            }
-                            if _first_cycle.get(ukey, True) and initial_limit > 0:
-                                notes_tagged_filter['limit'] = initial_limit
-                            filters.append(notes_tagged_filter)
-                        
-                        # Filter 1b: Notes (kind 1) by effective pubkey WITHOUT #t filter (catches all author's notes)
-                        notes_author_filter = {
-                            "kinds": [1], 
-                            "authors": [ctx['eff_pub']], 
-                            "since": since
-                        }
-                        if _first_cycle.get(ukey, True) and initial_limit > 0:
-                            notes_author_filter['limit'] = initial_limit
-                        filters.append(notes_author_filter)
+                        # Use consolidated helper to build note filters (kinds 1 and 30311)
+                        limit = initial_limit if _first_cycle.get(ukey, True) and initial_limit > 0 else None
+                        filter_tags = ctx.get('filter_tags', ctx['tags'])
+                        filters.extend(_build_note_filters(
+                            eff_pub=ctx['eff_pub'],
+                            filter_tags=filter_tags if filter_tags else None,
+                            since=since,
+                            limit=limit,
+                            include_tagged_filter=True
+                        ))
                         
                         # Filter 2: Engagement events (kinds 6/7) - ONLY #e filter, NO #t restriction
                         # Zaps are handled via invoice listener and are not subscribed here
@@ -1412,7 +1499,7 @@ async def _manager_loop(app):
                             # Get tracked event IDs from settings
                             try:
                                 settings = ctx.get('settings', {})
-                                tracked_event_ids = getattr(settings, 'tracked_event_ids', []) or []
+                                tracked_event_ids = _get_tracked_event_ids(settings)
                                 
                                 logger.info(
                                     f"📝 Tracked event IDs for user {ctx['user_id']}: "
@@ -1428,12 +1515,9 @@ async def _manager_loop(app):
                                     # Safety-net: also add a broad kind=6 only filter (no #e) so content-only
                                     # reposts can be recovered client-side. Use a higher limit controlled
                                     # by CYBERHERD_BROAD_REPOST_LIMIT.
-                                    try:
-                                        if 6 in engagement_kinds:
-                                            broad_repost_filter = {"kinds": [6], "since": since, "limit": CYBERHERD_BROAD_REPOST_LIMIT}
-                                            filters.append(broad_repost_filter)
-                                    except Exception:
-                                        pass
+                                    if 6 in engagement_kinds:
+                                        broad_repost_filter = {"kinds": [6], "since": since, "limit": CYBERHERD_BROAD_REPOST_LIMIT}
+                                        filters.append(broad_repost_filter)
                                     logger.info(
                                         f"✅ Created engagement subscription for user {ctx['user_id']}: "
                                         f"kinds={engagement_kinds}, tracking {len(tracked_event_ids)} event(s). "
@@ -1519,29 +1603,19 @@ async def _manager_loop(app):
                             filters = []
 
                         if not filters:
-                            # Filter 1a: Notes (kind 1) with #t tags
-                            if ctx.get('filter_tags') or ctx['tags']:
-                                notes_tagged_filter = {
-                                    "kinds": [1], 
-                                    "#t": ctx.get('filter_tags', ctx['tags']), 
-                                    "authors": [ctx['eff_pub']], 
-                                    "since": since
-                                }
-                                if _first_cycle.get(ukey, True) and initial_limit > 0:
-                                    notes_tagged_filter['limit'] = initial_limit
-                                filters.append(notes_tagged_filter)
-                            
-                            # Filter 1b: Notes (kind 1) WITHOUT #t filter (all author's notes)
-                            notes_author_filter = {
-                                "kinds": [1], 
-                                "authors": [ctx['eff_pub']], 
-                                "since": since
-                            }
-                            if _first_cycle.get(ukey, True) and initial_limit > 0:
-                                notes_author_filter['limit'] = initial_limit
-                            filters.append(notes_author_filter)
+                            # Use consolidated helper to build note filters (kinds 1 and 30311)
+                            limit = initial_limit if _first_cycle.get(ukey, True) and initial_limit > 0 else None
+                            filter_tags = ctx.get('filter_tags', ctx['tags'])
+                            filters.extend(_build_note_filters(
+                                eff_pub=ctx['eff_pub'],
+                                filter_tags=filter_tags if filter_tags else None,
+                                since=since,
+                                limit=limit,
+                                include_tagged_filter=True
+                            ))
                             
                             # Filter 2: Engagement events (reposts/reactions) - ONLY #e filter, NO #t restriction
+                            # Build from settings context
                             engagement_kinds = []
                             if ctx.get('repost_tracking_enabled', False):
                                 engagement_kinds.append(6)
@@ -1551,7 +1625,7 @@ async def _manager_loop(app):
                             if engagement_kinds:
                                 try:
                                     settings = ctx.get('settings', {})
-                                    tracked_event_ids = getattr(settings, 'tracked_event_ids', []) or []
+                                    tracked_event_ids = _get_tracked_event_ids(settings)
                                     if tracked_event_ids:
                                         # Only create subscription if we have specific event IDs to track
                                         engagement_filter = {"kinds": engagement_kinds, "#e": tracked_event_ids, "since": since}
@@ -1780,7 +1854,7 @@ async def _event_pump(app):
                     
                     new_id = secrets.token_hex(6)
                     user_id = meta['user_id']
-                    ukey = user_id if user_id is not None else 'None'
+                    ukey = _get_user_key(user_id)
                     base_since = _local_midnight_timestamp()
                     st = getattr(app, 'state', app)
                     shared = int(getattr(st, 'cyberherd_social_last_seen_ts', 0) or 0)
@@ -1788,15 +1862,20 @@ async def _event_pump(app):
                     watermark = max(shared, local, base_since)
                     since = max(base_since, watermark - overlap_seconds)
                     
-                    # Fallback filter: author-only for kind 1 (no #t filter)
-                    filt = {"kinds": [1], "authors": [meta['eff_pub']], "since": since}
-                    if _first_cycle.get(ukey, True) and initial_limit > 0:
-                        filt['limit'] = initial_limit
+                    # Use consolidated helper to build fallback filter (author-only, no #t filter)
+                    limit = initial_limit if _first_cycle.get(ukey, True) and initial_limit > 0 else None
+                    fallback_filters = _build_note_filters(
+                        eff_pub=meta['eff_pub'],
+                        filter_tags=None,  # No #t filter for fallback
+                        since=since,
+                        limit=limit,
+                        include_tagged_filter=False  # Skip tagged filter, only author filter
+                    )
                         
-                    _dbg("Fallback resub user=%s pubkey=%s since=%s limit=%s", user_id, meta['eff_pub'], since, filt.get('limit'))
+                    _dbg("Fallback resub user=%s pubkey=%s since=%s limit=%s", user_id, meta['eff_pub'], since, limit)
                     
                     # Add new subscription via nostr_helpers
-                    nostr_helpers.add_subscription(new_id, [filt])
+                    nostr_helpers.add_subscription(new_id, fallback_filters)
                     
                     _subscriptions[new_id] = meta
                     if sub_key in _subscriptions:

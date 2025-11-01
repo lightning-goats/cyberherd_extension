@@ -20,6 +20,7 @@ from .services.splits import reset_splits_to_predefined_wallet
 from .services.zap_monitor import get_zap_monitor
 from . import crud as crud_module
 from .views_api import _clear_cached_notes_for_user
+from .utils.common import parse_bool_env, utc_now
 
 # Conditional import for cyberherd_messaging
 try:
@@ -173,7 +174,7 @@ async def process_incoming_payment(payment: Any, app: Any | None = None) -> None
 
 def start_invoice_listener(app: Any | None = None) -> None:
     """Register background invoice listener when enabled."""
-    enabled = parse_bool(os.getenv("CYBERHERD_USE_INVOICE_LISTENER", "true"), True)
+    enabled = parse_bool_env("CYBERHERD_USE_INVOICE_LISTENER", True)
     if not enabled:
         logger.info("CyberHerd: invoice listener disabled via CYBERHERD_USE_INVOICE_LISTENER")
         return
@@ -209,7 +210,7 @@ async def midnight_reset_job(app: Any | None = None):
       2. Iterate each settings row with zap tracking enabled and a source wallet and reset
          its splits to the predefined zap wallet (100%) or clear if none present.
     """
-    start_time = datetime.now(timezone.utc)
+    start_time = utc_now()
     logger.info(f"🕛 CyberHerd midnight reset starting at {start_time.isoformat()}")
     
     total_users = 0
@@ -309,7 +310,7 @@ async def midnight_reset_job(app: Any | None = None):
         errors.append(f"Job failed: {e}")
     
     # Final summary log
-    duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+    duration = (utc_now() - start_time).total_seconds()
     logger.success(
         f"✅ CyberHerd midnight reset completed in {duration:.2f}s | "
         f"Users: {total_users} | Members deactivated: {total_members_deactivated} | "
@@ -341,7 +342,7 @@ async def wait_for_midnight():
         logger.warning(
             "CyberHerd: zoneinfo not available, falling back to UTC midnight for reset scheduling"
         )
-        now_utc = datetime.now(timezone.utc)
+        now_utc = utc_now()
         tomorrow_midnight_utc = datetime.combine(now_utc.date(), time(0, 0)).replace(tzinfo=timezone.utc)
         if now_utc.time() >= time(0, 0):
             tomorrow_midnight_utc = tomorrow_midnight_utc + timedelta(days=1)
@@ -355,7 +356,7 @@ async def wait_for_midnight():
         return
 
     denver = ZoneInfo("America/Denver")
-    now_utc = datetime.now(timezone.utc)
+    now_utc = utc_now()
     # current time in Denver
     now_denver = now_utc.astimezone(denver)
 
@@ -402,7 +403,7 @@ def cyberherd_tasks(app: Any | None = None):
         logger.success("✅ CyberHerd: Midnight reset task created successfully (task_id='cyberherd_midnight_reset')")
         
         # Log next scheduled run time
-        now_utc = datetime.now(timezone.utc)
+        now_utc = utc_now()
         from datetime import timedelta
         tomorrow_midnight = datetime.combine(now_utc.date(), datetime.min.time()).replace(tzinfo=timezone.utc)
         if now_utc.time() >= datetime.min.time():

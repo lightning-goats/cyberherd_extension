@@ -22,6 +22,7 @@ from loguru import logger
 from .. import crud
 from . import nostr_helpers
 from .note_metadata import refresh_tracked_event_addresses
+from ..utils.common import parse_int_env, utc_now, extract_t_tags_from_event
 from bech32 import bech32_decode, convertbits
 
 try:
@@ -45,8 +46,8 @@ except Exception:  # pragma: no cover - messaging extension optional at import t
 
 
 _METADATA_CACHE: dict[str, dict[str, Any]] = {}
-_METADATA_REFRESH_SECONDS = int(os.getenv("CYBERHERD_METADATA_REFRESH_SECONDS", "3600") or 3600)
-_NIP05_REFRESH_SECONDS = int(os.getenv("CYBERHERD_NIP05_REFRESH_SECONDS", "10800") or 10800)
+_METADATA_REFRESH_SECONDS = parse_int_env("CYBERHERD_METADATA_REFRESH_SECONDS", 3600)
+_NIP05_REFRESH_SECONDS = parse_int_env("CYBERHERD_NIP05_REFRESH_SECONDS", 10800)
 
 
 def _now() -> float:
@@ -297,14 +298,9 @@ def _normalize_event_id(value: Any) -> str | None:
         return candidate
 
     if candidate.startswith(("note1", "nevent1")):
-        nip19 = None
-        try:
-            import importlib
-
-            nostr_mod = importlib.import_module("lnbits.utils.nostr")
-            nip19 = getattr(nostr_mod, "nip19", None)
-        except Exception:
-            nip19 = None
+        from ..utils.common import get_nip19_decoder
+        
+        nip19 = get_nip19_decoder()
 
         try:
             if nip19:
@@ -566,11 +562,7 @@ class EnhancedHeadbuttService:
                     ca = 0
                 if not (since <= ca < until):
                     continue
-                tag_values = {
-                    str(t[1]).lstrip("#").lower()
-                    for t in (ev.get("tags") or [])
-                    if isinstance(t, list) and len(t) > 1 and t[0] == "t"
-                }
+                tag_values = extract_t_tags_from_event(ev)
                 # Strict match: require explicit 't' tag equality only to avoid false positives
                 if set(tags) & tag_values:
                     if isinstance(ev.get("id"), str):

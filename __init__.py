@@ -26,6 +26,7 @@ from .setup import register_services
 from .tasks import cyberherd_tasks
 from .services.subscriptions import start_subscriptions
 from .services.note_metadata import apply_event_address
+from .utils.common import extract_t_tags_from_event, utc_now
 
 # Import zap monitor for initialization
 from .services.zap_monitor import get_zap_monitor
@@ -351,7 +352,7 @@ async def _warm_start_today_cache_and_recovery(app):
         logger.info(f"Cyberherd warm start: found {len(rows)} settings rows")
 
         # Use UTC for day boundaries - cache key uses UTC date
-        day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        day_key = utc_now().strftime("%Y-%m-%d")
         since = _utc_midnight_timestamp()
         until = since + 86400
 
@@ -383,7 +384,7 @@ async def _warm_start_today_cache_and_recovery(app):
                                 ca = 0
                             if not (since <= ca < until):
                                 continue
-                            tag_values = {str(t[1]).lstrip('#').lower() for t in (ev.get('tags') or []) if isinstance(t, list) and len(t) > 1}
+                            tag_values = extract_t_tags_from_event(ev)
                             content = (ev.get('content') or '').lower()
                             if (set(tags) & tag_values) or any(f"#{tv}" in content for tv in tags):
                                 if isinstance(ev.get('id'), str):
