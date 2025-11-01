@@ -761,7 +761,30 @@ class EnhancedHeadbuttService:
                 note_id = _normalize_event_id(raw_note_id)
                 raw_event_id = getattr(attacker, "event_id", None)
                 event_id_value = _normalize_event_id(raw_event_id) or raw_event_id
-                event_type = "member_increase" if was_active else "new_member"
+                
+                # Determine the base event type (new member vs increase)
+                base_event_type = "member_increase" if was_active else "new_member"
+                
+                # Determine the source event type (what triggered this: zap, repost, or reaction)
+                # Check attacker.kinds to see if it's a kind 6 (repost) or kind 7 (reaction)
+                attacker_kinds = getattr(attacker, 'kinds', []) or []
+                is_repost = 6 in attacker_kinds
+                is_reaction = 7 in attacker_kinds
+                
+                # Select the appropriate event_type for messaging:
+                # - For new members: use "new_member" (generic) since we want consistent welcome messages
+                # - For existing members: use specific types if triggered by repost/reaction
+                if base_event_type == "member_increase":
+                    if is_repost:
+                        event_type = "kind_6_repost"  # Existing member reposted
+                    elif is_reaction:
+                        event_type = "kind_7_reaction"  # Existing member reacted
+                    else:
+                        event_type = "member_increase"  # Existing member zapped (or other)
+                else:
+                    # New member - could use specific types here too if desired
+                    event_type = base_event_type  # "new_member"
+                
                 message_event_id = None
                 if event_id_value:
                     event_id_str = str(event_id_value)
