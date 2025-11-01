@@ -406,11 +406,13 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
                     if eid not in current_tracked:
                         try:
                             logger.info(
-                                f"Auto-added tracked event id={eid} for user={user_id} (note author={eff_pub})"
+                                f"🎯 Auto-added tracked event id={eid} for user={user_id} (note author={eff_pub}). "
+                                f"Total tracked events: {len(updated_tracked)}. Triggering kind 6/7 subscription refresh..."
                             )
                         except Exception:
                             pass
                         # Refresh signaling unified via app.state flag
+                        # This will cause kind 6/7 subscriptions to be recreated with the new event ID
                         try:
                             st = getattr(app, "state", app)
                             setattr(st, "cyberherd_force_subscription_refresh", True)
@@ -424,6 +426,10 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
                                     _refresh_event.set()
                                 except Exception:
                                     pass
+                            logger.info(
+                                f"✅ Subscription refresh triggered for user={user_id} after adding tracked event {eid}. "
+                                f"Kind 6/7 subscriptions will be updated automatically."
+                            )
                             _dbg("Set force refresh flag after adding event {} for user {}", eid, user_id)
                         except Exception as e:
                             logger.warning(f"Failed to set subscription refresh flag: {e}")

@@ -1299,7 +1299,10 @@ async def _manager_loop(app):
                 if getattr(st, "cyberherd_force_subscription_refresh", False):
                     force_refresh = True
                     setattr(st, "cyberherd_force_subscription_refresh", False)
-                    logger.info("Cyberherd: Processing forced subscription refresh")
+                    logger.info(
+                        "🔄 Cyberherd: Processing FORCED subscription refresh. "
+                        "This will recreate all subscriptions with updated tracked_event_ids for kind 6/7 detection."
+                    )
                     # Also notify external callback about the forced refresh
                     try:
                         if _filter_update_callback is not None:
@@ -1330,6 +1333,10 @@ async def _manager_loop(app):
                 # Force recreation if force_refresh is True
                 if force_refresh and existing:
                     sid, meta = existing[0]
+                    logger.info(
+                        f"🔄 Force refresh: Recreating subscription for user={ctx['user_id']} "
+                        f"to include updated tracked_event_ids for kind 6/7 detection"
+                    )
                     _dbg("Force refresh: Recreating subscription for user=%s", ctx['user_id'])
                     nostr_helpers.close_subscription(sid)
                     del _subscriptions[sid]
@@ -1430,7 +1437,8 @@ async def _manager_loop(app):
                                         pass
                                     logger.info(
                                         f"✅ Created engagement subscription for user {ctx['user_id']}: "
-                                        f"kinds={engagement_kinds}, tracking {len(tracked_event_ids)} event(s)"
+                                        f"kinds={engagement_kinds}, tracking {len(tracked_event_ids)} event(s). "
+                                        f"Realtime kind 6/7 detection is now ACTIVE."
                                     )
                                     _dbg("Created engagement subscription for user=%s kinds=%s event_count=%d", ctx['user_id'], engagement_kinds, len(tracked_event_ids))
                                 else:
@@ -1677,7 +1685,13 @@ async def _event_pump(app):
                         # let existing processor handle validation; it will check settings flags
                         # Only call the processor when user_id is a valid string
                         if isinstance(user_id, str):
+                            logger.info(
+                                f"🎯 Forwarding kind {kind} event to processor for user {user_id}: "
+                                f"event_id={eid[:16] if isinstance(eid, str) else eid}... "
+                                f"(realtime detection active)"
+                            )
                             await process_event_for_user(user_id, ev, settings, app)
+                            _dbg(f"Successfully processed kind {kind} event {eid} for user {user_id}")
                     except Exception as e:
                         logger.debug(f"Error forwarding kind {kind} event to processor for user {user_id}: {e}")
                     # continue processing (do not early-continue) so last_seen and status updates still run
