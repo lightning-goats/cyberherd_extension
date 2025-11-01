@@ -1682,16 +1682,25 @@ async def _event_pump(app):
                         from .subscriptions import process_event_for_user
                         # let existing processor handle validation; it will check settings flags
                         # Only call the processor when user_id is a valid string
-                        if isinstance(user_id, str):
+                        if isinstance(user_id, str) and settings:
+                            eid = ev.get('id')
+                            # Log settings state for debugging
+                            repost_enabled = getattr(settings, 'repost_tracking_enabled', False) if settings else False
+                            likes_enabled = getattr(settings, 'likes_tracking_enabled', False) if settings else False
                             logger.info(
                                 f"🎯 Forwarding kind {kind} event to processor for user {user_id}: "
                                 f"event_id={eid[:16] if isinstance(eid, str) else eid}... "
+                                f"repost_enabled={repost_enabled} likes_enabled={likes_enabled} "
                                 f"(realtime detection active)"
                             )
                             await process_event_for_user(user_id, ev, settings, app)
-                            _dbg(f"Successfully processed kind {kind} event {eid} for user {user_id}")
+                            logger.debug(f"✅ Successfully processed kind {kind} event {eid} for user {user_id}")
+                        elif not isinstance(user_id, str):
+                            logger.warning(f"⚠️ Skipping kind {kind} event: invalid user_id type={type(user_id)}")
+                        elif not settings:
+                            logger.warning(f"⚠️ Skipping kind {kind} event for user {user_id}: settings not loaded")
                     except Exception as e:
-                        logger.debug(f"Error forwarding kind {kind} event to processor for user {user_id}: {e}")
+                        logger.error(f"❌ Error forwarding kind {kind} event to processor for user {user_id}: {e}", exc_info=True)
                     # continue processing (do not early-continue) so last_seen and status updates still run
                     
                 if CYBERHERD_DIAG:
