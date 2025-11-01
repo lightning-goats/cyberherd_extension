@@ -299,6 +299,45 @@ def _get_cache_note_ids(cache: dict, key, create: bool = False) -> list[str]:
     return []
 
 
+def _event_matches_tracked_tags(event: dict, tags_norm: list[str]) -> bool:
+    """Check if event matches any of the tracked tags.
+    
+    Checks both:
+    1. Explicit 't' tags in event.tags
+    2. Hashtags in event.content (fallback for clients that don't add 't' tags)
+    
+    Args:
+        event: Nostr event dict
+        tags_norm: List of normalized (lowercase, no #) tags to match against
+    
+    Returns:
+        True if event contains any tracked tag, False otherwise
+    """
+    if not tags_norm:
+        return False
+    
+    # Check explicit 't' tags
+    ev_tags = []
+    for t in event.get("tags", []) or []:
+        if isinstance(t, list) and len(t) > 1 and t[0] == "t" and isinstance(t[1], str):
+            ev_tags.append(t[1].lstrip('#').lower())
+    
+    if any(t in ev_tags for t in tags_norm):
+        return True
+    
+    # Content-hashtag fallback: check for #hashtags in content
+    try:
+        content = event.get('content', '') or ''
+        found = re.findall(r"#([\w\-]+)", content, flags=re.UNICODE)
+        found_norm = [h.lstrip('#').lower() for h in found if h]
+        if any(t in found_norm for t in tags_norm):
+            return True
+    except Exception:
+        pass
+    
+    return False
+
+
 async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, tags: list[str], event: dict, app=None) -> bool:
     """Append event id into today's cache entries (user-specific + neutral) if matches:
     - Author equals eff_pub
@@ -344,30 +383,10 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
              f"local_day=[{boundaries.local_since_ts}, {boundaries.local_until_ts}) "
              f"utc_date={boundaries.utc_day_str} eid={eid}")
         return False
-    # Robust: Nostr tags are arrays like ["t", "tag", ...]; tolerate mixed shapes
-    # Normalize by stripping a leading '#', then lowercase for comparison
-    ev_tags = []
-    for t in event.get("tags", []) or []:
-        if isinstance(t, list) and len(t) > 1 and t[0] == "t" and isinstance(t[1], str):
-            ev_tags.append(t[1].lstrip('#').lower())
-    matched = any(t in ev_tags for t in tags_norm)
-
-    # Content-hashtag fallback: if no explicit 't' tags matched, try to
-    # find #hashtags in the content body and match those. This is enabled
-    # by default so clients that don't add 't' tags still get detected.
-    found_norm = []
-    if not matched:
-        try:
-            content = event.get('content', '') or ''
-            # simple hashtag capture (unicode-friendly would be a future enhancement)
-            found = re.findall(r"#([\w\-]+)", content, flags=re.UNICODE)
-            found_norm = [h.lstrip('#').lower() for h in found if h]
-            matched = any(t in found_norm for t in tags_norm)
-        except Exception:
-            matched = matched
-
-    if not matched:
-        _dbg(f"_append_today: tag mismatch ev_tags={ev_tags} tags_norm={tags_norm} content_hashtags={found_norm} eid={eid}")
+    
+    # Use shared tag matching logic
+    if not _event_matches_tracked_tags(event, tags_norm):
+        _dbg(f"_append_today: tag mismatch tags_norm={tags_norm} eid={eid}")
         return False
 
     # Auto-add detected note event IDs to tracked_event_ids for repost/reaction tracking
@@ -539,17 +558,12 @@ async def _initialize_tracked_event_ids_on_startup(app):
                 
                 if events:
                     # Filter events to only those matching tracked tags
+                    # Use shared tag matching logic (consistent with _append_today)
                     tracked_ids = []
                     tags_norm = [t.lstrip('#').lower() for t in tags if t]
                     
                     for event in events:
-                        # Check if event has any tracked tags
-                        ev_tags = []
-                        for t in event.get("tags", []) or []:
-                            if isinstance(t, list) and len(t) > 1 and t[0] == "t" and isinstance(t[1], str):
-                                ev_tags.append(t[1].lstrip('#').lower())
-                        
-                        if any(t in ev_tags for t in tags_norm):
+                        if _event_matches_tracked_tags(event, tags_norm):
                             event_id = event.get("id")
                             if event_id:
                                 tracked_ids.append(event_id)
@@ -939,18 +953,11 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
 
         # kind 6: reposts
         elif kind == 6 and getattr(settings, "repost_tracking_enabled", False):
-            # Respect local "today" window: ignore historic reposts unless recovery_mode is requested
-            try:
-                if not recovery_mode:
-                    boundaries = _get_today_boundaries_utc()
-                    created_at = int(event.get('created_at') or 0)
-                    if not boundaries.is_timestamp_in_local_day(created_at):
-                        _dbg("Ignoring repost outside today's window: created_at=%s eid=%s", created_at, eid)
-                        return
-            except Exception:
-                # On any error, fall back to normal behavior
-                pass
-
+            logger.info(f"🔄 Processing kind 6 repost event {eid[:16] if eid else 'unknown'}... for user {user_id}")
+            
+            # No timestamp check for kind 6 - we only care if it references a tracked event ID.
+            # The tracked event IDs themselves are already filtered to today's window when detected.
+            
             cache = _get_cache(app)
             target_id = None
             for identifier in _collect_reference_identifiers(event, include_content=True):
@@ -1019,34 +1026,42 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
 
         # kind 7: reactions
         elif kind == 7 and getattr(settings, "likes_tracking_enabled", False):
-            # Respect local "today" window: ignore historic reactions unless recovery_mode is requested
-            try:
-                if not recovery_mode:
-                    boundaries = _get_today_boundaries_utc()
-                    created_at = int(event.get('created_at') or 0)
-                    if not boundaries.is_timestamp_in_local_day(created_at):
-                        _dbg("Ignoring reaction outside today's window: created_at=%s eid=%s", created_at, eid)
-                        return
-            except Exception:
-                pass
-
+            logger.info(f"🔍 Processing kind 7 reaction event {eid[:16] if eid else 'unknown'}... for user {user_id}")
+            
+            # No timestamp check for kind 7 - we only care if it references a tracked event ID.
+            # The tracked event IDs themselves are already filtered to today's window when detected.
+            
             cache = _get_cache(app)
             reacted_id = None
-            for identifier in _collect_reference_identifiers(event, include_content=False):
+            identifiers = _collect_reference_identifiers(event, include_content=False)
+            logger.info(f"📋 Found {len(identifiers)} reference identifiers in kind 7 event: {identifiers}")
+            
+            tracked_ids = getattr(settings, 'tracked_event_ids', []) or []
+            logger.info(f"📌 Current tracked_event_ids ({len(tracked_ids)}): {tracked_ids}")
+            
+            for identifier in identifiers:
+                logger.debug(f"🔎 Checking identifier: {identifier[:16]}...")
                 resolved_id, _metadata = await _resolve_tracked_event(settings, identifier, cache, app)
                 if not resolved_id:
+                    logger.debug(f"❌ Identifier {identifier[:16]}... did not resolve")
                     continue
-                if await _is_tracked_event(user_id, resolved_id, settings, app, cache):
+                logger.debug(f"✅ Resolved to: {resolved_id[:16]}...")
+                
+                is_tracked = await _is_tracked_event(user_id, resolved_id, settings, app, cache)
+                logger.info(f"🎯 Is {resolved_id[:16]}... tracked? {is_tracked}")
+                
+                if is_tracked:
                     reacted_id = resolved_id
                     break
 
             if reacted_id:
+                logger.info(f"✅ Kind 7 reaction matched tracked event {reacted_id[:16]}... Processing headbutt!")
                 # Persistent dedupe: skip if reaction event already processed
                 try:
                     from .. import crud
                     try:
                         if eid and await crud.is_event_processed(user_id, eid):
-                            logger.debug("Skipping reaction event %s because it's marked processed persistently", eid)
+                            logger.info(f"⏭️ Skipping reaction event {eid[:16]}... because it's already been processed")
                             return
                     except Exception:
                         pass
@@ -1054,6 +1069,7 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                     pass
 
                 result = await _trigger_reaction_headbutt(user_id, pubkey, reacted_id, eid, app, recovery_mode=recovery_mode)
+                logger.info(f"🎬 Reaction headbutt result: {result is not None}")
                 # Persist processed status when subscription-driven processing succeeds
                 try:
                     if result and eid:
@@ -1089,6 +1105,9 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                             logger.warning(f"Failed to persist processed reaction event {eid} for user {user_id}")
                 except Exception:
                     pass
+            else:
+                logger.warning(f"⚠️ Kind 7 reaction event {eid[:16] if eid else 'unknown'}... did NOT match any tracked events. Identifiers checked: {identifiers}")
+                
     except Exception as e:
         logger.error(f"Error processing event for user {user_id}: {e}")
     finally:
@@ -1412,16 +1431,6 @@ async def _trigger_reaction_headbutt(user_id: str, reactor_pubkey: str, reacted_
         return None
 
 
-# DEPRECATED: _trigger_zap_headbutt has been removed
-# Zaps are now processed exclusively via the payment listener (zap_monitor.py)
-# which handles LNURLp invoice.extra["nostr"] zap requests. This ensures
-# accurate tracking via actual payment settlement rather than Nostr events.
-# 
-# Historical context: Kind 9735 (zap receipt) events were previously processed
-# here, but this created duplicate processing issues and timing problems.
-# The payment listener path is more reliable and accurate.
-
-
 async def _recover_missed_reposts_and_reactions_on_startup(app):
     """Recover missed reposts and reactions on startup by querying recent kind 6 and 7 events.
 
@@ -1447,15 +1456,28 @@ async def _recover_missed_reposts_and_reactions_on_startup(app):
                 get_users = None
 
         users = await get_users() if asyncio.iscoroutinefunction(get_users) else []
+        recovery_attempted = 0
+        recovery_succeeded = 0
         for user in users:
             try:
                 settings = await crud.get_settings(user.id)
                 if not (getattr(settings, 'repost_tracking_enabled', False) or getattr(settings, 'likes_tracking_enabled', False)):
                     continue
                 
+                # Only attempt recovery if user has tracked_event_ids
+                tracked_event_ids = getattr(settings, 'tracked_event_ids', []) or []
+                if not tracked_event_ids:
+                    logger.debug(f"Skipping recovery for user {user.id}: no tracked_event_ids")
+                    continue
+                
+                recovery_attempted += 1
+                logger.info(f"Starting repost/reaction recovery for user {user.id} with {len(tracked_event_ids)} tracked notes")
                 await _recover_missed_reposts_and_reactions_for_user(user.id, settings, app)
+                recovery_succeeded += 1
             except Exception as e:
                 logger.warning(f"Error recovering reposts and reactions for user {user.id}: {e}")
+        
+        logger.info(f"Startup recovery complete: {recovery_succeeded}/{recovery_attempted} users successfully recovered")
                 
     except Exception as e:
         logger.warning(f"Error in repost/reaction recovery: {e}")
@@ -1559,12 +1581,18 @@ async def _recover_missed_reposts_and_reactions_for_user(user_id: str, settings,
         logger.info(f"Recovered {len(unique_events)} repost/reaction events for user {user_id} via #e filters")
         
         # Process each event recovered via #e filters
+        processed_count = 0
         for event in unique_events:
             try:
                 # Use recovery_mode=True to prevent publishing notes for historical events
-                await process_event_for_user(user_id, event, settings, app, recovery_mode=True)
+                result = await process_event_for_user(user_id, event, settings, app, recovery_mode=True)
+                if result is not False:  # None or True means processed
+                    processed_count += 1
             except Exception as e:
                 logger.warning(f"Error processing recovered event {event.get('id')} for user {user_id}: {e}")
+        
+        if processed_count > 0:
+            logger.info(f"✅ Successfully processed {processed_count}/{len(unique_events)} recovered events for user {user_id}")
 
         # --- Additional broad sweep for content-only reposts (no #e tag) ---
         try:
@@ -1625,11 +1653,17 @@ async def _recover_missed_reposts_and_reactions_for_user(user_id: str, settings,
                 logger.info(f"Recovered {len(new_events)} content-only reposts for user {user_id}")
 
                 # Process only the newly discovered content-only reposts
+                content_processed = 0
                 for event in new_events:
                     try:
-                        await process_event_for_user(user_id, event, settings, app, recovery_mode=True)
+                        result = await process_event_for_user(user_id, event, settings, app, recovery_mode=True)
+                        if result is not False:
+                            content_processed += 1
                     except Exception as e:
                         logger.warning(f"Error processing recovered event {event.get('id')} for user {user_id}: {e}")
+                
+                if content_processed > 0:
+                    logger.info(f"✅ Successfully processed {content_processed}/{len(new_events)} content-only reposts for user {user_id}")
         except Exception as e:
             logger.warning(f"Error during broad kind=6 recovery sweep for user {user_id}: {e}")
                 

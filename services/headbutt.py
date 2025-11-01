@@ -1084,10 +1084,10 @@ class EnhancedHeadbuttService:
         source_event_id: str | None = None,
         member_picture: str | None = None,
     ):
-        if self.recovery_mode:
-            return
-        # If we already processed this event (published by another path,
+        # Check if we already processed this event (published by another path,
         # e.g. views_api), skip publishing to avoid duplicate messages.
+        # This applies to both realtime and recovery modes - we publish messages
+        # for historical events during recovery as long as they're new (not duplicates).
         try:
             if event_id and self.user_id:
                 from .. import crud
