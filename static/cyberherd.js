@@ -671,5 +671,20 @@ window.app = Vue.createApp({
     this.fetchShares()
     this.fetchTodayNotes()
     this.fetchZapMonitorStatus()
+    
+    // Auto-refresh data every 15 seconds (LNbits standard polling pattern)
+    this._pollInterval = setInterval(() => {
+      if (!document.hidden) {
+        this.fetchMembers()
+        this.fetchShares()
+        this.fetchTodayNotes()
+      }
+    }, 15000)
+  },
+  beforeUnmount() {
+    // Clean up polling interval when component is destroyed
+    if (this._pollInterval) {
+      clearInterval(this._pollInterval)
+    }
   }
 })
