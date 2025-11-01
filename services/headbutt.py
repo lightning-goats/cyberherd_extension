@@ -705,6 +705,46 @@ class EnhancedHeadbuttService:
                 old_amount = existing_member.get('amount', 0) if existing_member else 0
                 was_active = bool(existing_member and existing_member.get('is_active'))
                 
+                # Check if this is a repost or reaction event
+                attacker_kinds = getattr(attacker, 'kinds', []) or []
+                is_repost_event = 6 in attacker_kinds
+                is_reaction_event = 7 in attacker_kinds
+                
+                # Get existing kinds from the member record
+                existing_kinds_set = set()
+                if existing_member:
+                    kinds_raw = existing_member.get('kinds')
+                    if kinds_raw:
+                        if isinstance(kinds_raw, str):
+                            # Parse comma-separated string like "6,7"
+                            for part in kinds_raw.split(','):
+                                try:
+                                    existing_kinds_set.add(int(part.strip()))
+                                except Exception:
+                                    pass
+                        elif isinstance(kinds_raw, (list, tuple)):
+                            for k in kinds_raw:
+                                try:
+                                    existing_kinds_set.add(int(k))
+                                except Exception:
+                                    pass
+                
+                # Skip processing if this is a duplicate repost or reaction
+                # Reposts and reactions should only be counted once per user
+                if is_repost_event and 6 in existing_kinds_set:
+                    logger.info(
+                        f"⏭️  Skipping duplicate kind 6 (repost) for existing member {attacker.pubkey[:8]}... "
+                        f"(already has kind 6 recorded)"
+                    )
+                    return None
+                
+                if is_reaction_event and 7 in existing_kinds_set:
+                    logger.info(
+                        f"⏭️  Skipping duplicate kind 7 (reaction) for existing member {attacker.pubkey[:8]}... "
+                        f"(already has kind 7 recorded)"
+                    )
+                    return None
+                
                 # Normalize the attacker metadata before templating:
                 # Copy display_name, nprofile, lud16, picture, etc. from existing_member onto attacker when missing
                 if existing_member:
