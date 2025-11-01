@@ -205,12 +205,12 @@ def _prepare_websocket_subscription(user_id: str, settings, app) -> Optional[dic
     filters: list[dict[str, Any]] = []
     if eff_pub:
         if stripped_tags:
-            notes_tagged_filter = {"kinds": [1], "#t": stripped_tags, "authors": [eff_pub], "since": since}
+            notes_tagged_filter = {"kinds": [1, 30311], "#t": stripped_tags, "authors": [eff_pub], "since": since}
             if _first_cycle.get(ukey, True) and initial_limit > 0:
                 notes_tagged_filter['limit'] = initial_limit
             filters.append(notes_tagged_filter)
 
-        notes_author_filter = {"kinds": [1], "authors": [eff_pub], "since": since}
+        notes_author_filter = {"kinds": [1, 30311], "authors": [eff_pub], "since": since}
         if _first_cycle.get(ukey, True) and initial_limit > 0:
             notes_author_filter['limit'] = initial_limit
         filters.append(notes_author_filter)
@@ -1718,16 +1718,17 @@ async def _event_pump(app):
                     
                 _dbg("Event recv user=%s id=%s created_at=%s", user_id, (eid[:12] + '…') if isinstance(eid, str) else eid, created_at)
                 
-                # For kind 1 notes, delegate matching logic to _append_today which
-                # now supports t-tags and content-hashtag fallback. Always call it
-                # instead of gating on explicit 't' tags here.
-                if int(ev.get('kind') or 0) == 1:
+                # For kind 1 notes and kind 30311 (long-form content), delegate matching logic to _append_today
+                # which supports t-tags and content-hashtag fallback. Always call it instead of gating on
+                # explicit 't' tags here.
+                event_kind = int(ev.get('kind') or 0)
+                if event_kind in (1, 30311):
                     try:
-                        if await _append_today(cache, user_id, eff_pub, tags, ev):
+                        if await _append_today(cache, user_id, eff_pub, tags, ev, app):
                             meta['appended'] += 1
                             if CYBERHERD_DIAG:
                                 _diag_counts['events_matched'] += 1
-                            _dbg("Appended to cache user=%s total_appended=%s", user_id, meta['appended'])
+                            _dbg("Appended to cache user=%s kind=%s total_appended=%s", user_id, event_kind, meta['appended'])
                     except Exception:
                         pass
                         

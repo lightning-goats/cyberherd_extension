@@ -932,8 +932,8 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
         eff_pub = get_effective_pubkey(settings)
         tags = getattr(settings, "tracked_tags", [])
 
-        # kind 1: notes
-        if kind == 1:
+        # kind 1: notes, kind 30311: long-form content
+        if kind in (1, 30311):
             cache = _get_cache(app)
             await _append_today(cache, user_id, eff_pub, tags, event, app)
 
