@@ -38,6 +38,8 @@ class CyberherdSettings(BaseModel):
     minimum_sats: int = 10
     # optional feeder trigger threshold (sats) supplied by external automation
     feeder_trigger_sats: Optional[int] = None
+    # toggle to enable/disable NIP-05 verification requirement
+    nip05_verification_enabled: bool = True
     # user ID associated with these settings
     user_id: Optional[str] = None
 

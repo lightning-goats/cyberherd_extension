@@ -1494,37 +1494,51 @@ class EnhancedHeadbuttService:
                 )
                 return "lud16_required"
 
-            nip05_value = str(getattr(attacker, "nip05", "") or "").strip()
-            if not nip05_value and metadata:
-                nip05_candidate = metadata.get("nip05")
-                if isinstance(nip05_candidate, str):
-                    nip05_value = nip05_candidate.strip()
-                    if nip05_value:
-                        attacker.nip05 = nip05_value
+            # Check if NIP-05 verification is enabled in settings
+            nip05_verification_enabled = True  # Default to enabled
+            try:
+                settings = await self.db.get_settings(self.user_id)
+                nip05_verification_enabled = getattr(settings, "nip05_verification_enabled", True)
+            except Exception as e:
+                logger.debug(f"Failed to fetch NIP-05 verification setting, defaulting to enabled: {e}")
 
-            if not nip05_value:
-                logger.info(
-                    f"AdmissionGuard nip05_required: missing (pubkey={attacker.pubkey[:16]}...)"
-                )
-                return "nip05_required"
+            # Only enforce NIP-05 verification if it's enabled
+            if nip05_verification_enabled:
+                nip05_value = str(getattr(attacker, "nip05", "") or "").strip()
+                if not nip05_value and metadata:
+                    nip05_candidate = metadata.get("nip05")
+                    if isinstance(nip05_candidate, str):
+                        nip05_value = nip05_candidate.strip()
+                        if nip05_value:
+                            attacker.nip05 = nip05_value
 
-            verification_result, verification_reason = await _verify_nip05_relaxed(attacker.pubkey, nip05_value)
-            cached_verified = bool(cache_entry and cache_entry.get("verified"))
-            if verification_result is False:
-                _metadata_cache_mark_verified(attacker.pubkey, False)
-                logger.info(
-                    f"AdmissionGuard nip05_required: verification_failed (pubkey={attacker.pubkey[:16]}..., nip05={nip05_value}, reason={verification_reason})"
-                )
-                return "nip05_required"
-            if verification_result is True:
-                _metadata_cache_mark_verified(attacker.pubkey, True)
-            elif not cached_verified:
-                logger.warning(
-                    f"AdmissionGuard nip05_unverified: proceeding without confirmation (pubkey={attacker.pubkey[:16]}..., nip05={nip05_value}, reason={verification_reason})"
-                )
+                if not nip05_value:
+                    logger.info(
+                        f"AdmissionGuard nip05_required: missing (pubkey={attacker.pubkey[:16]}...)"
+                    )
+                    return "nip05_required"
+
+                verification_result, verification_reason = await _verify_nip05_relaxed(attacker.pubkey, nip05_value)
+                cached_verified = bool(cache_entry and cache_entry.get("verified"))
+                if verification_result is False:
+                    _metadata_cache_mark_verified(attacker.pubkey, False)
+                    logger.info(
+                        f"AdmissionGuard nip05_required: verification_failed (pubkey={attacker.pubkey[:16]}..., nip05={nip05_value}, reason={verification_reason})"
+                    )
+                    return "nip05_required"
+                if verification_result is True:
+                    _metadata_cache_mark_verified(attacker.pubkey, True)
+                elif not cached_verified:
+                    logger.warning(
+                        f"AdmissionGuard nip05_unverified: proceeding without confirmation (pubkey={attacker.pubkey[:16]}..., nip05={nip05_value}, reason={verification_reason})"
+                    )
+                else:
+                    logger.debug(
+                        f"AdmissionGuard nip05_cached_ok: using cached verification (pubkey={attacker.pubkey[:16]}..., reason={verification_reason})"
+                    )
             else:
-                logger.debug(
-                    f"AdmissionGuard nip05_cached_ok: using cached verification (pubkey={attacker.pubkey[:16]}..., reason={verification_reason})"
+                logger.info(
+                    f"AdmissionGuard nip05_verification_disabled: skipping NIP-05 verification (pubkey={attacker.pubkey[:16]}...)"
                 )
 
             # Generate nprofile for attacker (without relay hints - faster and still valid)

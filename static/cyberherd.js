@@ -19,6 +19,7 @@ window.app = Vue.createApp({
           likes_tracking_enabled: false,
           tracked_event_ids: [],
           midnight_reset_enabled: false,
+          nip05_verification_enabled: true,
           // zap_monitor_mode deprecated (always 'payment')
           nostr_private_key: '',
           nostr_private_key_mask: '',
@@ -188,6 +189,7 @@ window.app = Vue.createApp({
           tracked_tags: (data.tracked_tags || []).join(', '),
           zap_tracking_enabled: data.zap_tracking_enabled || false,
           midnight_reset_enabled: typeof data.midnight_reset_enabled !== 'undefined' ? !!data.midnight_reset_enabled : false,
+          nip05_verification_enabled: typeof data.nip05_verification_enabled !== 'undefined' ? !!data.nip05_verification_enabled : true,
           websocket_url: data.websocket_url || null,
           repost_tracking_enabled: data.repost_tracking_enabled || false,
           likes_tracking_enabled: data.likes_tracking_enabled || false,
@@ -263,6 +265,7 @@ window.app = Vue.createApp({
           zap_tracking_enabled: this.cyberherdData.form.zap_tracking_enabled,
           repost_tracking_enabled: this.cyberherdData.form.repost_tracking_enabled,
           likes_tracking_enabled: this.cyberherdData.form.likes_tracking_enabled,
+          nip05_verification_enabled: this.cyberherdData.form.nip05_verification_enabled,
           // zap_monitor_mode removed
         }
 
@@ -334,6 +337,7 @@ window.app = Vue.createApp({
           likes_tracking_enabled: this.cyberherdData.form.likes_tracking_enabled,
           // Persist midnight reset opt-in
           midnight_reset_enabled: !!this.cyberherdData.form.midnight_reset_enabled,
+          nip05_verification_enabled: !!this.cyberherdData.form.nip05_verification_enabled,
         }
 
         const authKey = this.getAuthKey()

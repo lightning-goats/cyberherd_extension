@@ -182,6 +182,7 @@ async def _bootstrap_settings_storage():
         f"ALTER TABLE {table_name} ADD COLUMN repost_tracking_enabled INTEGER DEFAULT 0;",
         f"ALTER TABLE {table_name} ADD COLUMN likes_tracking_enabled INTEGER DEFAULT 0;",
         f"ALTER TABLE {table_name} ADD COLUMN minimum_sats INTEGER DEFAULT 10;",
+        f"ALTER TABLE {table_name} ADD COLUMN nip05_verification_enabled INTEGER DEFAULT 1;",
         # legacy column `manual_event_ids` is handled via migration below if needed;
         # tracked_event_ids is used by newer code; ensure it's present
         f"ALTER TABLE {table_name} ADD COLUMN tracked_event_ids TEXT;",
@@ -539,6 +540,7 @@ def _row_to_settings(row) -> CyberherdSettings:
         likes_tracking_enabled=bool(row.get("likes_tracking_enabled", False)),
         midnight_reset_enabled=bool(row.get("midnight_reset_enabled", True)),
         minimum_sats=row.get("minimum_sats") or 10,
+        nip05_verification_enabled=bool(row.get("nip05_verification_enabled", True)),
         feeder_trigger_sats=row.get("feeder_trigger_sats"),
         user_id=row.get("user_id"),
     )
@@ -637,6 +639,10 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
         has_midnight_col = await _column_exists("settings", "midnight_reset_enabled")
         if has_midnight_col:
             update_cols.insert(update_cols.index("minimum_sats = :minimum_sats"), "midnight_reset_enabled = :midnight_reset_enabled")
+        # Only include nip05_verification_enabled if the column exists in this DB
+        has_nip05_col = await _column_exists("settings", "nip05_verification_enabled")
+        if has_nip05_col:
+            update_cols.insert(update_cols.index("minimum_sats = :minimum_sats") + 1, "nip05_verification_enabled = :nip05_verification_enabled")
         if has_templates_col:
             update_cols.append("templates_owner_user = :templates_owner_user")
         sql = f"UPDATE {db.references_schema}settings SET " + ", ".join(update_cols) + " WHERE user_id = :user_id"
@@ -667,6 +673,9 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
         # Only add midnight_reset_enabled param if column exists
         if has_midnight_col:
             params["midnight_reset_enabled"] = int(getattr(settings, "midnight_reset_enabled", True))
+        # Only add nip05_verification_enabled param if column exists
+        if has_nip05_col:
+            params["nip05_verification_enabled"] = int(getattr(settings, "nip05_verification_enabled", True))
         try:
             async with _crud_write_lock:
                 await _execute_with_retry(sql, params)
@@ -762,6 +771,8 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
         sql = f"INSERT INTO {db.references_schema}settings ({', '.join(insert_cols)}) VALUES ({', '.join(placeholders)})"
         # Only include midnight_reset_enabled param if column exists
         has_midnight_col = await _column_exists("settings", "midnight_reset_enabled")
+        # Only include nip05_verification_enabled param if column exists
+        has_nip05_col = await _column_exists("settings", "nip05_verification_enabled")
         params = {
             "user_id": user_id,
             "source_wallet": getattr(settings, "source_wallet", None),
@@ -790,6 +801,14 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
             placeholders = [":" + c for c in insert_cols]
             sql = f"INSERT INTO {db.references_schema}settings ({', '.join(insert_cols)}) VALUES ({', '.join(placeholders)})"
             params["midnight_reset_enabled"] = int(getattr(settings, "midnight_reset_enabled", True))
+        if has_nip05_col:
+            # Ensure column is present in insert list and params
+            if "nip05_verification_enabled" not in insert_cols:
+                insert_cols.insert(insert_cols.index("minimum_sats") + 1, "nip05_verification_enabled")
+            # Rebuild placeholders and SQL to include the column
+            placeholders = [":" + c for c in insert_cols]
+            sql = f"INSERT INTO {db.references_schema}settings ({', '.join(insert_cols)}) VALUES ({', '.join(placeholders)})"
+            params["nip05_verification_enabled"] = int(getattr(settings, "nip05_verification_enabled", True))
         if has_feeder_col:
             # Ensure column appears in insert order if midnight column was inserted earlier
             if "feeder_trigger_sats" not in insert_cols:

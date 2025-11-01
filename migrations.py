@@ -27,6 +27,7 @@ __all__ = [
     'm026_add_zap_totals_table',
     'm027_add_feeder_trigger_sats',
     'm028_sync_processed_zaps_schema',
+    'm029_add_nip05_verification_toggle',
 ]
 
 logger.info(f"CYBERHERD MIGRATIONS: Registered {len(__all__)} migrations: {__all__}")
@@ -82,6 +83,7 @@ async def m001_consolidated_schema(db: Database):
             likes_tracking_enabled INTEGER DEFAULT 0,
         midnight_reset_enabled INTEGER DEFAULT 1,
             minimum_sats INTEGER DEFAULT 10,
+            nip05_verification_enabled INTEGER DEFAULT 1,
             
             -- Multi-user support
             user_id TEXT,
@@ -472,3 +474,22 @@ async def m028_sync_processed_zaps_schema(db: Database):
     except Exception:
         pass
     logger.info("CYBERHERD m028: processed_zaps schema sync complete")
+
+
+async def m029_add_nip05_verification_toggle(db: Database):
+    """Add nip05_verification_enabled column to settings table."""
+    logger.info("CYBERHERD m029: adding nip05_verification_enabled column")
+    try:
+        await db.execute(
+            """
+            ALTER TABLE cyberherd.settings 
+            ADD COLUMN nip05_verification_enabled INTEGER DEFAULT 1;
+            """
+        )
+        logger.info("CYBERHERD m029: nip05_verification_enabled column added successfully")
+    except Exception as e:
+        msg = str(e).lower()
+        if any(token in msg for token in ("duplicate", "already exists", "duplicate column")):
+            logger.info("CYBERHERD m029: nip05_verification_enabled column already exists, skipping")
+        else:
+            logger.warning(f"CYBERHERD m029: failed to add nip05_verification_enabled column: {e}")

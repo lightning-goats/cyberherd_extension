@@ -978,6 +978,7 @@ async def api_get_settings(request: Request, auth=Depends(auth_wallet_or_admin_d
         "nostrclient_available": _nostrclient_available(),
         "zap_tracking_enabled": getattr(settings, "zap_tracking_enabled", False),
         "midnight_reset_enabled": getattr(settings, "midnight_reset_enabled", True),
+        "nip05_verification_enabled": getattr(settings, "nip05_verification_enabled", True),
         "zap_monitor_mode": getattr(settings, "zap_monitor_mode", "websocket"),
         "repost_tracking_enabled": getattr(settings, "repost_tracking_enabled", False),
         "likes_tracking_enabled": getattr(settings, "likes_tracking_enabled", False),
@@ -1205,6 +1206,11 @@ async def api_put_settings(
     midnight_reset_enabled = payload.get("midnight_reset_enabled")
     if midnight_reset_enabled is not None:
         settings.midnight_reset_enabled = bool(midnight_reset_enabled)
+
+    # Handle NIP-05 verification toggle
+    nip05_verification_enabled = payload.get("nip05_verification_enabled")
+    if nip05_verification_enabled is not None:
+        settings.nip05_verification_enabled = bool(nip05_verification_enabled)
 
     # Handle minimum sats
     minimum_sats = payload.get("minimum_sats")

@@ -60,6 +60,9 @@
             <div class="col-12 col-md-4">
               <q-toggle v-model="cyberherdData.form.midnight_reset_enabled" @update:model-value="saveToggleSettings" label="Midnight reset" hint="Opt-in to nightly deactivation + split reset"></q-toggle>
             </div>
+            <div class="col-12 col-md-4">
+              <q-toggle v-model="cyberherdData.form.nip05_verification_enabled" @update:model-value="saveToggleSettings" label="NIP-05 verification" hint="Require valid NIP-05 identifier for members"></q-toggle>
+            </div>
           </div>
 
           <div class="row items-center q-col-gutter-sm q-mt-sm">
