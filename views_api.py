@@ -1740,8 +1740,15 @@ async def api_get_today_cyberherd_notes(request: Request, auth=Depends(auth_wall
             lock = None
 
     async def _query_and_cache():
-        # Use the shared note detection logic from crud
-        today_ids = await crud.get_cyberherd_notes_for_settings(s, since_days_ago=0)
+        # Return tracked_event_ids from settings (maintained by subscription system)
+        # This reflects the notes that are actively being monitored for engagements
+        tracked_ids = getattr(s, "tracked_event_ids", []) or []
+        
+        # Normalize to list of strings
+        today_ids = []
+        for note_id in tracked_ids:
+            if isinstance(note_id, str):
+                today_ids.append(note_id.strip().lower())
         
         _cache_notes(request, cache_key, today_ids)
         if debug_mode:
