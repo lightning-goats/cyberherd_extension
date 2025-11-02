@@ -179,9 +179,46 @@ def get_effective_pubkey(settings) -> Optional[str]:
 
 # Module-level mirror of status for callers that don't have app context
 _subscription_status: dict[str, Any] = {}
-_refresh_event: asyncio.Event | None = None  # set by API when settings change
+# Use a dict to hold the event so both modules can share the reference
+_refresh_event_holder: dict[str, asyncio.Event | None] = {'event': None}
+_refresh_event: asyncio.Event | None = None  # deprecated, kept for compatibility
 # Module-level cache used when no app/state is provided (tests or callers without app)
 _module_note_cache: dict = {}
+
+
+def get_refresh_event() -> asyncio.Event | None:
+    """Get the shared refresh event, creating it if needed.
+    
+    Returns the event from the holder dict which is shared across modules.
+    """
+    global _refresh_event_holder
+    if _refresh_event_holder['event'] is None:
+        try:
+            _refresh_event_holder['event'] = asyncio.Event()
+        except Exception:
+            pass
+    return _refresh_event_holder['event']
+
+
+def set_refresh_event():
+    """Set/trigger the shared refresh event."""
+    evt = get_refresh_event()
+    if evt is not None:
+        try:
+            evt.set()
+        except Exception:
+            pass
+
+
+def clear_refresh_event():
+    """Clear the shared refresh event."""
+    evt = get_refresh_event()
+    if evt is not None:
+        try:
+            evt.clear()
+        except Exception:
+            pass
+
 
 
 def get_subscription_status(app=None) -> dict:
@@ -352,8 +389,6 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
     - Checks event.created_at against LOCAL day boundaries (user's "today" concept)
     - Cache key uses UTC date for storage consistency
     """
-    global _refresh_event
-
     eid = event.get("id")
     if not eid:
         return False
@@ -436,16 +471,8 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
                         try:
                             st = getattr(app, "state", app)
                             setattr(st, "cyberherd_force_subscription_refresh", True)
-                            if _refresh_event is None:
-                                try:
-                                    _refresh_event = asyncio.Event()
-                                except Exception:
-                                    _refresh_event = None
-                            if _refresh_event is not None:
-                                try:
-                                    _refresh_event.set()
-                                except Exception:
-                                    pass
+                            # Use the shared event holder for reliable cross-module signaling
+                            set_refresh_event()
                             logger.info(
                                 f"✅ Subscription refresh triggered for user={user_id} after adding tracked event {eid}. "
                                 f"Kind 6/7 subscriptions will be updated automatically."
@@ -673,33 +700,24 @@ async def _wait_for_tracked_event_ids(app, timeout_seconds: float = 30.0) -> boo
 
     Returns True if tracked_event_ids were detected, False on timeout.
     """
-    global _refresh_event
     try:
         # Fast path: already present
         if await _any_tracked_event_ids_exist(app):
             return True
 
-        # Ensure event exists so _append_today can set it when it auto-adds IDs
-        if _refresh_event is None:
-            try:
-                _refresh_event = asyncio.Event()
-            except Exception:
-                _refresh_event = None
-
-        if _refresh_event is None:
+        # Get the shared event
+        evt = get_refresh_event()
+        if evt is None:
             # Can't rely on event waking, just sleep a bit and re-check
             await asyncio.sleep(timeout_seconds)
             return await _any_tracked_event_ids_exist(app)
 
         try:
-            await asyncio.wait_for(_refresh_event.wait(), timeout=timeout_seconds)
+            await asyncio.wait_for(evt.wait(), timeout=timeout_seconds)
         except asyncio.TimeoutError:
             return False
         finally:
-            try:
-                _refresh_event.clear()
-            except Exception:
-                pass
+            clear_refresh_event()
 
         # Give a small moment for DB writes to complete
         await asyncio.sleep(0.1)
@@ -720,49 +738,8 @@ def trigger_subscription_refresh(app, reason: str | None = None):
     except Exception:
         pass
 
-    global _refresh_event
-    try:
-        if _refresh_event is None:
-            try:
-                _refresh_event = asyncio.Event()
-            except Exception:
-                _refresh_event = None
-        if _refresh_event is not None:
-            try:
-                _refresh_event.set()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # Try to sync the event to the nostr_adapter module so the adapter's
-    # manager loop (which may be waiting on its own _refresh_event) is
-    # reliably woken up immediately instead of waiting for the loop timeout.
-    try:
-        from . import nostr_adapter
-        try:
-            # If adapter has its own _refresh_event, set it or replace it with ours
-            a_ev = getattr(nostr_adapter, '_refresh_event', None)
-            if a_ev is None:
-                try:
-                    setattr(nostr_adapter, '_refresh_event', _refresh_event)
-                except Exception:
-                    pass
-            else:
-                try:
-                    # If adapter event exists, prefer to set it so its wait wakes
-                    a_ev.set()
-                except Exception:
-                    # If setting fails, try to replace it
-                    try:
-                        setattr(nostr_adapter, '_refresh_event', _refresh_event)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    except Exception:
-        # Adapter may not be importable in some contexts; ignore
-        pass
+    # Use the shared event holder for reliable cross-module signaling
+    set_refresh_event()
 
     try:
         logger.info(f"Triggered subscription refresh{f' - {reason}' if reason else ''}")
@@ -812,7 +789,6 @@ def start_subscriptions(app):
         import asyncio
 
         async def _kick():
-            global _refresh_event
             try:
                 # Wait for nostrclient relays to be ready before starting subscriptions
                 from .relay_readiness import wait_for_relays_ready
@@ -924,16 +900,7 @@ def start_subscriptions(app):
                 try:
                     st = getattr(app, "state", app)
                     setattr(st, "cyberherd_force_subscription_refresh", True)
-                    if _refresh_event is None:
-                        try:
-                            _refresh_event = asyncio.Event()
-                        except Exception:
-                            _refresh_event = None
-                    if _refresh_event is not None:
-                        try:
-                            _refresh_event.set()
-                        except Exception:
-                            pass
+                    set_refresh_event()
                 except Exception as e:
                     logger.warning(f"Could not set subscription refresh flag: {e}")
                 

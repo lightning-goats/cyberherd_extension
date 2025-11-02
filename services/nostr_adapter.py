@@ -42,10 +42,12 @@ from .subscriptions import (
     _get_cache,
     _get_cache_note_ids,
     _local_midnight_timestamp,
-    _refresh_event,
     get_subscription_status,
     get_effective_pubkey,
     _get_today_boundaries_utc,
+    get_refresh_event,
+    set_refresh_event,
+    clear_refresh_event,
 )  # reuse helpers
 from .. import crud
 from . import nostr_helpers
@@ -1373,10 +1375,8 @@ async def _manager_loop(app):
     })
     st.cyberherd_subscription_status = status
 
-    global _refresh_event
-    if _refresh_event is None:
-        from .subscriptions import _refresh_event as legacy_event  # ensure event created
-        _refresh_event = legacy_event or asyncio.Event()
+    # No need for module-level _refresh_event anymore; use shared event from subscriptions
+    refresh_event = get_refresh_event()  # Get the shared event
 
     while True:
         try:
@@ -1677,14 +1677,15 @@ async def _manager_loop(app):
         except Exception as e:
             _dbg("manager error %s", e)
         
-        # Wait for refresh or timeout
+        # Wait for refresh or timeout using the shared event
         try:
-            if _refresh_event is None:
+            refresh_event = get_refresh_event()  # Re-get in case it was recreated
+            if refresh_event is None:
                 await asyncio.sleep(refresh_seconds)
             else:
                 try:
-                    await asyncio.wait_for(_refresh_event.wait(), timeout=refresh_seconds)
-                    _refresh_event.clear()
+                    await asyncio.wait_for(refresh_event.wait(), timeout=refresh_seconds)
+                    clear_refresh_event()
                 except asyncio.TimeoutError:
                     pass
         except Exception:
