@@ -671,6 +671,20 @@ class EnhancedHeadbuttService:
                 logger.info("AdmissionGuard cooldown: in_cooldown=True")
                 return None
 
+            # Reject actions from the effective pubkey (operator's own reposts/likes/zaps)
+            try:
+                from ..views_api import _get_effective_pubkey
+                settings = await self.db.get_settings(self.user_id)
+                eff_pub = _get_effective_pubkey(settings)
+                if eff_pub and attacker.pubkey == eff_pub:
+                    logger.info(
+                        f"AdmissionGuard: rejecting action from effective pubkey (operator's own action) "
+                        f"pubkey={attacker.pubkey[:16]}..."
+                    )
+                    return None
+            except Exception as e:
+                logger.warning(f"Could not check effective pubkey: {e}")
+
             active_members = await self.db.get_active_cyberherd_members(user_id=self.user_id)
             max_members = await self._get_max_members()
 

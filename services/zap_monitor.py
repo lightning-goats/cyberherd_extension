@@ -483,6 +483,19 @@ class ZapMonitorService:
                 self.last_error = "missing_zapper_pubkey"
                 return False
             
+            # Reject zaps from the effective pubkey (operator's own zaps)
+            try:
+                eff_pub = resolve_effective_pubkey(settings)
+                if eff_pub and zapper_pubkey.lower() == eff_pub.lower():
+                    logger.info(
+                        f"Zap rejected: zapper is the effective pubkey (operator's own zap) "
+                        f"zapper={zapper_pubkey[:16]}..."
+                    )
+                    self.last_error = "zapper_is_effective_pubkey"
+                    return False
+            except Exception as e:
+                logger.debug(f"Could not check if zapper is effective pubkey: {e}")
+            
             # Extract target note references from tags (NIP-57 format)
             target_note_id_raw: Optional[str] = None
             target_author_raw: Optional[str] = None

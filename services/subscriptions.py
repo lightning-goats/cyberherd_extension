@@ -966,6 +966,16 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
             return
 
         eff_pub = get_effective_pubkey(settings)
+        
+        # Reject events from the effective pubkey (operator's own actions)
+        # This prevents self-reposts, self-reactions, and self-zaps from counting
+        if eff_pub and pubkey == eff_pub:
+            logger.debug(
+                f"Skipping event {eid[:16]}... kind {kind} from effective pubkey "
+                f"(operator's own action) for user {user_id}"
+            )
+            return
+        
         tags = getattr(settings, "tracked_tags", [])
 
         # kind 1: notes, kind 30311: long-form content
