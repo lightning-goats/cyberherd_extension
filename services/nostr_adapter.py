@@ -1262,7 +1262,8 @@ async def _load_contexts():
         tags_norm = sorted({t.lower() for t in raw_tags if t})
         # Expand filter tags with original + lowercase variants (deduplicated order stable)
         filter_tags = list(dict.fromkeys([rt for rt in raw_tags if rt] + [rt.lower() for rt in raw_tags if rt]))
-        if filter_tags and eff:
+        # Allow contexts without filter_tags - if empty, any note from author will count
+        if eff:
             contexts.append({
                 'user_id': None, 
                 'settings': s, 
@@ -1284,7 +1285,8 @@ async def _load_contexts():
             raw_tags = [t.lstrip('#') for t in (getattr(s, 'tracked_tags', []) or [])]
             tags_norm = sorted({t.lower() for t in raw_tags if t})
             filter_tags = list(dict.fromkeys([rt for rt in raw_tags if rt] + [rt.lower() for rt in raw_tags if rt]))
-            if not filter_tags or not eff:
+            # Allow contexts without filter_tags - if empty, any note from author will count
+            if not eff:
                 continue
             contexts.append({
                 'user_id': uid, 

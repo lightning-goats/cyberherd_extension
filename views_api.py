@@ -1976,7 +1976,9 @@ async def api_post_member(
     user_id = wallet_info.wallet.user
     settings = await crud.get_settings(user_id)
     tracked_note_ids = set(getattr(settings, "tracked_event_ids", []) or [])
-    if tracked_event_id and tracked_event_id not in tracked_note_ids:
+    # If tracked_note_ids is empty, accept any note (no specific tags configured)
+    # Otherwise, validate that the tracked_event_id is in the list
+    if tracked_note_ids and tracked_event_id and tracked_event_id not in tracked_note_ids:
         preview = tracked_event_id[:16] + "..." if len(tracked_event_id) > 16 else tracked_event_id
         logger.warning(
             "Cyberherd POST /members rejected: note %s not in tracked_event_ids (count=%d) user=%s",

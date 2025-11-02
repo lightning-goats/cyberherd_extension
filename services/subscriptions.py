@@ -350,9 +350,11 @@ def _event_matches_tracked_tags(event: dict, tags_norm: list[str]) -> bool:
     
     Returns:
         True if event contains any tracked tag, False otherwise
+        True if tags_norm is empty (no specific tags configured - accept all events)
     """
+    # If no tags are configured, accept all events from the author
     if not tags_norm:
-        return False
+        return True
     
     # Check explicit 't' tags
     ev_tags = []

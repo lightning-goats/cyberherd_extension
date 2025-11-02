@@ -2664,8 +2664,7 @@ async def _get_detected_cyberherd_notes_for_settings(settings, since_days_ago: i
     original_tags = [t.lstrip("#") for t in (settings.tracked_tags or []) if t]
     # Normalized lowercase list for internal matching
     tags_lower = [t.lower() for t in original_tags]
-    if not original_tags:
-        return []
+    # Allow empty tags - if not set, any note from author will count
     # Build expanded filter list (original order preserved; then lowercase variants)
     filter_tags: list[str] = []
     seen: set[str] = set()
@@ -2780,15 +2779,20 @@ async def _get_detected_cyberherd_notes_for_settings(settings, since_days_ago: i
             content_l = (ev.get("content") or "").lower()
             tag_values = extract_t_tags_from_event(ev)
             
-            # Match if: (1) any tag appears in t-tags, OR (2) any tag appears as #tag in content
-            has_t_tag = bool(set(tags_lower) & tag_values)
-            has_content_hashtag = any(f"#{t}" in content_l for t in tags_lower)
-            
-            if not (has_t_tag or has_content_hashtag):
-                if len(debug_reasons) < 5:
-                    ev_id_short = (ev.get('id') or '')[:16]
-                    debug_reasons.append(f"skip:tag_miss id={ev_id_short}... t-tags={list(tag_values)[:3]} content_match={has_content_hashtag}")
-                continue
+            # If no tags configured, accept all notes from author
+            # Otherwise, match if: (1) any tag appears in t-tags, OR (2) any tag appears as #tag in content
+            if not tags_lower:
+                # No tags set - accept any note from author
+                pass
+            else:
+                has_t_tag = bool(set(tags_lower) & tag_values)
+                has_content_hashtag = any(f"#{t}" in content_l for t in tags_lower)
+                
+                if not (has_t_tag or has_content_hashtag):
+                    if len(debug_reasons) < 5:
+                        ev_id_short = (ev.get('id') or '')[:16]
+                        debug_reasons.append(f"skip:tag_miss id={ev_id_short}... t-tags={list(tag_values)[:3]} content_match={has_content_hashtag}")
+                    continue
             
             # Author verification
             if ev.get("pubkey") != eff_pub:

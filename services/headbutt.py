@@ -525,8 +525,7 @@ class EnhancedHeadbuttService:
 
             s = await self.db.get_settings(self.user_id)
             tags = [t.lstrip("#").lower() for t in (s.tracked_tags or [])]
-            if not tags:
-                return []
+            # Allow empty tags - if not set, any note from author will count
 
             eff_pub = _get_effective_pubkey(s)
             if not eff_pub:
@@ -562,11 +561,18 @@ class EnhancedHeadbuttService:
                     ca = 0
                 if not (since <= ca < until):
                     continue
-                tag_values = extract_t_tags_from_event(ev)
-                # Strict match: require explicit 't' tag equality only to avoid false positives
-                if set(tags) & tag_values:
+                # If tags are empty, accept all notes from the author
+                # Otherwise, require tag match
+                if not tags:
+                    # No tags set - accept any note from author
                     if isinstance(ev.get("id"), str):
                         matched.append((ev["id"], ca))
+                else:
+                    tag_values = extract_t_tags_from_event(ev)
+                    # Strict match: require explicit 't' tag equality only to avoid false positives
+                    if set(tags) & tag_values:
+                        if isinstance(ev.get("id"), str):
+                            matched.append((ev["id"], ca))
 
             # Newest first, limit to 10
             matched.sort(key=lambda x: x[1], reverse=True)
@@ -870,13 +876,15 @@ class EnhancedHeadbuttService:
             }
             tracked_event_ids.discard(None)
 
+            # If tracked_event_ids is empty, it means no specific tags are set
+            # In this case, any note from the author will count for admission
             if not tracked_event_ids:
                 logger.info(
-                    "AdmissionGuard tracking_required: no tracked notes configured — denying admission"
+                    "AdmissionGuard: no tracked notes configured — accepting any note from author"
                 )
-                return None
-
-            if not attacker_note_id_norm or attacker_note_id_norm not in tracked_event_ids:
+                # Allow admission without specific note validation
+                # The note_id check below will be skipped
+            elif not attacker_note_id_norm or attacker_note_id_norm not in tracked_event_ids:
                 logger.info(
                     f"AdmissionGuard tracking_mismatch: note_not_registered "
                     f"(note_id={attacker_note_id[:16] if attacker_note_id else 'none'}, "
