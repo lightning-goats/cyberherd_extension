@@ -838,6 +838,18 @@ def start_subscriptions(app):
 
                 # Start the adapter (which creates initial subscriptions)
                 await _authoritative_tag_subscription(app)
+                
+                # CRITICAL FIX: Trigger subscription refresh IMMEDIATELY after adapter starts
+                # This ensures engagement subscriptions (kinds 6/7) are created with the
+                # tracked_event_ids that were just initialized above.
+                # Without this, the initial subscriptions are created WITHOUT engagement filters,
+                # and won't be updated until the next manager loop cycle (60 seconds by default).
+                logger.info("🔧 DIAGNOSTIC: Triggering IMMEDIATE subscription refresh for tracked_event_ids")
+                trigger_subscription_refresh(app, reason="post_initialization")
+                
+                # Give the manager loop a moment to process the refresh
+                await asyncio.sleep(1)
+                
                 # Register a simple callback with nostr_adapter so it can notify
                 # this module when it considers updating filters. The callback
                 # will trigger a subscription refresh which the adapter already
@@ -888,21 +900,6 @@ def start_subscriptions(app):
                 except Exception:
                     pass
                 logger.info("Cyberherd nostr adapter started")
-                
-                # CRITICAL: Wait a moment for initial subscriptions to be created,
-                # then trigger a refresh so engagement subscriptions (kinds 6/7) are updated
-                # are created now that tracked_event_ids has been populated
-                await asyncio.sleep(2)
-                logger.info("Cyberherd: Triggering subscription refresh after tracked_event_ids initialization")
-                
-                # Trigger subscription refresh by touching the _update_config_flag in app.state
-                # The manager loop checks this flag and recreates subscriptions when it's set
-                try:
-                    st = getattr(app, "state", app)
-                    setattr(st, "cyberherd_force_subscription_refresh", True)
-                    set_refresh_event()
-                except Exception as e:
-                    logger.warning(f"Could not set subscription refresh flag: {e}")
                 
                 # Start background monitor to watch for tracked_event_ids added later
                 try:

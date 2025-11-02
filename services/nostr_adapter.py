@@ -1301,16 +1301,21 @@ async def _load_contexts():
 async def start_adapter(app):
     global _adapter_started
     if _adapter_started:
+        logger.info("🔧 DIAGNOSTIC: Adapter already started, skipping")
         return
     _adapter_started = True
+    
+    logger.info("🔧 DIAGNOSTIC: Starting Cyberherd nostr adapter...")
 
     # Check if polling fallback is enabled (default: enabled)
     use_polling_fallback = parse_bool_env("CYBERHERD_POLLING_FALLBACK", True)
 
     # Try subscription-based approach first
     try:
+        logger.info("🔧 DIAGNOSTIC: Creating manager_loop and event_pump tasks...")
         asyncio.create_task(_manager_loop(app))
         asyncio.create_task(_event_pump(app))
+        logger.info("🔧 DIAGNOSTIC: Tasks created successfully")
     except Exception as e:
         logger.warning(f"Cyberherd: Subscription system failed, falling back to polling: {e}")
 
@@ -1377,9 +1382,16 @@ async def _manager_loop(app):
 
     # No need for module-level _refresh_event anymore; use shared event from subscriptions
     refresh_event = get_refresh_event()  # Get the shared event
+    
+    # DIAGNOSTIC: Log manager loop start
+    logger.info("🔧 DIAGNOSTIC: Subscription manager loop starting")
+    loop_count = 0
 
     while True:
         try:
+            loop_count += 1
+            logger.info(f"🔧 DIAGNOSTIC: Manager loop iteration #{loop_count} starting")
+            
             # Allow external callback to run at the start of each manager cycle.
             try:
                 if _filter_update_callback is not None:
@@ -1412,6 +1424,20 @@ async def _manager_loop(app):
                 pass
             
             contexts = await _load_contexts()
+            logger.info(
+                f"🔧 DIAGNOSTIC: Loaded {len(contexts)} user context(s). "
+                f"Users: {[ctx.get('user_id') for ctx in contexts]}"
+            )
+            
+            # Log settings for each context
+            for ctx in contexts:
+                logger.info(
+                    f"🔧 DIAGNOSTIC: User {ctx['user_id']}: "
+                    f"repost_enabled={ctx.get('repost_tracking_enabled')}, "
+                    f"likes_enabled={ctx.get('likes_tracking_enabled')}, "
+                    f"tracked_event_ids_count={len(ctx.get('settings', {}).tracked_event_ids if hasattr(ctx.get('settings', {}), 'tracked_event_ids') else [])}"
+                )
+            
             desired_keys = {ctx['user_id'] for ctx in contexts}
             
             # Remove subscriptions for users no longer present
@@ -1427,20 +1453,44 @@ async def _manager_loop(app):
                 # Find existing sub for this user
                 existing = [(sid, meta) for sid, meta in _subscriptions.items() if meta['user_id'] == ctx['user_id']]
                 
-                # Force recreation if force_refresh is True
+                # EFFICIENCY: Check if subscription needs recreation
+                needs_recreation = False
+                reason = []
+                
                 if force_refresh and existing:
+                    needs_recreation = True
+                    reason.append("force_refresh")
+                elif existing:
+                    sid, meta = existing[0]
+                    # EFFICIENCY: Only recreate if configuration actually changed
+                    if meta.get('tags') != ctx['tags']:
+                        needs_recreation = True
+                        reason.append("tags_changed")
+                    if meta.get('eff_pub') != ctx['eff_pub']:
+                        needs_recreation = True
+                        reason.append("pubkey_changed")
+                    # Check if tracking settings changed
+                    if (meta.get('repost_tracking_enabled') != ctx.get('repost_tracking_enabled') or
+                        meta.get('likes_tracking_enabled') != ctx.get('likes_tracking_enabled')):
+                        needs_recreation = True
+                        reason.append("tracking_settings_changed")
+                
+                # Recreate if needed
+                if needs_recreation and existing:
                     sid, meta = existing[0]
                     logger.info(
-                        f"🔄 Force refresh: Recreating subscription for user={ctx['user_id']} "
-                        f"to include updated tracked_event_ids for kind 6/7 detection"
+                        f"🔄 Recreating subscription for user={ctx['user_id']}: {', '.join(reason)}"
                     )
-                    _dbg("Force refresh: Recreating subscription for user=%s", ctx['user_id'])
+                    _dbg("Recreating subscription for user=%s reason=%s", ctx['user_id'], reason)
                     nostr_helpers.close_subscription(sid)
                     del _subscriptions[sid]
                     existing = []
                 
                 if not existing:
                     # Create new subscription
+                    logger.debug(f"Creating NEW subscription for user {ctx['user_id']}")
+
+                    
                     sub_id = secrets.token_hex(6)
                     base_since = _local_midnight_timestamp()
                     st = getattr(app, 'state', app)
@@ -1541,6 +1591,12 @@ async def _manager_loop(app):
                         _dbg("DIAG add_sub user=%s sub=%s filter=%s", ctx['user_id'], sub_id, filters)
                     
                     _dbg("Add sub user=%s pubkey=%s tags=%s since=%s filters=%s", ctx['user_id'], ctx['eff_pub'], ctx['tags'], since, len(filters))
+                    
+                    # DIAGNOSTIC: Log the complete filter set including engagement filters
+                    logger.info(
+                        f"🔧 DIAGNOSTIC: Creating subscription {sub_id} for user {ctx['user_id']} with {len(filters)} filters. "
+                        f"Filter details: {json.dumps(filters, indent=2)}"
+                    )
                     
                     # Add subscription via nostr_helpers
                     if not nostr_helpers.add_subscription(sub_id, filters):
@@ -1692,10 +1748,46 @@ async def _manager_loop(app):
             await asyncio.sleep(refresh_seconds)
 
 async def _event_pump(app):
+    """Process events from message pool with batching, caching, and backoff.
+    
+    EFFICIENCY IMPROVEMENTS:
+    - Settings caching to avoid repeated DB queries
+    - Batch processing of multiple events
+    - Adaptive sleep/backoff when pool is empty
+    - Deduplication to prevent reprocessing
+    """
     overlap_seconds = int(os.getenv("CYBERHERD_SINCE_OVERLAP_SECONDS", "300") or 300)
     # Default to strict 't' tag matching only; no hashtag content fallback unless explicitly enabled
     content_fallback = os.getenv("CYBERHERD_CONTENT_FALLBACK", "false").lower() in ("1","true","yes","y")
     initial_limit = int(os.getenv("CYBERHERD_INITIAL_LIMIT", "500") or 500)
+    
+    # EFFICIENCY: Configurable batch size and backoff
+    batch_size = parse_int_env("CYBERHERD_EVENT_BATCH_SIZE", 10)
+    batch_timeout = parse_int_env("CYBERHERD_BATCH_TIMEOUT_MS", 50) / 1000.0  # Max time to wait for full batch
+    empty_pool_sleep = parse_int_env("CYBERHERD_EMPTY_POOL_SLEEP_MS", 100) / 1000.0  # Convert ms to seconds
+    max_backoff = parse_int_env("CYBERHERD_MAX_BACKOFF_MS", 5000) / 1000.0  # Convert ms to seconds
+    
+    # ROBUSTNESS: Track metrics
+    metrics = {
+        'events_processed': 0,
+        'events_forwarded': 0,
+        'events_deduplicated': 0,
+        'errors': 0,
+        'cache_hits': 0,
+        'cache_misses': 0
+    }
+    
+    # EFFICIENCY: Settings cache (user_id -> (settings, timestamp))
+    settings_cache = {}
+    cache_ttl = parse_int_env("CYBERHERD_SETTINGS_CACHE_TTL", 60)  # Cache for 60 seconds
+    
+    # ROBUSTNESS: Event deduplication (recent event IDs)
+    from collections import deque
+    recent_events = deque(maxlen=1000)  # Keep last 1000 event IDs
+    
+    # ROBUSTNESS: Backoff state
+    current_backoff = empty_pool_sleep
+    consecutive_empty_polls = 0
 
     # Check nostrclient availability via nostr_helpers
     if not nostr_helpers.check_availability():
@@ -1709,113 +1801,210 @@ async def _event_pump(app):
         return
 
     cache = _get_cache(app)
+    
+    # DIAGNOSTIC: Log that event pump is running
+    logger.info("🔧 DIAGNOSTIC: Event pump started with batching (size={}, timeout={}ms) and caching (ttl={}s)".format(
+        batch_size, int(batch_timeout * 1000), cache_ttl))
+    poll_count = 0
+    
+    def get_cached_settings(user_id: str):
+        """Get settings from cache or fetch from DB."""
+        now = utc_now().timestamp()
+        if user_id in settings_cache:
+            settings, cached_at = settings_cache[user_id]
+            if now - cached_at < cache_ttl:
+                metrics['cache_hits'] += 1
+                return settings
+        
+        # Cache miss - will be fetched in event processing
+        metrics['cache_misses'] += 1
+        return None
 
     while True:
         try:
-            # Process events via nostr_helpers poller
-            while poller.has_events():
+            poll_count += 1
+            
+            # EFFICIENCY: Batch collection - collect multiple events at once
+            # But don't wait too long for a full batch (use timeout)
+            events_batch = []
+            batch_count = 0
+            batch_start = utc_now().timestamp()
+            
+            # Collect events until: batch full, no more events, or timeout reached
+            while batch_count < batch_size:
+                if not poller.has_events():
+                    # If we have at least one event and timeout not reached, briefly wait for more
+                    if batch_count > 0 and (utc_now().timestamp() - batch_start) < batch_timeout:
+                        await asyncio.sleep(0.001)  # 1ms micro-sleep to allow more events to arrive
+                        continue
+                    else:
+                        break  # No events or timeout reached
+                
                 ev_msg = poller.get_event()
                 if not ev_msg:
                     continue
-                    
+                
                 sub_id = getattr(ev_msg, 'subscription_id', None)
-                # Ensure sub_id is a string before using as dict key
                 sub_key: Optional[str] = sub_id if isinstance(sub_id, str) else None
+                
                 if sub_key is None:
                     poller.put_event_back(ev_msg)
                     continue
+                
                 meta = _subscriptions.get(sub_key)
                 if not meta:
-                    # Put back events for other subscriptions
+                    # REDUCED VERBOSITY: Only log on first occurrence
+                    if poll_count % 100 == 1:
+                        logger.debug(f"⚠️ Event subscription_id '{sub_key}' not in subscriptions")
                     poller.put_event_back(ev_msg)
                     continue
-                    
+                
                 try:
                     ev = json.loads(getattr(ev_msg, 'event', '{}'))
-                except Exception:
+                    ev_id = ev.get('id')
+                    
+                    # ROBUSTNESS: Deduplication - skip recently processed events
+                    if ev_id and ev_id in recent_events:
+                        metrics['events_deduplicated'] += 1
+                        continue
+                    
+                    if ev_id:
+                        recent_events.append(ev_id)
+                    
+                    events_batch.append((ev_msg, ev, meta))
+                    batch_count += 1
+                    
+                except Exception as e:
+                    logger.debug(f"Failed to parse event: {e}")
                     continue
-                    
-                # Determine user and settings up-front
-                user_id = meta.get('user_id')
-                try:
-                    from .. import crud as _crud
-                    # Only fetch settings when user_id looks valid
-                    settings = await _crud.get_settings(user_id) if isinstance(user_id, str) else None
-                except Exception:
-                    settings = None
-                    
-                # Forward reposts/reactions (kinds 6 and 7) into the per-user processor
-                try:
-                    kind = int(ev.get('kind') or 0)
-                except Exception:
-                    kind = 0
-
-                # Only forward reposts (6) and reactions (7). Zap receipts (9735)
-                # are handled via the invoice listener path and should not be forwarded
-                if kind in (6, 7):
+            
+            # EFFICIENCY: If we collected events, process them
+            if events_batch:
+                consecutive_empty_polls = 0
+                current_backoff = empty_pool_sleep  # Reset backoff
+                
+                # DIAGNOSTIC: Log batch processing (reduced verbosity)
+                if len(events_batch) > 1:
+                    logger.debug(f"Processing batch of {len(events_batch)} events")
+                
+                # Process the batch
+                for ev_msg, ev, meta in events_batch:
                     try:
-                        from .subscriptions import process_event_for_user
-                        # let existing processor handle validation; it will check settings flags
-                        # Only call the processor when user_id is a valid string
-                        if isinstance(user_id, str) and settings:
-                            eid = ev.get('id')
-                            # Log settings state for debugging
-                            repost_enabled = getattr(settings, 'repost_tracking_enabled', False) if settings else False
-                            likes_enabled = getattr(settings, 'likes_tracking_enabled', False) if settings else False
-                            logger.info(
-                                f"🎯 Forwarding kind {kind} event to processor for user {user_id}: "
-                                f"event_id={eid[:16] if isinstance(eid, str) else eid}... "
-                                f"repost_enabled={repost_enabled} likes_enabled={likes_enabled} "
-                                f"(realtime detection active)"
-                            )
-                            await process_event_for_user(user_id, ev, settings, app)
-                            logger.debug(f"✅ Successfully processed kind {kind} event {eid} for user {user_id}")
-                        elif not isinstance(user_id, str):
-                            logger.warning(f"⚠️ Skipping kind {kind} event: invalid user_id type={type(user_id)}")
-                        elif not settings:
-                            logger.warning(f"⚠️ Skipping kind {kind} event for user {user_id}: settings not loaded")
+                        metrics['events_processed'] += 1
+                        
+                        user_id = meta.get('user_id')
+                        
+                        # EFFICIENCY: Try cache first
+                        settings = get_cached_settings(user_id) if isinstance(user_id, str) else None
+                        
+                        # If not in cache, fetch from DB
+                        if settings is None and isinstance(user_id, str):
+                            try:
+                                from .. import crud as _crud
+                                settings = await _crud.get_settings(user_id)
+                                if settings:
+                                    # Update cache
+                                    settings_cache[user_id] = (settings, utc_now().timestamp())
+                            except Exception:
+                                settings = None
+                        
+                        # Forward reposts/reactions (kinds 6 and 7) into the per-user processor
+                        try:
+                            kind = int(ev.get('kind') or 0)
+                        except Exception:
+                            kind = 0
+
+                        # Only forward reposts (6) and reactions (7). Zap receipts (9735)
+                        # are handled via the invoice listener path and should not be forwarded
+                        if kind in (6, 7):
+                            metrics['events_forwarded'] += 1
+                            try:
+                                from .subscriptions import process_event_for_user
+                                # let existing processor handle validation; it will check settings flags
+                                # Only call the processor when user_id is a valid string
+                                if isinstance(user_id, str) and settings:
+                                    eid = ev.get('id')
+                                    # REDUCED VERBOSITY: Only log engagement events in debug mode
+                                    logger.debug(
+                                        f"Forwarding kind {kind} event {eid[:16] if isinstance(eid, str) else eid}... "
+                                        f"for user {user_id}"
+                                    )
+                                    await process_event_for_user(user_id, ev, settings, app)
+                                elif not isinstance(user_id, str):
+                                    logger.warning(f"⚠️ Skipping kind {kind} event: invalid user_id type={type(user_id)}")
+                                elif not settings:
+                                    logger.debug(f"Skipping kind {kind} event for user {user_id}: settings not loaded")
+                            except Exception as e:
+                                logger.error(f"❌ Error forwarding kind {kind} event to processor for user {user_id}: {e}")
+                                metrics['errors'] += 1
+                            # continue processing (do not early-continue) so last_seen and status updates still run
+                        
+                        if CYBERHERD_DIAG:
+                            _diag_counts['events_total'] += 1
+                            
+                        tags = meta['tags']  # normalized lowercase tags
+                        eff_pub = meta['eff_pub']
+                        eid = ev.get('id')
+                        created_at = 0
+                        try:
+                            created_at = int(ev.get('created_at') or 0)
+                        except Exception:
+                            pass
+                            
+                        _dbg("Event recv user=%s id=%s created_at=%s", user_id, (eid[:12] + '…') if isinstance(eid, str) else eid, created_at)
+                        
+                        # For kind 1 notes and kind 30311 (long-form content), delegate matching logic to _append_today
+                        # which supports t-tags and content-hashtag fallback. Always call it instead of gating on
+                        # explicit 't' tags here.
+                        event_kind = int(ev.get('kind') or 0)
+                        if event_kind in (1, 30311):
+                            try:
+                                if await _append_today(cache, user_id, eff_pub, tags, ev, app):
+                                    meta['appended'] += 1
+                                    if CYBERHERD_DIAG:
+                                        _diag_counts['events_matched'] += 1
+                                    _dbg("Appended to cache user=%s kind=%s total_appended=%s", user_id, event_kind, meta['appended'])
+                            except Exception:
+                                pass
+                        
+                        if created_at:
+                            ukey = str(user_id) if user_id is not None else 'None'
+                            prev = _last_seen.get(ukey)
+                            if prev is None or created_at > prev:
+                                _last_seen[ukey] = created_at
+                                
+                        # Status update (batched minimal)
+                        if meta['appended'] % 10 == 1:
+                            _update_status(app, '', meta)  # sub_key not available in this scope
+                        
                     except Exception as e:
-                        logger.error(f"❌ Error forwarding kind {kind} event to processor for user {user_id}: {e}", exc_info=True)
-                    # continue processing (do not early-continue) so last_seen and status updates still run
-                    
-                if CYBERHERD_DIAG:
-                    _diag_counts['events_total'] += 1
-                    
-                tags = meta['tags']  # normalized lowercase tags
-                user_id = meta['user_id']
-                eff_pub = meta['eff_pub']
-                eid = ev.get('id')
-                created_at = 0
+                        logger.debug(f"Error processing event in batch: {e}")
+                        metrics['errors'] += 1
+                        continue
+            
+            # EFFICIENCY: Adaptive backoff when pool is empty
+            else:
+                consecutive_empty_polls += 1
+                if consecutive_empty_polls > 5:
+                    # Exponential backoff up to max_backoff
+                    current_backoff = min(current_backoff * 1.5, max_backoff)
+                
+                await asyncio.sleep(current_backoff)
+            
+            # ROBUSTNESS: Log metrics periodically
+            if poll_count % 1000 == 0:
+                logger.info(
+                    f"📊 Event pump metrics: processed={metrics['events_processed']}, "
+                    f"forwarded={metrics['events_forwarded']}, deduplicated={metrics['events_deduplicated']}, "
+                    f"errors={metrics['errors']}, cache_hits={metrics['cache_hits']}, "
+                    f"cache_misses={metrics['cache_misses']}, backoff={current_backoff:.3f}s"
+                )
+                # Update app metrics
                 try:
-                    created_at = int(ev.get('created_at') or 0)
+                    st = getattr(app, 'state', app)
+                    setattr(st, 'cyberherd_event_pump_metrics', dict(metrics))
                 except Exception:
                     pass
-                    
-                _dbg("Event recv user=%s id=%s created_at=%s", user_id, (eid[:12] + '…') if isinstance(eid, str) else eid, created_at)
-                
-                # For kind 1 notes and kind 30311 (long-form content), delegate matching logic to _append_today
-                # which supports t-tags and content-hashtag fallback. Always call it instead of gating on
-                # explicit 't' tags here.
-                event_kind = int(ev.get('kind') or 0)
-                if event_kind in (1, 30311):
-                    try:
-                        if await _append_today(cache, user_id, eff_pub, tags, ev, app):
-                            meta['appended'] += 1
-                            if CYBERHERD_DIAG:
-                                _diag_counts['events_matched'] += 1
-                            _dbg("Appended to cache user=%s kind=%s total_appended=%s", user_id, event_kind, meta['appended'])
-                    except Exception:
-                        pass
-                        
-                if created_at:
-                    ukey = str(user_id) if user_id is not None else 'None'
-                    prev = _last_seen.get(ukey)
-                    if prev is None or created_at > prev:
-                        _last_seen[ukey] = created_at
-                        
-                # Status update (batched minimal)
-                if meta['appended'] % 10 == 1:
-                    _update_status(app, sub_key, meta)
                     
             # Process EOSE notices via nostr_helpers poller
             while poller.has_eose_notices():
@@ -1895,6 +2084,9 @@ async def _event_pump(app):
             
         except Exception as e:
             _dbg("event pump error %s", e)
+            logger.error(f"Event pump error: {e}", exc_info=True)
+            metrics['errors'] += 1
+            # ROBUSTNESS: Don't crash on errors, just sleep and continue
             await asyncio.sleep(1)
 
 
