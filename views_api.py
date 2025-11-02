@@ -1976,20 +1976,39 @@ async def api_post_member(
     user_id = wallet_info.wallet.user
     settings = await crud.get_settings(user_id)
     tracked_note_ids = set(getattr(settings, "tracked_event_ids", []) or [])
-    # If tracked_note_ids is empty, accept any note (no specific tags configured)
-    # Otherwise, validate that the tracked_event_id is in the list
-    if tracked_note_ids and tracked_event_id and tracked_event_id not in tracked_note_ids:
-        preview = tracked_event_id[:16] + "..." if len(tracked_event_id) > 16 else tracked_event_id
-        logger.warning(
-            "Cyberherd POST /members rejected: note %s not in tracked_event_ids (count=%d) user=%s",
-            preview,
-            len(tracked_note_ids),
-            user_id,
-        )
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST,
-            detail="tracked note id is not registered for this user",
-        )
+    
+    # Check if tracked_tags are configured
+    tracked_tags = getattr(settings, "tracked_tags", []) or []
+    has_tracked_tags = bool([t for t in tracked_tags if t and t.strip()])
+    
+    # If tracked_tags are NOT set AND no tracked_event_ids exist, accept any note
+    # If tracked_tags ARE set (even if no notes detected yet), require validation
+    if has_tracked_tags or tracked_note_ids:
+        # Tags or specific notes are configured - validate the tracked_event_id
+        if tracked_event_id and tracked_event_id not in tracked_note_ids:
+            # If tags are set but no notes detected yet, reject
+            if has_tracked_tags and not tracked_note_ids:
+                logger.warning(
+                    "Cyberherd POST /members rejected: tracked tags configured but no notes detected yet user=%s",
+                    user_id,
+                )
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    detail="tracked tags configured but no notes detected yet",
+                )
+            # If notes exist, validate that this event is in the list
+            preview = tracked_event_id[:16] + "..." if len(tracked_event_id) > 16 else tracked_event_id
+            logger.warning(
+                "Cyberherd POST /members rejected: note %s not in tracked_event_ids (count=%d) user=%s",
+                preview,
+                len(tracked_note_ids),
+                user_id,
+            )
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail="tracked note id is not registered for this user",
+            )
+    # else: No tracked_tags and no tracked_note_ids - accept any note
 
     # Enrich metadata best-effort
     display_name = "Anon"

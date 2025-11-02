@@ -876,14 +876,25 @@ class EnhancedHeadbuttService:
             }
             tracked_event_ids.discard(None)
 
-            # If tracked_event_ids is empty, it means no specific tags are set
-            # In this case, any note from the author will count for admission
-            if not tracked_event_ids:
+            # Check if tracked_tags are configured
+            tracked_tags = getattr(settings_for_tracking, "tracked_tags", []) or []
+            has_tracked_tags = bool([t for t in tracked_tags if t and t.strip()])
+
+            # If tracked_tags are NOT set AND no tracked_event_ids exist, accept any note
+            # If tracked_tags ARE set (even if no notes detected yet), require validation
+            if not has_tracked_tags and not tracked_event_ids:
                 logger.info(
-                    "AdmissionGuard: no tracked notes configured — accepting any note from author"
+                    "AdmissionGuard: no tracked tags or notes configured — accepting any note from author"
                 )
                 # Allow admission without specific note validation
                 # The note_id check below will be skipped
+            elif not tracked_event_ids:
+                # Tracked tags are set but no notes detected yet - deny until notes exist
+                logger.info(
+                    f"AdmissionGuard: tracked tags configured but no notes detected yet — denying admission "
+                    f"(tracked_tags={len(tracked_tags)}, pubkey={attacker.pubkey[:16]}...)"
+                )
+                return None
             elif not attacker_note_id_norm or attacker_note_id_norm not in tracked_event_ids:
                 logger.info(
                     f"AdmissionGuard tracking_mismatch: note_not_registered "
