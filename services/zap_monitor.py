@@ -573,6 +573,9 @@ class ZapMonitorService:
             # Existing members can zap ANY Lightning Goats note to increase their amount
             # New members must zap today's #CyberHerd tagged note
             is_existing_member = False
+            subscriptions_ready = True  # Default assumption; will be checked for new members
+            is_tracked = False  # Will be set for new members
+            
             try:
                 existing_member = await crud.get_cyberherd_member_by_pubkey(zapper_pubkey, user_id=self.user_id)
                 is_existing_member = bool(existing_member and existing_member.get('is_active'))
