@@ -47,7 +47,8 @@ window.app = Vue.createApp({
           { name: 'kinds', label: 'Kinds', field: row => (row.kinds ? (Array.isArray(row.kinds) ? row.kinds.join(',') : String(row.kinds)) : '-') },
           { name: 'percent', label: 'Share', field: row => (typeof row.splits_percent !== 'undefined' && row.splits_percent !== null ? (row.splits_percent + '%') : '-') },
           { name: 'amount', label: 'Amount', field: row => (row.is_active ? ((typeof row.amount !== 'undefined' && row.amount !== null) ? (row.amount + ' sats') : '0 sats') : '-') },
-          { name: 'is_active', label: 'Active', field: row => (row.is_active ? 'Yes' : 'No') }
+          { name: 'is_active', label: 'Active', field: row => (row.is_active ? 'Yes' : 'No') },
+          { name: 'banned', label: 'Banned', field: row => (row.banned ? 'Yes' : 'No') }
         ],
         ui: {
           showMemberDialog: false,
@@ -442,6 +443,24 @@ window.app = Vue.createApp({
   await this._cyberherdFetch('POST', '/api/v1/members/' + encodeURIComponent(pubkey) + '/deactivate', this.getAuthKey() || null)
         await this.refreshMembers()
         this.$q.notify({ type: 'positive', message: 'Member deactivated' })
+      } catch (e) {
+        LNbits.utils.notifyApiError(e)
+      }
+    },
+    async banMember(pubkey) {
+      try {
+        await this._cyberherdFetch('POST', '/api/v1/members/' + encodeURIComponent(pubkey) + '/ban', this.getAuthKey() || null)
+        await this.refreshMembers()
+        this.$q.notify({ type: 'positive', message: 'Member banned' })
+      } catch (e) {
+        LNbits.utils.notifyApiError(e)
+      }
+    },
+    async unbanMember(pubkey) {
+      try {
+        await this._cyberherdFetch('POST', '/api/v1/members/' + encodeURIComponent(pubkey) + '/unban', this.getAuthKey() || null)
+        await this.refreshMembers()
+        this.$q.notify({ type: 'positive', message: 'Member unbanned' })
       } catch (e) {
         LNbits.utils.notifyApiError(e)
       }

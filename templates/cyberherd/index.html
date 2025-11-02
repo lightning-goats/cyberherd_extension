@@ -110,6 +110,7 @@
               <q-td auto-width>
                 <q-btn flat dense size="xs" icon="edit" color="primary" @click="openEditDialog(props.row.pubkey)"></q-btn>
                 <q-btn flat dense size="xs" :icon="props.row.is_active ? 'toggle_on' : 'toggle_off'" :color="props.row.is_active ? 'green' : 'grey'" @click="props.row.is_active ? deactivateMember(props.row.pubkey) : activateMember(props.row.pubkey)"></q-btn>
+                <q-btn flat dense size="xs" :icon="props.row.banned ? 'block' : 'check_circle'" :color="props.row.banned ? 'orange' : 'grey'" @click="props.row.banned ? unbanMember(props.row.pubkey) : banMember(props.row.pubkey)" :title="props.row.banned ? 'Unban member' : 'Ban member'"></q-btn>
                 <q-btn flat dense size="xs" icon="delete" color="red" @click="removeMember(props.row.pubkey)"></q-btn>
               </q-td>
             </q-tr>

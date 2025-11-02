@@ -1191,6 +1191,102 @@ async def deactivate_all_cyberherd_members(user_id: str | None = None):
     
     return member_count
 
+async def is_pubkey_banned(pubkey: str, user_id: str | None = None) -> bool:
+    """Check if a pubkey is banned for a specific user.
+    
+    Args:
+        pubkey: The pubkey to check (will be normalized to lowercase)
+        user_id: User ID to filter by. If None, returns False.
+        
+    Returns:
+        bool: True if the pubkey is banned, False otherwise.
+    """
+    if not user_id or not pubkey:
+        return False
+    
+    normalized_pubkey = str(pubkey).strip().lower()
+    
+    try:
+        result = await db.fetchone(
+            f"""
+            SELECT banned FROM {db.references_schema}cyber_herd
+            WHERE pubkey = :pubkey AND user_id = :user_id
+            """,
+            {"pubkey": normalized_pubkey, "user_id": user_id}
+        )
+        
+        if result:
+            return bool(result.get("banned", 0))
+        return False
+    except Exception as e:
+        logger.warning(f"Error checking if pubkey {normalized_pubkey[:16]}... is banned: {e}")
+        return False
+
+
+async def set_member_ban_status(pubkey: str, banned: bool, user_id: str | None = None) -> bool:
+    """Ban or unban a cyberherd member by pubkey.
+    
+    When banning a member, also deactivates them from the herd.
+    
+    Args:
+        pubkey: The pubkey to ban/unban (will be normalized to lowercase)
+        banned: True to ban, False to unban
+        user_id: User ID to filter by. Required for multi-user support.
+        
+    Returns:
+        bool: True if successful, False otherwise.
+    """
+    if not user_id or not pubkey:
+        logger.error("set_member_ban_status called without user_id or pubkey")
+        return False
+    
+    normalized_pubkey = str(pubkey).strip().lower()
+    banned_value = 1 if banned else 0
+    
+    try:
+        # If banning, also deactivate the member
+        if banned:
+            await db.execute(
+                f"""
+                UPDATE {db.references_schema}cyber_herd
+                SET banned = :banned, is_active = 0
+                WHERE pubkey = :pubkey AND user_id = :user_id
+                """,
+                {"banned": banned_value, "pubkey": normalized_pubkey, "user_id": user_id}
+            )
+            logger.info(f"Banned and deactivated member {normalized_pubkey[:16]}... for user {user_id}")
+        else:
+            await db.execute(
+                f"""
+                UPDATE {db.references_schema}cyber_herd
+                SET banned = :banned
+                WHERE pubkey = :pubkey AND user_id = :user_id
+                """,
+                {"banned": banned_value, "pubkey": normalized_pubkey, "user_id": user_id}
+            )
+            logger.info(f"Unbanned member {normalized_pubkey[:16]}... for user {user_id}")
+        
+        # Recompute payouts and splits after ban status change
+        try:
+            await recompute_member_payouts(user_id)
+        except Exception as exc:
+            logger.debug(f"cyberherd: recompute after ban status change failed: {exc}")
+        
+        try:
+            from .services.splits import schedule_split_recompute
+            s = await get_settings(user_id)
+            sw = getattr(s, "source_wallet", None)
+            if sw:
+                await schedule_split_recompute(str(sw), user_id=user_id)
+        except Exception as e:
+            logger.warning(f"Failed to schedule split recompute after ban status change: {e}")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error setting ban status for pubkey {normalized_pubkey[:16]}...: {e}")
+        return False
+
+
 async def add_new_active_member(member_data: dict, user_id: str | None = None):
     """Add or update a cyberherd member for a specific user.
     

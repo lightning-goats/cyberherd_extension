@@ -685,6 +685,18 @@ class EnhancedHeadbuttService:
             except Exception as e:
                 logger.warning(f"Could not check effective pubkey: {e}")
 
+            # Check if pubkey is banned
+            try:
+                from .. import crud
+                if await crud.is_pubkey_banned(attacker.pubkey, self.user_id):
+                    logger.info(
+                        f"AdmissionGuard: rejecting action from banned pubkey "
+                        f"pubkey={attacker.pubkey[:16]}..."
+                    )
+                    return None
+            except Exception as e:
+                logger.warning(f"Could not check if pubkey is banned: {e}")
+
             active_members = await self.db.get_active_cyberherd_members(user_id=self.user_id)
             max_members = await self._get_max_members()
 

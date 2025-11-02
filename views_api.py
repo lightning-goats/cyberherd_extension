@@ -2387,6 +2387,54 @@ async def api_deactivate_member(
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="deactivate failed")
 
 
+@cyberherd_api_router.post("/api/v1/members/{pubkey}/ban")
+async def api_ban_member(
+    request: Request,
+    pubkey: str,
+    wallet_info: WalletTypeInfo = Depends(require_admin_key),
+):
+    """Ban a cyberherd member by pubkey.
+    
+    Banned members are deactivated and cannot rejoin the herd.
+    """
+    try:
+        user_id = wallet_info.wallet.user
+        success = await crud.set_member_ban_status(pubkey, banned=True, user_id=user_id)
+        if success:
+            return {"ok": True, "banned": True}
+        else:
+            raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="ban failed")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"Cyberherd: ban member failed {pubkey[:8]}…: {e}")
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="ban failed")
+
+
+@cyberherd_api_router.post("/api/v1/members/{pubkey}/unban")
+async def api_unban_member(
+    request: Request,
+    pubkey: str,
+    wallet_info: WalletTypeInfo = Depends(require_admin_key),
+):
+    """Unban a cyberherd member by pubkey.
+    
+    Unbanned members can rejoin the herd but are not automatically reactivated.
+    """
+    try:
+        user_id = wallet_info.wallet.user
+        success = await crud.set_member_ban_status(pubkey, banned=False, user_id=user_id)
+        if success:
+            return {"ok": True, "banned": False}
+        else:
+            raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="unban failed")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"Cyberherd: unban member failed {pubkey[:8]}…: {e}")
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="unban failed")
+
+
 @cyberherd_api_router.get("/api/v1/shares")
 async def api_get_shares(request: Request, auth=Depends(auth_wallet_or_admin_dep)):
     try:

@@ -28,6 +28,7 @@ __all__ = [
     'm027_add_feeder_trigger_sats',
     'm028_sync_processed_zaps_schema',
     'm029_add_nip05_verification_toggle',
+    'm030_add_banned_column',  # Add banned column for member banning
 ]
 
 logger.info(f"CYBERHERD MIGRATIONS: Registered {len(__all__)} migrations: {__all__}")
@@ -122,7 +123,8 @@ async def m001_consolidated_schema(db: Database):
             relays TEXT,
             metadata_last_checked_at INTEGER,
             is_active INTEGER DEFAULT 0,
-            user_id TEXT
+            user_id TEXT,
+            banned INTEGER DEFAULT 0
         );
         """
     )
@@ -134,6 +136,9 @@ async def m001_consolidated_schema(db: Database):
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_active ON cyberherd.cyber_herd(user_id, is_active);"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_banned ON cyberherd.cyber_herd(user_id, banned);"
         )
     except Exception:
         pass
@@ -493,3 +498,32 @@ async def m029_add_nip05_verification_toggle(db: Database):
             logger.info("CYBERHERD m029: nip05_verification_enabled column already exists, skipping")
         else:
             logger.warning(f"CYBERHERD m029: failed to add nip05_verification_enabled column: {e}")
+
+
+async def m030_add_banned_column(db: Database):
+    """Add banned column to cyber_herd table for member banning."""
+    logger.info("CYBERHERD m030: adding banned column to cyber_herd table")
+    table_name = f"{db.references_schema}cyber_herd"
+    try:
+        await db.execute(
+            f"""
+            ALTER TABLE {table_name}
+            ADD COLUMN banned INTEGER DEFAULT 0;
+            """
+        )
+        logger.info("CYBERHERD m030: banned column added successfully")
+    except Exception as e:
+        msg = str(e).lower()
+        if any(token in msg for token in ("duplicate", "already exists", "duplicate column")):
+            logger.info("CYBERHERD m030: banned column already exists, skipping")
+        else:
+            logger.warning(f"CYBERHERD m030: failed to add banned column: {e}")
+    
+    # Add index for banned status queries
+    try:
+        await db.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_banned ON {table_name}(user_id, banned);"
+        )
+        logger.info("CYBERHERD m030: added index for banned column")
+    except Exception as e:
+        logger.info(f"CYBERHERD m030 index: {e}")
