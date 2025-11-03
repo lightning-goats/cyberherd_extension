@@ -14,7 +14,7 @@ from lnbits.core.models.payments import CreateInvoice
 from lnbits.core.services.payments import create_wallet_invoice, pay_invoice
 
 _LAST_ATTEMPT: dict[str, float] = {}
-_MIN_INTERVAL_SECONDS = 10.0
+_MIN_INTERVAL_SECONDS = 1.0
 
 
 async def _resolve_wallet(wallet_ref: Optional[str]) -> Tuple[Optional[str], Any]:

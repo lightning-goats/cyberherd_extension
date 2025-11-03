@@ -29,6 +29,7 @@ __all__ = [
     'm028_sync_processed_zaps_schema',
     'm029_add_nip05_verification_toggle',
     'm030_add_banned_column',  # Add banned column for member banning
+    'm031_add_send_splits_enabled',  # Add send_splits_enabled toggle for automatic splits
 ]
 
 logger.info(f"CYBERHERD MIGRATIONS: Registered {len(__all__)} migrations: {__all__}")
@@ -527,3 +528,22 @@ async def m030_add_banned_column(db: Database):
         logger.info("CYBERHERD m030: added index for banned column")
     except Exception as e:
         logger.info(f"CYBERHERD m030 index: {e}")
+
+
+async def m031_add_send_splits_enabled(db: Database):
+    """Add send_splits_enabled column to settings table for automatic splits trigger."""
+    logger.info("CYBERHERD m031: adding send_splits_enabled column")
+    try:
+        await db.execute(
+            """
+            ALTER TABLE cyberherd.settings 
+            ADD COLUMN send_splits_enabled INTEGER DEFAULT 0;
+            """
+        )
+        logger.info("CYBERHERD m031: send_splits_enabled column added successfully")
+    except Exception as e:
+        msg = str(e).lower()
+        if any(token in msg for token in ("duplicate", "already exists", "duplicate column")):
+            logger.info("CYBERHERD m031: send_splits_enabled column already exists, skipping")
+        else:
+            logger.warning(f"CYBERHERD m031: failed to add send_splits_enabled column: {e}")

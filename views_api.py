@@ -707,19 +707,19 @@ async def api_recover_events(request: Request, wallet_info: WalletTypeInfo = Dep
 
         # Run subscriptions (reposts/likes) recovery if subscription service available
         try:
-            from .services import subscriptions as subs
+            from .services import nostr_adapter
 
             diagnostics["reposts_reactions"]["attempted"] = True
             try:
-                # subs helper may return diagnostics; accept both None or dict
-                res = await subs._recover_missed_reposts_and_reactions_for_user(user_id, await crud.get_settings(user_id), request.app)
-                if isinstance(res, dict):
-                    diagnostics["reposts_reactions"]["processed"] = int(res.get("processed", 0))
-                    if res.get("errors"):
-                        diagnostics["reposts_reactions"]["errors"].extend(res.get("errors") or [])
+                # Use force_requery_for_user which handles all event recovery (notes + engagement)
+                res = await nostr_adapter.force_requery_for_user(request.app, user_id)
+                if isinstance(res, list):
+                    # force_requery_for_user returns list of event ids
+                    diagnostics["reposts_reactions"]["processed"] = len(res)
+                    diagnostics["messages"].append(f"Reposts/reactions recovery attempted via force_requery_for_user: {len(res)} events")
                 else:
-                    diagnostics["reposts_reactions"]["processed"] = diagnostics["reposts_reactions"].get("processed", 0)
-                diagnostics["messages"].append("Reposts/reactions recovery attempted")
+                    diagnostics["reposts_reactions"]["processed"] = 0
+                    diagnostics["messages"].append("Reposts/reactions recovery attempted via force_requery_for_user")
             except Exception as e:
                 msg = f"Failed recovering reposts/reactions for user {user_id}: {e}"
                 logger.warning(msg)
@@ -984,6 +984,7 @@ async def api_get_settings(request: Request, auth=Depends(auth_wallet_or_admin_d
         "likes_tracking_enabled": getattr(settings, "likes_tracking_enabled", False),
         "minimum_sats": getattr(settings, "minimum_sats", 10),
         "feeder_trigger_sats": getattr(settings, "feeder_trigger_sats", None),
+        "send_splits_enabled": getattr(settings, "send_splits_enabled", False),
         "websocket_url": websocket_url,
     }
 
@@ -1235,6 +1236,11 @@ async def api_put_settings(
                 status_code=HTTPStatus.BAD_REQUEST, detail="Invalid feeder_trigger_sats"
             ) from e
 
+    # Handle send_splits_enabled toggle
+    send_splits_enabled = payload.get("send_splits_enabled")
+    if send_splits_enabled is not None:
+        settings.send_splits_enabled = bool(send_splits_enabled)
+
     # Pre-compute effective pubkey before the upsert to avoid recomputation later.
     try:
         settings.computed_effective_pubkey = _get_effective_pubkey(settings)
@@ -1349,9 +1355,9 @@ async def api_put_settings(
                 await asyncio.sleep(0.2)  # Small delay after zap monitor
                 # Recover reposts and likes
                 if repost_now_enabled or likes_now_enabled:
-                    from .services import subscriptions as subs
-                    await subs._recover_missed_reposts_and_reactions_for_user(user_id, settings, request.app)
-                    logger.info("Recovered missed reposts/reactions from settings toggle enable")
+                    from .services import nostr_adapter
+                    await nostr_adapter.force_requery_for_user(request.app, user_id)
+                    logger.info("Recovered missed reposts/reactions from settings toggle enable via force_requery_for_user")
 
                 # Recover zaps if newly enabled
                 if zap_now_enabled:

@@ -63,6 +63,9 @@
             <div class="col-12 col-md-4">
               <q-toggle v-model="cyberherdData.form.nip05_verification_enabled" @update:model-value="saveToggleSettings" label="NIP-05 verification" hint="Require valid NIP-05 identifier for members"></q-toggle>
             </div>
+            <div class="col-12 col-md-4">
+              <q-toggle v-model="cyberherdData.form.send_splits_enabled" @update:model-value="saveToggleSettings" label="Auto-send splits" hint="Automatically transfer herd wallet balance when trigger amount reached"></q-toggle>
+            </div>
           </div>
 
           <div class="row items-center q-col-gutter-sm q-mt-sm">

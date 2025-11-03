@@ -543,6 +543,7 @@ def _row_to_settings(row) -> CyberherdSettings:
         minimum_sats=row.get("minimum_sats") or 10,
         nip05_verification_enabled=bool(row.get("nip05_verification_enabled", True)),
         feeder_trigger_sats=row.get("feeder_trigger_sats"),
+        send_splits_enabled=bool(row.get("send_splits_enabled", False)),
         user_id=row.get("user_id"),
     )
 
@@ -636,6 +637,10 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
         ]
         if has_feeder_col:
             update_cols.append("feeder_trigger_sats = :feeder_trigger_sats")
+        # Check for send_splits_enabled column
+        has_send_splits_col = await _column_exists("settings", "send_splits_enabled")
+        if has_send_splits_col:
+            update_cols.append("send_splits_enabled = :send_splits_enabled")
         # Only include midnight_reset_enabled if the column exists in this DB
         has_midnight_col = await _column_exists("settings", "midnight_reset_enabled")
         if has_midnight_col:
@@ -671,6 +676,9 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
         if has_feeder_col:
             feeder_value = getattr(settings, "feeder_trigger_sats", None)
             params["feeder_trigger_sats"] = int(feeder_value) if feeder_value not in (None, "") else None
+        # Only add send_splits_enabled param if column exists
+        if has_send_splits_col:
+            params["send_splits_enabled"] = int(getattr(settings, "send_splits_enabled", False))
         # Only add midnight_reset_enabled param if column exists
         if has_midnight_col:
             params["midnight_reset_enabled"] = int(getattr(settings, "midnight_reset_enabled", True))
@@ -1757,6 +1765,16 @@ async def delete_cyberherd_member_by_pubkey(pubkey: str, user_id: str | None = N
         await recompute_member_payouts(user_id)
     except Exception as exc:
         logger.debug(f"cyberherd: recompute after delete member skipped: {exc}")
+    
+    # After deletion, recompute and update split targets if a source wallet is configured
+    try:
+        from .services.splits import schedule_split_recompute
+        s = await get_settings(user_id)
+        sw = getattr(s, "source_wallet", None)
+        if sw:
+            await schedule_split_recompute(str(sw), user_id=user_id)
+    except Exception as e:
+        logger.warning(f"Failed to schedule split recompute after member deletion: {e}")
 
 
 async def update_cyberherd_member_allocation(pubkey: str, allocation_percentage: float, user_id: str | None = None):

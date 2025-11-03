@@ -13,6 +13,7 @@ window.app = Vue.createApp({
           max_members: 3,
           minimum_sats: 10,
           feeder_trigger_sats: null,
+          send_splits_enabled: false,
           tracked_tags: '#CyberHerd',
           zap_tracking_enabled: false,
           repost_tracking_enabled: false,
@@ -187,6 +188,7 @@ window.app = Vue.createApp({
           feeder_trigger_sats: (typeof data.feeder_trigger_sats !== 'undefined' && data.feeder_trigger_sats !== null)
             ? data.feeder_trigger_sats
             : null,
+          send_splits_enabled: typeof data.send_splits_enabled !== 'undefined' ? !!data.send_splits_enabled : false,
           tracked_tags: (data.tracked_tags || []).join(', '),
           zap_tracking_enabled: data.zap_tracking_enabled || false,
           midnight_reset_enabled: typeof data.midnight_reset_enabled !== 'undefined' ? !!data.midnight_reset_enabled : false,
@@ -262,6 +264,7 @@ window.app = Vue.createApp({
           max_members: Number(this.cyberherdData.form.max_members) || 3,
           minimum_sats: Number(this.cyberherdData.form.minimum_sats) || 10,
           feeder_trigger_sats: feederTriggerValue,
+          send_splits_enabled: this.cyberherdData.form.send_splits_enabled,
           tracked_tags: this.cyberherdData.form.tracked_tags.split(',').map(s => s.trim()).filter(Boolean),
           zap_tracking_enabled: this.cyberherdData.form.zap_tracking_enabled,
           repost_tracking_enabled: this.cyberherdData.form.repost_tracking_enabled,
@@ -339,6 +342,7 @@ window.app = Vue.createApp({
           // Persist midnight reset opt-in
           midnight_reset_enabled: !!this.cyberherdData.form.midnight_reset_enabled,
           nip05_verification_enabled: !!this.cyberherdData.form.nip05_verification_enabled,
+          send_splits_enabled: !!this.cyberherdData.form.send_splits_enabled,
         }
 
         const authKey = this.getAuthKey()

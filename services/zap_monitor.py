@@ -586,8 +586,6 @@ class ZapMonitorService:
             # Existing members can zap ANY Lightning Goats note to increase their amount
             # New members must zap today's #CyberHerd tagged note
             is_existing_member = False
-            subscriptions_ready = True  # Default assumption; will be checked for new members
-            is_tracked = False  # Will be set for new members
             
             try:
                 existing_member = await crud.get_cyberherd_member_by_pubkey(zapper_pubkey, user_id=self.user_id)
@@ -625,78 +623,89 @@ class ZapMonitorService:
                     )
             else:
                 # New member: enforce strict tracking requirements
-                # Check subscription readiness for registry operations (non-blocking for headbutt)
-                # Headbutt can proceed independently with its own today-notes validation
-                status = get_subscription_status(self.app)
-                subscriptions_ready = bool(status.get("connected"))
-                
-                if not subscriptions_ready:
-                    logger.info(
-                        f"ℹ️  Zap monitor: subscriptions not ready (will proceed with headbutt anyway, "
-                        f"registry updates deferred for note {target_note_id[:8]}...)"
-                    )
-                
-                # Check if target note is in today's active note list
+                # CRITICAL FIX: Only accept zaps for TODAY's tracked events
+                # Filter tracked_event_ids to only include events from today's local day
                 tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
-                today_success, today_note_ids = await self._get_today_note_ids(settings)
-                if today_success:
-                    if target_note_id not in today_note_ids:
-                        if allow_outside_today:
+                timestamps_map = getattr(settings, 'tracked_event_timestamps', {}) or {}
+                
+                # Get today's boundaries (UTC-first approach, consistent with subscriptions.py)
+                from .subscriptions import _get_today_boundaries_utc
+                boundaries = _get_today_boundaries_utc()
+                
+                # Filter to only include events from today (local day)
+                today_tracked_notes = []
+                earliest_event_ts = None
+                for note_id in tracked_notes:
+                    note_ts = timestamps_map.get(note_id)
+                    if note_ts and boundaries.is_timestamp_in_local_day(note_ts):
+                        today_tracked_notes.append(note_id)
+                        if earliest_event_ts is None or note_ts < earliest_event_ts:
+                            earliest_event_ts = note_ts
+                
+                logger.info(
+                    f"📅 Zap validation: {len(tracked_notes)} total tracked events, "
+                    f"{len(today_tracked_notes)} from today (local day). "
+                    f"Earliest today event: {earliest_event_ts}"
+                )
+                
+                # Check if target note is in TODAY's tracked events
+                is_tracked = target_note_id in today_tracked_notes
+                
+                if not is_tracked:
+                    logger.info(
+                        f"❌ Zap target {target_note_id[:8]}... is NOT in today's tracked events "
+                        f"({len(today_tracked_notes)} events from today). Ignoring zap."
+                    )
+                    self.last_error = "note_not_today"
+                    return False
+                
+                # CRITICAL FIX: Validate zap timestamp - must be after earliest event from today
+                # This prevents old zaps from previous days from counting
+                if earliest_event_ts is not None:
+                    # Get payment timestamp (try multiple field names for compatibility)
+                    payment_ts = None
+                    try:
+                        # Try common timestamp fields on payment object
+                        payment_ts_raw = getattr(payment, 'time', None) or getattr(payment, 'created_at', None)
+                        if payment_ts_raw is None:
+                            # If no timestamp field, use current time (best effort)
+                            payment_ts = int(datetime.now(timezone.utc).timestamp())
                             logger.debug(
-                                f"Zap monitor recovery: allowing zap for note {target_note_id[:8]}... "
-                                f"outside today's active note window"
+                                f"⚠️  Payment timestamp not available, using current time: {payment_ts}"
                             )
                         else:
-                            logger.info(
-                                f"Zap target {target_note_id[:8]}... is not in today's active note set. Ignoring zap."
-                            )
-                            self.last_error = "note_not_today"
-                            return False
-                else:
-                    logger.debug(
-                        "Zap monitor: unable to resolve today's note list for user %s; continuing with tracked note fallback",
-                        self.user_id,
-                    )
-
-                timestamps_map = getattr(settings, 'tracked_event_timestamps', {}) or {}
-                is_tracked = target_note_id in tracked_notes
-
-                # Opportunistically register the note if it isn't tracked yet. This can happen
-                # when invoice settlements arrive before subscriptions finish populating
-                # tracked_event_ids on startup or after restarts.
-                # NOTE: Only do this during normal operation, not during recovery mode
-                if not is_tracked and not allow_outside_today:
-                    created_at_hint = None
-                    try:
-                        candidate = zap_request.get("created_at")
-                        if candidate is not None:
-                            created_at_hint = int(candidate)
-                            if created_at_hint <= 0:
-                                created_at_hint = None
-                    except Exception:
-                        created_at_hint = None
-
-                    if target_author and await self._ensure_note_tracked(settings, target_note_id, created_at_hint, target_author):
-                        tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
-                        is_tracked = target_note_id in tracked_notes
-
-                # CRITICAL: Always require the note to be in tracked_event_ids for new members
-                # The allow_outside_today flag should only bypass the "today's notes" temporal check,
-                # NOT the requirement that the note must be tracked
-                if not is_tracked:
-                    logger.debug(
-                        f"Zap target {target_note_id[:16]}... is not a tracked note ID "
-                        f"(tracking {len(tracked_notes)} notes). Ignoring."
-                        f"{' [recovery mode]' if allow_outside_today else ''}"
-                    )
-                    self.last_error = "note_not_tracked"
-                    return False
-                else:
-                    logger.debug(
-                        f"✅ Zap target {target_note_id[:16]}... IS in tracked notes. "
-                        f"Proceeding with headbutt processing..."
-                        f"{' [recovery mode]' if allow_outside_today else ''}"
-                    )
+                            # Normalize to integer timestamp (handle both datetime objects and int/float timestamps)
+                            if isinstance(payment_ts_raw, datetime):
+                                payment_ts = int(payment_ts_raw.timestamp())
+                            elif isinstance(payment_ts_raw, (int, float)):
+                                payment_ts = int(payment_ts_raw)
+                            else:
+                                # Fallback to current time if unexpected type
+                                payment_ts = int(datetime.now(timezone.utc).timestamp())
+                                logger.debug(
+                                    f"⚠️  Payment timestamp unexpected type {type(payment_ts_raw)}, using current time: {payment_ts}"
+                                )
+                    except Exception as e:
+                        logger.warning(f"Failed to get payment timestamp: {e}")
+                        payment_ts = int(datetime.now(timezone.utc).timestamp())
+                    
+                    if payment_ts < earliest_event_ts:
+                        logger.info(
+                            f"❌ Zap occurred at {payment_ts} (before earliest event at {earliest_event_ts}). "
+                            f"Only zaps after the first tracked event from today are valid. Ignoring zap."
+                        )
+                        self.last_error = "zap_too_old"
+                        return False
+                    else:
+                        logger.debug(
+                            f"✅ Zap timestamp {payment_ts} is after earliest event {earliest_event_ts}"
+                        )
+                
+                # Note is validated as being in today's tracked events and zap timestamp is valid
+                logger.debug(
+                    f"✅ Zap target {target_note_id[:16]}... IS in today's tracked notes. "
+                    f"Proceeding with headbutt processing..."
+                )
             
             # Check for duplicate processing using payment hash as event ID
             event_id_raw = getattr(payment, "payment_hash", None) or getattr(payment, "checking_id", None)
@@ -802,15 +811,10 @@ class ZapMonitorService:
                         f"Zap monitor: failed to persist processed zap for user {self.user_id}: {exc}"
                     )
                 
-                # Best-effort registry update when subscriptions become ready
-                if not subscriptions_ready and not is_tracked:
-                    logger.debug(
-                        f"Scheduling opportunistic registry update for note {target_note_id[:8]}... "
-                        f"when subscriptions become ready"
-                    )
-                    asyncio.create_task(
-                        self._opportunistic_registry_update(target_note_id, max_attempts=7, delay=2.0)
-                    )
+                # Note: Opportunistic registry update removed - we now enforce that notes
+                # must be in today's tracked_event_ids before processing zaps
+                # Note: Automatic splits trigger moved to _check_and_trigger_splits which is
+                # called for ALL payments to the herd wallet (not just zaps)
                 return True
             else:
                 logger.warning(f"Failed to process LNURLp zap from {zapper_pubkey[:8]}...")
@@ -830,6 +834,68 @@ class ZapMonitorService:
             return False
         # Default to False for any non-successful processing (explicit)
         return False
+
+    async def _check_and_trigger_splits(self, payment):
+        """Check if automatic splits should be triggered for any payment to the herd wallet.
+        
+        This method is called for EVERY payment received to the herd wallet, regardless of
+        whether it's a zap or not. It checks if:
+        1. send_splits_enabled is true
+        2. feeder_trigger_sats is configured
+        3. herd wallet balance >= trigger amount
+        
+        If all conditions are met, it triggers an automatic transfer of the entire herd
+        wallet balance to the CyberHerd (splits) wallet.
+        
+        Args:
+            payment: Payment object received from the invoice listener
+        """
+        try:
+            # Get user settings
+            settings = await crud.get_settings(self.user_id)
+            if not settings:
+                return
+            
+            # Check if automatic splits are enabled
+            if not getattr(settings, "send_splits_enabled", False):
+                return
+            
+            # Only process payments to the configured herd wallet
+            herd_wallet_id = getattr(settings, 'herd_wallet', None)
+            if not isinstance(herd_wallet_id, str):
+                herd_wallet_id = None
+            
+            if not herd_wallet_id:
+                return
+            
+            # Check if this payment is to the herd wallet
+            if payment.wallet_id != herd_wallet_id:
+                return
+            
+            # Trigger automatic splits check
+            from .send_splits import maybe_send_splits_for_user
+            
+            split_result = await maybe_send_splits_for_user(
+                user_id=cast(str, self.user_id),
+                settings=settings
+            )
+            
+            if split_result and split_result.get("ok"):
+                logger.info(
+                    f"💸 Automatic splits triggered by payment: transferred {split_result.get('sats')} sats "
+                    f"from herd wallet to splits wallet for user {self.user_id}"
+                )
+            elif split_result and not split_result.get("ok"):
+                # Log the error but don't fail the payment processing
+                logger.debug(
+                    f"Automatic splits check failed for user {self.user_id}: {split_result.get('error')}"
+                )
+                
+        except Exception as exc:
+            # Don't let splits check errors affect payment processing
+            logger.debug(
+                f"Error checking/triggering automatic splits for user {self.user_id}: {exc}"
+            )
 
     async def _ensure_note_tracked(
         self,
@@ -1134,7 +1200,12 @@ class ZapMonitorService:
                     payment = await asyncio.wait_for(
                         self._invoice_queue.get(), timeout=1.0
                     )
+                    # Process payment for zap detection (if applicable)
                     await self._process_payment_for_zap(payment)
+                    
+                    # Check if automatic splits should be triggered for ANY payment
+                    # to the herd wallet (not just zaps)
+                    await self._check_and_trigger_splits(payment)
                 except asyncio.TimeoutError:
                     # Normal timeout, check if still running
                     continue

@@ -595,104 +595,20 @@ async def _trigger_recovery_for_all_users(app):
 
 
 async def _initialize_tracked_event_ids_on_startup(app):
-    """Initialize tracked_event_ids with recent notes on startup.
+    """DEPRECATED: Replaced by force_requery_for_user in startup flow.
     
-    Queries for recent kind 1 notes by each user's effective pubkey and
-    populates tracked_event_ids. This ensures subscriptions for reposts/reactions
-    can be created immediately, even if no notes have been detected yet.
+    This function is no longer needed because force_requery_for_user does everything
+    this function did PLUS more, eliminating duplicate queries during startup.
     
-    UTC-FIRST: Uses UTC midnight as query "since" timestamp.
+    Original purpose: Initialize tracked_event_ids with recent notes on startup.
+    New approach: force_requery_for_user queries notes and auto-populates tracked_event_ids
+    via _append_today, while also handling engagement event recovery in one pass.
     """
-    try:
-        # Check if nostr_helpers is available
-        available = nostr_helpers.check_availability()
-        _record_availability_check(available)
-        
-        if not available:
-            logger.warning("Nostr helpers not available for tracked_event_ids initialization")
-            return
-        
-        # Get all users with tracking enabled
-        from .. import crud
-        from ..utils.common import get_lnbits_users_function
-        
-        # Dynamic import for get_users to avoid static-analysis import errors
-        get_users = get_lnbits_users_function()
-
-        # Only await if we obtained an async function
-        if get_users and asyncio.iscoroutinefunction(get_users):
-            users = await get_users()
-        else:
-            users = []
-        # By default initialize tracked_event_ids using events from a recent lookback window.
-        # Configure lookback via CYBERHERD_TRACKED_EVENT_LOOKBACK_DAYS (default 3 days).
-        try:
-            lookback_days = parse_int_env("CYBERHERD_TRACKED_EVENT_LOOKBACK_DAYS", 3)
-            boundaries = get_day_boundaries_utc(days_ago=lookback_days)
-            since_ts = boundaries.local_since_ts
-            logger.info(f"Initializing tracked_event_ids on startup with lookback_days={lookback_days} since_ts={since_ts} local_day={boundaries.local_day_str}")
-        except Exception as e:
-            # Fallback to UTC now if helper fails
-            since_ts = int(utc_now().timestamp())
-            logger.warning(f"Failed to compute day boundaries for tracked_event_ids init: {e}; falling back to now since_ts={since_ts}")
-        
-        for user in users:
-            try:
-                settings = await crud.get_settings(user.id)
-                if not settings:
-                    continue
-                
-                # Skip users without tracking enabled
-                if not (getattr(settings, 'repost_tracking_enabled', False) or getattr(settings, 'likes_tracking_enabled', False)):
-                    continue
-                
-                eff_pub = get_effective_pubkey(settings)
-                tags = getattr(settings, 'tracked_tags', [])
-                
-                if not eff_pub or not tags:
-                    continue
-                
-                # Query for recent kind 1 and 30311 notes by this author
-                filter_dict = {
-                    "kinds": [1, 30311],
-                    "authors": [eff_pub],
-                    "since": since_ts
-                }
-                
-                events = await nostr_helpers.query_events(
-                    filter_dict,
-                    limit=100,  # Get last 100 notes from today
-                    timeout=5.0
-                )
-                _record_helper_query(True)
-                
-                if events:
-                    # Filter events to only those matching tracked tags
-                    # Use shared tag matching logic (consistent with _append_today)
-                    tracked_ids = []
-                    tags_norm = [t.lstrip('#').lower() for t in tags if t]
-                    
-                    for event in events:
-                        if _event_matches_tracked_tags(event, tags_norm):
-                            event_id = event.get("id")
-                            if event_id:
-                                tracked_ids.append(event_id)
-                    
-                    if tracked_ids:
-                        # Update tracked_event_ids in settings
-                        current_tracked = getattr(settings, 'tracked_event_ids', []) or []
-                        updated_tracked = list(set(current_tracked + tracked_ids))
-                        settings.tracked_event_ids = updated_tracked
-                        await crud.upsert_settings(settings, user.id)
-                        
-                        logger.info(f"Initialized tracked_event_ids for user {user.id}: added {len(tracked_ids)} recent notes (total: {len(updated_tracked)})")
-                        _dbg(f"Initialized tracked_event_ids for user {user.id} with {len(tracked_ids)} notes")
-                        
-            except Exception as e:
-                logger.warning(f"Error initializing tracked_event_ids for user {user.id}: {e}")
-                
-    except Exception as e:
-        logger.warning(f"Error in tracked_event_ids initialization: {e}")
+    logger.warning(
+        "DEPRECATED: _initialize_tracked_event_ids_on_startup called. "
+        "This is now handled by force_requery_for_user in the startup flow."
+    )
+    # Function body removed - use force_requery_for_user instead
 
 
 async def _any_tracked_event_ids_exist(app) -> bool:
@@ -726,34 +642,20 @@ async def _any_tracked_event_ids_exist(app) -> bool:
 
 
 async def _wait_for_tracked_event_ids(app, timeout_seconds: float = 30.0) -> bool:
-    """Wait up to timeout_seconds for any tracked_event_ids to appear.
-
-    Returns True if tracked_event_ids were detected, False on timeout.
+    """DEPRECATED: No longer needed with optimized startup flow.
+    
+    This function is no longer needed because force_requery_for_user runs first
+    during startup and immediately populates tracked_event_ids, eliminating the
+    need to wait/poll for them to be ready.
+    
+    Original purpose: Wait for any user to have tracked_event_ids populated.
+    New approach: force_requery_for_user populates them synchronously during startup.
     """
-    try:
-        # Fast path: already present
-        if await _any_tracked_event_ids_exist(app):
-            return True
-
-        # Get the shared event
-        evt = get_refresh_event()
-        if evt is None:
-            # Can't rely on event waking, just sleep a bit and re-check
-            await asyncio.sleep(timeout_seconds)
-            return await _any_tracked_event_ids_exist(app)
-
-        try:
-            await asyncio.wait_for(evt.wait(), timeout=timeout_seconds)
-        except asyncio.TimeoutError:
-            return False
-        finally:
-            clear_refresh_event()
-
-        # Give a small moment for DB writes to complete
-        await asyncio.sleep(0.1)
-        return await _any_tracked_event_ids_exist(app)
-    except Exception:
-        return False
+    logger.warning(
+        "DEPRECATED: _wait_for_tracked_event_ids called. "
+        "No longer needed - force_requery_for_user populates tracked_event_ids synchronously."
+    )
+    return True  # Return True to avoid breaking existing logic
 
 
 def trigger_subscription_refresh(app, reason: str | None = None):
@@ -830,41 +732,50 @@ def start_subscriptions(app):
                         f"Reason: {relay_status['reason']}"
                     )
                 
-                # Initialize tracked_event_ids with recent notes before starting subscriptions
-                await _initialize_tracked_event_ids_on_startup(app)
+                # OPTIMIZED STARTUP FLOW:
+                # Run force_requery for all users FIRST - this populates tracked_event_ids
+                # AND recovers missed events in a single pass (no duplicate queries)
+                logger.info("Starting event recovery and tracked_event_ids initialization")
                 
-                # Wait for tracked_event_ids to be initialized before starting the
-                # adapter so engagement subscriptions (kinds 6/7) can be created
-                # immediately. This avoids starting realtime subscriptions too
-                # early when there are no tracked ids.
-                wait_secs = parse_float_env('CYBERHERD_WAIT_FOR_TRACKED_IDS_SECONDS', 30.0)
-
-                got_tracked = False
                 try:
-                    got_tracked = await _wait_for_tracked_event_ids(app, timeout_seconds=wait_secs)
-                except Exception:
-                    got_tracked = False
-
-                if not got_tracked:
-                    logger.warning(
-                        f"Timed out waiting {wait_secs}s for tracked_event_ids; starting adapter without guaranteed engagement filters"
-                    )
-                else:
-                    # CRITICAL: Trigger event recovery now that tracked_event_ids are populated
-                    # This ensures missed zaps, reposts, and reactions are recovered after startup initialization
-                    logger.info("Tracked event IDs detected, triggering automatic event recovery for all users")
+                    from . import nostr_adapter
+                    from ..utils.common import get_lnbits_users_function
                     
-                    # Recover zaps (payment-based)
-                    try:
-                        await _trigger_recovery_for_all_users(app)
-                    except Exception as e:
-                        logger.warning(f"Failed to trigger automatic zap recovery after tracked_event_ids detection: {e}")
+                    get_users = get_lnbits_users_function()
+                    users = await get_users() if asyncio.iscoroutinefunction(get_users) else []
+                    recovery_count = 0
                     
-                    # Recover reposts and reactions (Nostr-based)
-                    try:
-                        await _recover_missed_reposts_and_reactions_on_startup(app)
-                    except Exception as e:
-                        logger.warning(f"Failed to trigger automatic repost/reaction recovery after tracked_event_ids detection: {e}")
+                    for user in users:
+                        try:
+                            settings = await crud.get_settings(user.id)
+                            # Only recover if tracking is enabled
+                            if not (getattr(settings, 'repost_tracking_enabled', False) or 
+                                   getattr(settings, 'likes_tracking_enabled', False) or
+                                   getattr(settings, 'tracked_tags', [])):
+                                continue
+                            
+                            # Run force_requery to:
+                            # 1. Query and cache notes (kind 1/30311)
+                            # 2. Auto-populate tracked_event_ids via _append_today
+                            # 3. Query and process engagement events (kind 6/7)
+                            # This replaces both _initialize_tracked_event_ids_on_startup
+                            # and the old _recover_missed_reposts_and_reactions_on_startup
+                            appended_ids = await nostr_adapter.force_requery_for_user(app, user.id)
+                            if appended_ids is not None:  # None = error, [] = no notes found
+                                recovery_count += 1
+                                logger.info(f"Completed startup recovery for user {user.id} via force_requery")
+                        except Exception as ue:
+                            logger.warning(f"Failed startup recovery for user {user.id}: {ue}")
+                    
+                    logger.info(f"Startup recovery complete: {recovery_count} users processed")
+                except Exception as e:
+                    logger.warning(f"Failed startup recovery: {e}")
+                
+                # Recover zaps (payment-based) - separate concern from Nostr events
+                try:
+                    await _trigger_recovery_for_all_users(app)
+                except Exception as e:
+                    logger.warning(f"Failed to trigger automatic zap recovery: {e}")
 
                 # Start the adapter (which creates initial subscriptions)
                 await _authoritative_tag_subscription(app)
@@ -1555,231 +1466,35 @@ async def _trigger_reaction_headbutt(user_id: str, reactor_pubkey: str, reacted_
 
 
 async def _recover_missed_reposts_and_reactions_on_startup(app):
-    """Recover missed reposts and reactions on startup by querying recent kind 6 and 7 events.
+    """DEPRECATED: Use force_requery_for_user instead.
+    
+    This function is kept for backward compatibility but should not be used.
+    Use nostr_adapter.force_requery_for_user(app, user_id) which queries both
+    notes AND engagement events (reposts/reactions) in a single comprehensive operation.
+    
+    Original documentation:
+    Recover missed reposts and reactions on startup by querying recent kind 6 and 7 events.
 
     Note: zap receipts (kind 9735) are intentionally excluded here — zaps are processed
     via the invoice/listener path only.
     """
-    try:
-        if os.getenv('DISABLE_MISSED_REPOST_RECOVERY', 'false').lower() == 'true':
-            return
-        
-        # Get all users with repost tracking enabled
-        from .. import crud
-        from ..utils.common import get_lnbits_users_function
-        
-        get_users = get_lnbits_users_function()
-
-        users = await get_users() if asyncio.iscoroutinefunction(get_users) else []
-        recovery_attempted = 0
-        recovery_succeeded = 0
-        for user in users:
-            try:
-                settings = await crud.get_settings(user.id)
-                if not (getattr(settings, 'repost_tracking_enabled', False) or getattr(settings, 'likes_tracking_enabled', False)):
-                    continue
-                
-                # Only attempt recovery if user has tracked_event_ids
-                tracked_event_ids = getattr(settings, 'tracked_event_ids', []) or []
-                if not tracked_event_ids:
-                    logger.debug(f"Skipping recovery for user {user.id}: no tracked_event_ids")
-                    continue
-                
-                recovery_attempted += 1
-                logger.info(f"Starting repost/reaction recovery for user {user.id} with {len(tracked_event_ids)} tracked notes")
-                await _recover_missed_reposts_and_reactions_for_user(user.id, settings, app)
-                recovery_succeeded += 1
-            except Exception as e:
-                logger.warning(f"Error recovering reposts and reactions for user {user.id}: {e}")
-        
-        logger.info(f"Startup recovery complete: {recovery_succeeded}/{recovery_attempted} users successfully recovered")
-                
-    except Exception as e:
-        logger.warning(f"Error in repost/reaction recovery: {e}")
+    logger.warning(
+        "DEPRECATED: _recover_missed_reposts_and_reactions_on_startup called. "
+        "Use nostr_adapter.force_requery_for_user instead for comprehensive recovery."
+    )
+    # Function body removed - use force_requery_for_user instead
 
 
 async def _recover_missed_reposts_and_reactions_for_user(user_id: str, settings, app):
-    """Recover missed reposts and reactions for a specific user.
+    """DEPRECATED: Use force_requery_for_user instead.
     
-    Uses #e-only filters (no #t requirement) to catch ALL reposts/reactions
-    on tracked events. Supports multi-#e batching for efficient queries.
-    
-    Note: Zap receipts (kind 9735) are intentionally excluded — zaps are
-    processed via the invoice/listener path only.
-    
-    UTC-FIRST: Uses UTC midnight for consistent "since" timestamp across timezones.
-    Events are filtered from the start of the current UTC day, ensuring reliable
-    recovery regardless of user timezone or DST transitions.
+    This function is kept for backward compatibility but should not be used.
+    Use nostr_adapter.force_requery_for_user(app, user_id) which queries both
+    notes AND engagement events in a single operation.
     """
-    try:
-        # Check if nostr_helpers is available
-        available = nostr_helpers.check_availability()
-        _record_availability_check(available)
-        
-        if not available:
-            logger.warning(f"Nostr helpers not available for repost/reaction recovery (user {user_id})")
-            return
-        
-        # UTC-FIRST: Get day boundaries for consistent time filtering
-        # Use UTC midnight as the "since" timestamp to ensure we query from
-        # the start of the current UTC day (matches Nostr event timestamps)
-        boundaries = _get_today_boundaries_utc()
-        since_ts = boundaries.utc_since_ts
-        
-        # Get tracked event IDs (these are the events we want to find reactions/reposts for)
-        tracked_event_ids = getattr(settings, 'tracked_event_ids', []) or []
-        
-        if not tracked_event_ids:
-            _dbg(f"No tracked event IDs for user {user_id}, skipping recovery")
-            return
+    logger.warning(
+        f"DEPRECATED: _recover_missed_reposts_and_reactions_for_user called for user {user_id}. "
+        "Use nostr_adapter.force_requery_for_user instead."
+    )
+    # Function body removed - use force_requery_for_user instead
 
-        cache = _get_cache(app)
-        
-        # Determine which kinds to query
-        kinds_to_query = []
-        if getattr(settings, 'repost_tracking_enabled', False):
-            kinds_to_query.append(6)
-        if getattr(settings, 'likes_tracking_enabled', False):
-            kinds_to_query.append(7)
-        
-        if not kinds_to_query:
-            _dbg(f"No repost/reaction tracking enabled for user {user_id}")
-            return
-        
-        # Build filter using #e tags only (no #t requirement for reposts/reactions)
-        # Split into batches if we have many tracked event IDs (Nostr relays may limit filter size)
-        batch_size = 100  # Conservative batch size
-        all_events = []
-        
-        for i in range(0, len(tracked_event_ids), batch_size):
-            batch_ids = tracked_event_ids[i:i + batch_size]
-            
-            # Query via nostr_helpers with #e-only filter
-            filter_dict = {
-                "kinds": kinds_to_query,
-                "#e": batch_ids,
-                "since": since_ts
-            }
-            
-            try:
-                events = await nostr_helpers.query_events(
-                    filter_dict,
-                    limit=500,
-                    timeout=10.0
-                )
-                _record_helper_query(True)
-                
-                if events:
-                    all_events.extend(events)
-                    _dbg(f"Recovered {len(events)} events in batch {i // batch_size + 1} for user {user_id}")
-                    
-            except Exception as e:
-                _record_helper_query(False, str(e))
-                logger.warning(f"Nostr helper query failed for batch {i // batch_size + 1} (user {user_id}): {e}")
-        
-        # Remove duplicates (events might appear in multiple batches if IDs overlap)
-        seen_ids: set[str] = set()
-        unique_events = []
-        for event in all_events:
-            event_id = event.get('id')
-            if not event_id or event_id in seen_ids:
-                continue
-            seen_ids.add(event_id)
-            try:
-                if await crud.is_event_processed(user_id, event_id):
-                    _dbg(f"Skipping already processed event {event_id[:16]} for user {user_id}")
-                    continue
-            except Exception:
-                pass
-            unique_events.append(event)
-        
-        logger.info(f"Recovered {len(unique_events)} repost/reaction events for user {user_id} via #e filters")
-        
-        # Process each event recovered via #e filters
-        processed_count = 0
-        for event in unique_events:
-            try:
-                # Use recovery_mode=True to prevent publishing notes for historical events
-                result = await process_event_for_user(user_id, event, settings, app, recovery_mode=True)
-                if result is not False:  # None or True means processed
-                    processed_count += 1
-            except Exception as e:
-                logger.warning(f"Error processing recovered event {event.get('id')} for user {user_id}: {e}")
-        
-        if processed_count > 0:
-            logger.info(f"✅ Successfully processed {processed_count}/{len(unique_events)} recovered events for user {user_id}")
-
-        # --- Additional broad sweep for content-only reposts (no #e tag) ---
-        try:
-            # Look back 24 hours from local midnight (fallback to UTC if necessary)
-            try:
-                lookback_since = max(_local_midnight_timestamp() - 24 * 3600, 0)
-            except Exception:
-                lookback_since = int(utc_now().timestamp()) - 24 * 3600
-
-            # Broad query for kind 6 reposts in recent window
-            broad_events = []
-            try:
-                broad_events = await nostr_helpers.query_events(
-                    {"kinds": [6], "since": lookback_since},
-                    limit=2000,
-                    timeout=8.0,
-                )
-                _record_helper_query(True)
-            except Exception as e:
-                _record_helper_query(False, str(e))
-                logger.warning(f"Broad kind=6 sweep failed for user {user_id}: {e}")
-
-            if broad_events:
-                candidate_events = []
-                for ev in broad_events:
-                    try:
-                        identifiers = _collect_reference_identifiers(ev, include_content=True)
-                    except Exception:
-                        identifiers = []
-                    matched = False
-                    for ident in identifiers:
-                        try:
-                            resolved_id, _meta = await _resolve_tracked_event(settings, ident, cache, app)
-                        except Exception:
-                            resolved_id = None
-                        if resolved_id and resolved_id in tracked_event_ids:
-                            matched = True
-                            break
-                    if matched:
-                        candidate_events.append(ev)
-
-                # Only process events we have not already seen
-                new_events = []
-                for ev in candidate_events:
-                    eid = ev.get('id')
-                    if not eid or eid in seen_ids:
-                        continue
-                    seen_ids.add(eid)
-                    try:
-                        if await crud.is_event_processed(user_id, eid):
-                            _dbg(f"Skipping already processed content-only repost {eid[:16]} for user {user_id}")
-                            continue
-                    except Exception:
-                        pass
-                    new_events.append(ev)
-
-                logger.info(f"Recovered {len(new_events)} content-only reposts for user {user_id}")
-
-                # Process only the newly discovered content-only reposts
-                content_processed = 0
-                for event in new_events:
-                    try:
-                        result = await process_event_for_user(user_id, event, settings, app, recovery_mode=True)
-                        if result is not False:
-                            content_processed += 1
-                    except Exception as e:
-                        logger.warning(f"Error processing recovered event {event.get('id')} for user {user_id}: {e}")
-                
-                if content_processed > 0:
-                    logger.info(f"✅ Successfully processed {content_processed}/{len(new_events)} content-only reposts for user {user_id}")
-        except Exception as e:
-            logger.warning(f"Error during broad kind=6 recovery sweep for user {user_id}: {e}")
-                
-    except Exception as e:
-        logger.warning(f"Error recovering reposts/reactions via nostr_helpers for user {user_id}: {e}")
