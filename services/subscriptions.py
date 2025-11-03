@@ -393,14 +393,26 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
     """
     eid = event.get("id")
     if not eid:
+        _dbg("_append_today: event has no id")
         return False
+    
     tags_norm = [t.lstrip('#').lower() for t in tags if t]
     if not tags_norm:
+        _dbg(f"_append_today: no tracked tags configured for user {user_id}")
         return False
+    
     # Author check
     event_pubkey = event.get("pubkey")
     if event_pubkey != eff_pub:
-        _dbg(f"_append_today: author mismatch event_pubkey={event_pubkey} eff_pub={eff_pub}")
+        # Log at INFO level if CYBERHERD_DEBUG is enabled, otherwise DEBUG
+        if CYBERHERD_DEBUG:
+            logger.info(
+                f"📝 Skipping event {eid[:16]}... from pubkey {event_pubkey[:16]}... "
+                f"(not matching effective pubkey {eff_pub[:16] if eff_pub else 'None'}...) "
+                f"user_id={user_id}"
+            )
+        else:
+            _dbg(f"_append_today: author mismatch event_pubkey={event_pubkey} eff_pub={eff_pub}")
         return False
     
     # UTC-FIRST: Get day boundaries (primary UTC, secondary local)
@@ -417,14 +429,30 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
     
     # Check if event is from user's local "today"
     if not boundaries.is_timestamp_in_local_day(created_at):
-        _dbg(f"_append_today: time mismatch created_at={created_at} "
-             f"local_day=[{boundaries.local_since_ts}, {boundaries.local_until_ts}) "
-             f"utc_date={boundaries.utc_day_str} eid={eid}")
+        if CYBERHERD_DEBUG:
+            from datetime import datetime
+            logger.info(
+                f"📅 Skipping event {eid[:16]}... from {datetime.fromtimestamp(created_at).isoformat()} "
+                f"(outside today's local window: {datetime.fromtimestamp(boundaries.local_since_ts).isoformat()} "
+                f"to {datetime.fromtimestamp(boundaries.local_until_ts).isoformat()}) user_id={user_id}"
+            )
+        else:
+            _dbg(f"_append_today: time mismatch created_at={created_at} "
+                 f"local_day=[{boundaries.local_since_ts}, {boundaries.local_until_ts}) "
+                 f"utc_date={boundaries.utc_day_str} eid={eid}")
         return False
     
     # Use shared tag matching logic
     if not _event_matches_tracked_tags(event, tags_norm):
-        _dbg(f"_append_today: tag mismatch tags_norm={tags_norm} eid={eid}")
+        if CYBERHERD_DEBUG:
+            # Extract event's tags for logging
+            event_t_tags = [t[1] for t in event.get('tags', []) if isinstance(t, list) and len(t) >= 2 and t[0] == 't']
+            logger.info(
+                f"🏷️ Skipping event {eid[:16]}... with t-tags {event_t_tags} "
+                f"(not matching tracked tags {tags_norm}) user_id={user_id}"
+            )
+        else:
+            _dbg(f"_append_today: tag mismatch tags_norm={tags_norm} eid={eid}")
         return False
 
     # Auto-add detected note event IDs to tracked_event_ids for repost/reaction tracking
