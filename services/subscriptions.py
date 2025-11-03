@@ -1022,22 +1022,40 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                 )
                 return
             
-            logger.info(f"🔄 Processing kind 6 repost event {eid[:16] if eid else 'unknown'}... for user {user_id}")
+            logger.info(f"🔄 Processing kind 6 repost event {eid[:16] if eid else 'unknown'}... for user {user_id} from pubkey {pubkey[:16]}...")
             
             # No timestamp check for kind 6 - we only care if it references a tracked event ID.
             # The tracked event IDs themselves are already filtered to today's window when detected.
             
             cache = _get_cache(app)
+            
+            # Get current tracked event IDs for debugging
+            tracked_ids = getattr(settings, 'tracked_event_ids', []) or []
+            logger.info(f"📌 Current tracked_event_ids for user {user_id} ({len(tracked_ids)}): {[t[:16]+'...' for t in tracked_ids[:5]]}")
+            
+            # Collect all identifiers from the repost event
+            identifiers = _collect_reference_identifiers(event, include_content=True)
+            logger.info(f"📋 Found {len(identifiers)} reference identifiers in repost event: {[i[:16]+'...' for i in identifiers]}")
+            
             target_id = None
-            for identifier in _collect_reference_identifiers(event, include_content=True):
+            for identifier in identifiers:
+                logger.debug(f"🔎 Checking identifier: {identifier[:16]}...")
                 resolved_id, _metadata = await _resolve_tracked_event(settings, identifier, cache, app)
                 if not resolved_id:
+                    logger.debug(f"❌ Identifier {identifier[:16]}... did not resolve")
                     continue
-                if await _is_tracked_event(user_id, resolved_id, settings, app, cache):
+                logger.debug(f"✅ Resolved to: {resolved_id[:16]}...")
+                
+                is_tracked = await _is_tracked_event(user_id, resolved_id, settings, app, cache)
+                logger.info(f"🎯 Is {resolved_id[:16]}... tracked? {is_tracked}")
+                
+                if is_tracked:
                     target_id = resolved_id
+                    logger.info(f"✅ Found tracked event: {target_id[:16]}... for repost!")
                     break
 
             if target_id:
+                logger.info(f"🎬 Triggering headbutt for repost event {eid[:16]}... referencing tracked note {target_id[:16]}...")
                 # Persistent dedupe: if this repost event was already processed
                 # and recorded in processed_events, skip to avoid cross-restart
                 # reprocessing. Fall back to processing if the persistence check
@@ -1056,6 +1074,7 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                     pass
 
                 result = await _trigger_repost_headbutt(user_id, pubkey, target_id, eid, app, recovery_mode=recovery_mode)
+                logger.info(f"🎬 Repost headbutt result: {result is not None}")
                 # Persist processed status when subscription-driven processing succeeds
                 try:
                     if result and eid:
@@ -1092,6 +1111,8 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                             logger.warning(f"Failed to persist processed repost event {eid} for user {user_id}")
                 except Exception:
                     pass
+            else:
+                logger.warning(f"⚠️ Repost event {eid[:16]}... does NOT reference any tracked event for user {user_id}")
 
         # kind 7: reactions
         elif kind == 7 and getattr(settings, "likes_tracking_enabled", False):
@@ -1346,6 +1367,9 @@ async def _is_tracked_event(user_id: str, note_event_id: str, settings, app, cac
     UTC-FIRST: Cache keys use UTC date for consistency across timezones.
     """
     try:
+        if CYBERHERD_DEBUG:
+            logger.info(f"🔍 _is_tracked_event: Checking if {note_event_id[:16]}... is tracked for user {user_id}")
+        
         # First check if the event is in today's cache
         cache = cache or _get_cache(app)
         
@@ -1356,6 +1380,9 @@ async def _is_tracked_event(user_id: str, note_event_id: str, settings, app, cac
         eff_pub = get_effective_pubkey(settings)
         tags = getattr(settings, 'tracked_tags', [])
         tagset = tuple(sorted([t.lstrip('#').lower() for t in tags if t]))
+
+        if CYBERHERD_DEBUG:
+            logger.info(f"  Cache day: {day}, eff_pub: {eff_pub[:16] if eff_pub else 'None'}..., tags: {tags}")
 
         # Check both user-specific and neutral cache keys
         cache_keys = [
@@ -1370,21 +1397,36 @@ async def _is_tracked_event(user_id: str, note_event_id: str, settings, app, cac
         # wasn't seen in the in-memory cache (e.g. added manually via UI).
         try:
             explicit_tracked = getattr(settings, 'tracked_event_ids', []) or []
+            if CYBERHERD_DEBUG:
+                logger.info(f"  Explicit tracked_event_ids ({len(explicit_tracked)}): {[e[:16]+'...' for e in explicit_tracked[:5]]}")
+            
             if note_event_id in explicit_tracked:
+                if CYBERHERD_DEBUG:
+                    logger.info(f"✅ Event {note_event_id[:16]}... found in explicit tracked_event_ids!")
                 # Ensure it's present in the runtime cache for faster future checks
                 for key in cache_keys:
                     note_ids = _get_cache_note_ids(cache, key, create=True)
                     if note_event_id not in note_ids:
                         note_ids.append(note_event_id)
                 return True
-        except Exception:
+            elif CYBERHERD_DEBUG:
+                logger.info(f"  Event {note_event_id[:16]}... NOT in explicit tracked_event_ids")
+        except Exception as e:
             # Fall back to cache lookup below on any error
+            if CYBERHERD_DEBUG:
+                logger.warning(f"  Error checking explicit tracked_event_ids: {e}")
             pass
 
+        # Check cache
         for key in cache_keys:
             event_ids = _get_cache_note_ids(cache, key)
             if note_event_id in event_ids:
+                if CYBERHERD_DEBUG:
+                    logger.info(f"✅ Event {note_event_id[:16]}... found in cache!")
                 return True
+        
+        if CYBERHERD_DEBUG:
+            logger.info(f"  Event {note_event_id[:16]}... NOT in cache, checking via nostr_helpers...")
         
         # If not in cache, query for the event via nostr_helpers and check if it would be tracked
         try:
@@ -1404,18 +1446,28 @@ async def _is_tracked_event(user_id: str, note_event_id: str, settings, app, cac
             
             if events:
                 event = events[0]
+                if CYBERHERD_DEBUG:
+                    logger.info(f"  Found event via nostr_helpers, checking if it would be tracked...")
                 # Check if this event would be tracked
                 if _would_event_be_tracked(event, eff_pub, tags):
+                    if CYBERHERD_DEBUG:
+                        logger.info(f"✅ Event {note_event_id[:16]}... WOULD be tracked, adding to cache")
                     # Add to cache so future checks are faster
                     for key in cache_keys:
                         note_ids = _get_cache_note_ids(cache, key, create=True)
                         if note_event_id not in note_ids:
                             note_ids.append(note_event_id)
                     return True
+                elif CYBERHERD_DEBUG:
+                    logger.info(f"❌ Event {note_event_id[:16]}... would NOT be tracked (doesn't match criteria)")
+            elif CYBERHERD_DEBUG:
+                logger.info(f"❌ Event {note_event_id[:16]}... NOT found via nostr_helpers query")
         except Exception as e:
             _record_helper_query(False, str(e))
             logger.warning(f"Error querying for tracked event {note_event_id} via nostr_helpers: {e}")
         
+        if CYBERHERD_DEBUG:
+            logger.info(f"❌ Event {note_event_id[:16]}... is NOT tracked")
         return False
     except Exception as e:
         logger.error(f"Error checking if event is tracked: {e}")

@@ -62,6 +62,7 @@ CYBERHERD_USE_WEBSOCKET = parse_bool_env("CYBERHERD_USE_WEBSOCKET", True)
 CYBERHERD_WS_RECONNECT_DELAY = parse_int_env("CYBERHERD_WS_RECONNECT_DELAY", 5)
 CYBERHERD_WS_MAX_RECONNECT_ATTEMPTS = parse_int_env("CYBERHERD_WS_MAX_RECONNECT_ATTEMPTS", 10)
 CYBERHERD_BROAD_REPOST_LIMIT = parse_int_env("CYBERHERD_BROAD_REPOST_LIMIT", 800)
+CYBERHERD_BROAD_REACTION_LIMIT = parse_int_env("CYBERHERD_BROAD_REACTION_LIMIT", 500)
 
 
 def _dbg(msg: str, *args):
@@ -316,25 +317,50 @@ def _prepare_websocket_subscription(user_id: str, settings, app) -> Optional[dic
     if eff_pub:
         # Use consolidated helper to build note filters (kinds 1 and 30311)
         limit = initial_limit if _first_cycle.get(ukey, True) and initial_limit > 0 else None
-        filters.extend(_build_note_filters(
+        note_filters = _build_note_filters(
             eff_pub=eff_pub,
             filter_tags=stripped_tags if stripped_tags else None,
             since=since,
             limit=limit,
             include_tagged_filter=True
-        ))
+        )
+        filters.extend(note_filters)
+        _dbg(f"Added {len(note_filters)} note filters (kinds 1, 30311) for pubkey {eff_pub[:16]}...")
 
     tracked_event_ids = _collect_tracked_event_ids_for_subscription(settings, app, eff_pub, tags_norm)
+    _dbg(f"Collected {len(tracked_event_ids)} tracked_event_ids for subscription")
+    if tracked_event_ids and CYBERHERD_DEBUG:
+        logger.info(f"📌 Tracked event IDs for subscription: {[e[:16]+'...' for e in tracked_event_ids[:10]]}")
 
     # Use helper to build engagement kinds list
     react_kinds = _build_engagement_kinds(settings)
     repost_enabled = 6 in react_kinds
     likes_enabled = 7 in react_kinds
+    
+    if CYBERHERD_DEBUG:
+        logger.info(f"🎯 Engagement settings: repost_enabled={repost_enabled}, likes_enabled={likes_enabled}")
 
-    if react_kinds and tracked_event_ids:
-        filters.append({"kinds": react_kinds, "#e": tracked_event_ids, "since": since})
-        if 6 in react_kinds and repost_enabled:
-            filters.append({"kinds": [6], "since": since, "limit": CYBERHERD_BROAD_REPOST_LIMIT})
+    # SIMPLIFIED APPROACH: Use broad filters and validate in processing
+    # This is simpler and works even without tracked_event_ids
+    
+    # Add broad repost filter (kind 6)
+    if repost_enabled:
+        # Catch all reposts and validate in processing if they reference tracked events
+        filters.append({"kinds": [6], "since": since, "limit": CYBERHERD_BROAD_REPOST_LIMIT})
+        _dbg(f"Added broad repost filter (limit={CYBERHERD_BROAD_REPOST_LIMIT})")
+    
+    # Add broad reaction filter (kind 7)
+    if likes_enabled:
+        # Reactions can be numerous, so use a reasonable limit
+        # Processing will validate if they reference tracked events
+        filters.append({"kinds": [7], "since": since, "limit": CYBERHERD_BROAD_REACTION_LIMIT})
+        _dbg(f"Added broad reaction filter (limit={CYBERHERD_BROAD_REACTION_LIMIT})")
+    
+    # Note: We no longer need the specific #e filter since processing validates
+    # whether events reference tracked_event_ids. This simplified approach:
+    # - Works even without tracked_event_ids (catches events immediately)
+    # - Doesn't require subscription refresh when tracked_event_ids change
+    # - Processes validation in code rather than at relay filter level
 
     meta = {
         'tags': list(tags_norm),
@@ -443,6 +469,20 @@ async def _issue_websocket_subscription(
         f"Cyberherd: {action} WebSocket subscription {new_sub_id} for user {user_id} "
         f"(filters={len(filters)}, tracked={len(tracked_event_ids)})"
     )
+    
+    # Log filter details in debug mode
+    if CYBERHERD_DEBUG:
+        for i, f in enumerate(filters):
+            kinds = f.get('kinds', [])
+            has_e_tag = '#e' in f
+            has_t_tag = '#t' in f
+            authors = f.get('authors', [])
+            logger.info(
+                f"  Filter {i+1}: kinds={kinds}, "
+                f"authors={[a[:8]+'...' for a in authors] if authors else []}, "
+                f"#e={len(f.get('#e', []))} IDs" if has_e_tag else f"#t={f.get('#t', [])} tags" if has_t_tag else "no #e/#t"
+            )
+    
     if reason:
         _dbg("WebSocket subscription update for %s reason=%s", user_id, reason)
 
@@ -978,17 +1018,17 @@ async def start_subscription_for_user(user_id: str, settings, app):
         logger.debug(f"Could not read today cache for engagement filters (websocket path): {_e}")
         tracked_event_ids = _get_tracked_event_ids(settings)
     
-    # Filter 2: Reposts/reactions (kinds 6/7) - ONLY #e filter, NO #t restriction
+    # Filter 2: Reposts/reactions (kinds 6/7) - Use broad filters
     react_kinds = _build_engagement_kinds(settings)
+    repost_enabled = 6 in react_kinds
+    likes_enabled = 7 in react_kinds
     
-    if react_kinds and tracked_event_ids:
-        # Only filter by #e (tracked event IDs) - no #t tag requirement for reposts/reactions
-        react_filter = {"kinds": react_kinds, "#e": tracked_event_ids, "since": since}
-        filters.append(react_filter)
-        # Add broad kind=6 safety-net subscription for content-only repost detection
-        if 6 in react_kinds:
-            broad_repost_filter = {"kinds": [6], "since": since, "limit": CYBERHERD_BROAD_REPOST_LIMIT}
-            filters.append(broad_repost_filter)
+    # SIMPLIFIED APPROACH: Use broad filters and validate in processing
+    if repost_enabled:
+        filters.append({"kinds": [6], "since": since, "limit": CYBERHERD_BROAD_REPOST_LIMIT})
+    
+    if likes_enabled:
+        filters.append({"kinds": [7], "since": since, "limit": CYBERHERD_BROAD_REACTION_LIMIT})
 
     # Add subscription via nostr_helpers
     if not nostr_helpers.add_subscription(sub_id, filters):
@@ -1548,7 +1588,7 @@ async def _manager_loop(app):
                         )
                         
                         if engagement_kinds:
-                            # Get tracked event IDs from settings
+                            # Get tracked event IDs from settings (for logging only)
                             try:
                                 settings = ctx.get('settings', {})
                                 tracked_event_ids = _get_tracked_event_ids(settings)
@@ -1559,33 +1599,20 @@ async def _manager_loop(app):
                                     f"sample={tracked_event_ids[:3] if tracked_event_ids else 'none'}"
                                 )
                                 
-                                if tracked_event_ids:
-                                    # Only create subscription if we have specific event IDs to track
-                                    # This prevents unnecessary relay queries and ensures efficient filtering
-                                    engagement_filter = {"kinds": engagement_kinds, "#e": tracked_event_ids, "since": since}
-                                    filters.append(engagement_filter)
-                                    # Safety-net: also add a broad kind=6 only filter (no #e) so content-only
-                                    # reposts can be recovered client-side. Use a higher limit controlled
-                                    # by CYBERHERD_BROAD_REPOST_LIMIT.
-                                    if 6 in engagement_kinds:
-                                        broad_repost_filter = {"kinds": [6], "since": since, "limit": CYBERHERD_BROAD_REPOST_LIMIT}
-                                        filters.append(broad_repost_filter)
-                                    logger.info(
-                                        f"✅ Created engagement subscription for user {ctx['user_id']}: "
-                                        f"kinds={engagement_kinds}, tracking {len(tracked_event_ids)} event(s). "
-                                        f"Realtime kind 6/7 detection is now ACTIVE."
-                                    )
-                                    _dbg("Created engagement subscription for user=%s kinds=%s event_count=%d", ctx['user_id'], engagement_kinds, len(tracked_event_ids))
-                                else:
-                                    # Log why no subscription was created
-                                    logger.warning(
-                                        f"⚠️ No engagement subscription created for user {ctx['user_id']}: "
-                                        f"tracked_event_ids is empty (kinds would be {engagement_kinds})"
-                                    )
-                                # Note: No subscription created if tracked_event_ids is empty
-                                # Subscriptions will be created automatically via refresh when:
-                                # 1. Startup initialization populates tracked_event_ids with recent notes
-                                # 2. New notes are detected and auto-added to tracked_event_ids
+                                # SIMPLIFIED APPROACH: Use broad filters and validate in processing
+                                # This works even without tracked_event_ids
+                                if 6 in engagement_kinds:
+                                    filters.append({"kinds": [6], "since": since, "limit": CYBERHERD_BROAD_REPOST_LIMIT})
+                                
+                                if 7 in engagement_kinds:
+                                    filters.append({"kinds": [7], "since": since, "limit": CYBERHERD_BROAD_REACTION_LIMIT})
+                                
+                                logger.info(
+                                    f"✅ Created engagement subscription for user {ctx['user_id']}: "
+                                    f"kinds={engagement_kinds}. "
+                                    f"Realtime kind 6/7 detection is now ACTIVE (broad filter, validates in processing)."
+                                )
+                                _dbg("Created engagement subscription for user=%s kinds=%s (broad filters)", ctx['user_id'], engagement_kinds)
                             except Exception as e:
                                 logger.warning(f"Error creating engagement filter: {e}")
                     
@@ -1682,14 +1709,14 @@ async def _manager_loop(app):
                             
                             if engagement_kinds:
                                 try:
-                                    settings = ctx.get('settings', {})
-                                    tracked_event_ids = _get_tracked_event_ids(settings)
-                                    if tracked_event_ids:
-                                        # Only create subscription if we have specific event IDs to track
-                                        engagement_filter = {"kinds": engagement_kinds, "#e": tracked_event_ids, "since": since}
-                                        filters.append(engagement_filter)
-                                        _dbg("Created engagement subscription (resub) for user=%s kinds=%s event_ids=%d", ctx.get('user_id'), engagement_kinds, len(tracked_event_ids))
-                                    # Note: No subscription created if tracked_event_ids is empty
+                                    # SIMPLIFIED APPROACH: Use broad filters and validate in processing
+                                    if 6 in engagement_kinds:
+                                        filters.append({"kinds": [6], "since": since, "limit": CYBERHERD_BROAD_REPOST_LIMIT})
+                                    
+                                    if 7 in engagement_kinds:
+                                        filters.append({"kinds": [7], "since": since, "limit": CYBERHERD_BROAD_REACTION_LIMIT})
+                                    
+                                    _dbg("Created engagement subscription (resub) for user=%s kinds=%s (broad filters)", ctx.get('user_id'), engagement_kinds)
                                 except Exception as e:
                                     logger.warning(f"Error creating engagement filter (resub): {e}")
                         
