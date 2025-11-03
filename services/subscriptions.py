@@ -994,25 +994,34 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
             return
 
         eff_pub = get_effective_pubkey(settings)
-        
-        # Reject events from the effective pubkey (operator's own actions)
-        # This prevents self-reposts, self-reactions, and self-zaps from counting
-        if eff_pub and pubkey == eff_pub:
-            logger.debug(
-                f"Skipping event {eid[:16]}... kind {kind} from effective pubkey "
-                f"(operator's own action) for user {user_id}"
-            )
-            return
-        
         tags = getattr(settings, "tracked_tags", [])
 
         # kind 1: notes, kind 30311: long-form content
+        # For notes, we WANT events from the effective pubkey (user's own notes)
         if kind in (1, 30311):
+            if CYBERHERD_DEBUG:
+                logger.info(
+                    f"📝 Processing kind {kind} note event {eid[:16]}... from pubkey {pubkey[:16]}... "
+                    f"(user's effective_pubkey: {eff_pub[:16] if eff_pub else 'None'}...) user_id={user_id}"
+                )
             cache = _get_cache(app)
-            await _append_today(cache, user_id, eff_pub, tags, event, app)
+            result = await _append_today(cache, user_id, eff_pub, tags, event, app)
+            if CYBERHERD_DEBUG and result:
+                logger.info(f"✅ Successfully added event {eid[:16]}... to tracked_event_ids for user {user_id}")
+            elif CYBERHERD_DEBUG:
+                logger.info(f"⚠️ Event {eid[:16]}... was not added to tracked_event_ids (check logs above for reason)")
 
         # kind 6: reposts
         elif kind == 6 and getattr(settings, "repost_tracking_enabled", False):
+            # Reject reposts from the effective pubkey (operator's own actions)
+            # This prevents self-reposts from counting
+            if eff_pub and pubkey == eff_pub:
+                logger.debug(
+                    f"Skipping repost event {eid[:16]}... from effective pubkey "
+                    f"(operator's own repost) for user {user_id}"
+                )
+                return
+            
             logger.info(f"🔄 Processing kind 6 repost event {eid[:16] if eid else 'unknown'}... for user {user_id}")
             
             # No timestamp check for kind 6 - we only care if it references a tracked event ID.
@@ -1086,6 +1095,15 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
 
         # kind 7: reactions
         elif kind == 7 and getattr(settings, "likes_tracking_enabled", False):
+            # Reject reactions from the effective pubkey (operator's own actions)
+            # This prevents self-reactions from counting
+            if eff_pub and pubkey == eff_pub:
+                logger.debug(
+                    f"Skipping reaction event {eid[:16]}... from effective pubkey "
+                    f"(operator's own reaction) for user {user_id}"
+                )
+                return
+            
             logger.info(f"🔍 Processing kind 7 reaction event {eid[:16] if eid else 'unknown'}... for user {user_id}")
             
             # No timestamp check for kind 7 - we only care if it references a tracked event ID.
