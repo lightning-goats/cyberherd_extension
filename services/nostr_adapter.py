@@ -868,15 +868,25 @@ async def _process_websocket_message(user_id: str, data: list, settings, app):
 
 
 async def _process_event_message(user_id: str, event: dict, settings, app):
-    """Process EVENT messages and filter for relevant zaps."""
+    """Process EVENT messages (kinds 1, 6, 7).
+    
+    Note: Kind 9735 (zap receipts) are never subscribed to and are handled
+    exclusively via the invoice-listener path.
+    """
     try:
-        # Ignore zap receipts (NIP-57) here — they are handled
-        # via the lnurlp invoice-listener preferred path.
+        # Log engagement events (kinds 6 and 7) for visibility
         try:
-            if int(event.get('kind') or 0) == 9735:
-                return
+            kind = int(event.get('kind') or 0)
         except Exception:
-            pass
+            kind = 0
+            
+        if kind in (6, 7):
+            eid = event.get('id')
+            logger.info(
+                f"📨 WebSocket: Realtime kind {kind} event detected: {eid[:16] if isinstance(eid, str) else eid}... "
+                f"for user {user_id} - forwarding to processor"
+            )
+        
         # Reuse existing event processing logic from subscriptions module
         # But re-fetch latest settings for the user to ensure toggles
         # (repost_tracking_enabled / likes_tracking_enabled) are honored
@@ -1660,6 +1670,8 @@ async def _manager_loop(app):
                         'appended': 0,
                         'initial_done': False,
                         'since': since,
+                        'repost_enabled': ctx.get('repost_tracking_enabled', False),
+                        'likes_enabled': ctx.get('likes_tracking_enabled', False),
                     }
                     _dbg("Added subscription sub=%s user=%s pubkey=%s tags=%s since=%s", sub_id, ctx['user_id'], ctx['eff_pub'], ctx['tags'], since)
                     
@@ -1971,16 +1983,20 @@ async def _event_pump(app):
                                 # Only call the processor when user_id is a valid string
                                 if isinstance(user_id, str) and settings:
                                     eid = ev.get('id')
-                                    # REDUCED VERBOSITY: Only log engagement events in debug mode
-                                    logger.debug(
-                                        f"Forwarding kind {kind} event {eid[:16] if isinstance(eid, str) else eid}... "
-                                        f"for user {user_id}"
+                                    # Log engagement events at INFO level for visibility
+                                    logger.info(
+                                        f"📨 Realtime kind {kind} event detected: {eid[:16] if isinstance(eid, str) else eid}... "
+                                        f"for user {user_id} - forwarding to processor"
                                     )
                                     await process_event_for_user(user_id, ev, settings, app)
                                 elif not isinstance(user_id, str):
                                     logger.warning(f"⚠️ Skipping kind {kind} event: invalid user_id type={type(user_id)}")
                                 elif not settings:
-                                    logger.debug(f"Skipping kind {kind} event for user {user_id}: settings not loaded")
+                                    # CRITICAL: Log at WARNING level if settings not loaded
+                                    logger.warning(
+                                        f"⚠️ Skipping kind {kind} event {ev.get('id', 'unknown')[:16]}... for user {user_id}: "
+                                        f"settings not loaded (cache_miss or DB error)"
+                                    )
                             except Exception as e:
                                 logger.error(f"❌ Error forwarding kind {kind} event to processor for user {user_id}: {e}")
                                 metrics['errors'] += 1
