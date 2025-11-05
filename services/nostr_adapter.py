@@ -1198,6 +1198,24 @@ async def force_requery_for_user(app, user_id: str | None):
                         if isinstance(ev.get('id'), str):
                             appended_ids.append(ev['id'])
                 elif kind in (6, 7):
+                    # CRITICAL: Check if this event was already processed to prevent duplicates
+                    # during recovery. This is the primary defense against double-counting
+                    # reposts and likes when recovery is run multiple times.
+                    event_id = ev.get('id')
+                    if event_id:
+                        try:
+                            if await crud.is_event_processed(user_id, event_id):
+                                logger.debug(
+                                    f"Cyberherd force_requery: Skipping already-processed "
+                                    f"kind {kind} event {event_id[:16]}... for user {user_id}"
+                                )
+                                continue
+                        except Exception as e:
+                            logger.warning(
+                                f"Cyberherd force_requery: Failed to check if event {event_id[:16]}... "
+                                f"was processed for user {user_id}: {e}"
+                            )
+                    
                     await process_event_for_user(user_id, ev, settings, app, recovery_mode=True)
             except Exception:
                 pass
