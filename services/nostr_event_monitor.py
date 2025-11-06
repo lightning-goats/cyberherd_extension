@@ -1,15 +1,16 @@
 """Nostr event monitor using nostrclient relay_manager.
 
-This module provides real-time monitoring of Nostr events (zap receipts,
-reposts, reactions) for tracked notes using the nostrclient extension's
-internal API.
+This module provides real-time monitoring of Nostr events (notes, reposts,
+reactions) for tracked notes using the nostrclient extension's internal API.
 
 Key features:
-- Subscribe to kind 9735 (zap receipts), 6 (reposts), 7 (reactions)
-- Poll nostrclient's message_pool for events
+- Subscribe to kind 1/30311 (notes), 6 (reposts), 7 (reactions)
+- Callback-based event handling via CyberHerdEventRouter
 - Parse and extract relevant data from events
-- Callback-based event handling
 - Dynamic subscription updates
+
+Note: Zap receipts (kind 9735) are NOT monitored here - they're handled
+via LNbits payment webhooks in zap_monitor.py
 """
 
 from __future__ import annotations
@@ -23,6 +24,10 @@ from typing import Any, Callable
 from loguru import logger
 
 from . import nostr_helpers
+
+# Import nostrclient availability check
+NOSTRCLIENT_AVAILABLE = nostr_helpers.check_availability()
+nostr_client = nostr_helpers.get_nostr_client()
 
 
 def _get_midnight_timestamp() -> int:
@@ -63,6 +68,175 @@ def _get_earliest_timestamp_from_dict(note_ids: list[str], timestamps: dict[str,
         return int((datetime.now() - timedelta(days=default_days_ago)).timestamp())  # Local time
 
 
+class CyberHerdEventRouter:
+    """Routes events from nostrclient callbacks to monitors.
+    
+    OPTION A IMPLEMENTATION: Uses nostrclient's callback-based subscribe() API
+    instead of polling message_pool directly.
+    
+    This singleton registers with nostrclient.subscribe() and routes events
+    to the appropriate NostrEventMonitor based on subscription_id.
+    
+    Architecture:
+    - Registers ONE callback with nostrclient.subscribe()
+    - nostrclient polls message_pool and calls our callback
+    - We route each event to the correct monitor's queue
+    - No custom polling code needed
+    
+    Benefits:
+    - Uses nostrclient's intended API (like nwcprovider does)
+    - Events consumed once (no "put it back" pattern)
+    - O(1) routing per event
+    - Shares polling loop with other extensions
+    """
+    
+    _instance: CyberHerdEventRouter | None = None
+    _lock = asyncio.Lock()
+    
+    def __init__(self):
+        """Private constructor. Use get_instance() instead."""
+        self._monitors: dict[str, Any] = {}  # subscription_id -> monitor (any object with _event_queue)
+        self._registered = False
+        
+    @classmethod
+    async def get_instance(cls) -> CyberHerdEventRouter:
+        """Get or create the singleton instance (thread-safe)."""
+        if cls._instance is None:
+            async with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+    
+    async def register_monitor(self, monitor: Any, subscription_ids: list[str]):
+        """Register a monitor to receive events for its subscription IDs.
+        
+        Uses duck typing - monitor just needs to have a _event_queue attribute.
+        This allows both NostrEventMonitor instances and adapter wrappers.
+        
+        Args:
+            monitor: Any object with _event_queue (NostrEventMonitor or wrapper)
+            subscription_ids: List of subscription IDs this monitor owns
+        """
+        for sub_id in subscription_ids:
+            self._monitors[sub_id] = monitor
+        
+        user_id = getattr(monitor, 'user_id', 'unknown')
+        logger.info(
+            f"📝 CyberHerdEventRouter: Registered monitor for user {user_id} "
+            f"with {len(subscription_ids)} subscriptions"
+        )
+        
+        # Register callback with nostrclient on first monitor
+        if not self._registered:
+            await self._register_nostrclient_callback()
+    
+    async def unregister_monitor(self, subscription_ids: list[str]):
+        """Unregister a monitor's subscription IDs.
+        
+        Args:
+            subscription_ids: List of subscription IDs to unregister
+        """
+        for sub_id in subscription_ids:
+            self._monitors.pop(sub_id, None)
+        
+        logger.info(
+            f"🗑️  CyberHerdEventRouter: Unregistered {len(subscription_ids)} subscriptions "
+            f"({len(self._monitors)} remain)"
+        )
+    
+    async def _register_nostrclient_callback(self):
+        """Register with nostrclient's callback-based subscribe system.
+        
+        This follows the pattern from nostrclient/tasks.py and nwcprovider.
+        """
+        try:
+            from lnbits.extensions.nostrclient.router import nostr_client
+        except ImportError:
+            logger.error("Cannot import nostrclient - callback registration failed")
+            return
+        
+        if not nostr_client:
+            logger.error("nostr_client not available - callback registration failed")
+            return
+        
+        logger.info("🔌 CyberHerdEventRouter: Registering callback with nostrclient...")
+        
+        def event_callback(event_msg):
+            """Called by nostrclient for every event.
+            
+            This runs in nostrclient's polling thread, so we schedule
+            the async routing in the event loop.
+            """
+            try:
+                # Get the event loop and schedule routing
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        self._route_event(event_msg),
+                        loop
+                    )
+            except Exception as e:
+                logger.error(f"CyberHerdEventRouter: Error in event_callback: {e}")
+        
+        # Start subscribe loop in background thread (like nwcprovider pattern)
+        import threading
+        
+        def subscribe_thread():
+            """Background thread that runs nostrclient.subscribe()."""
+            try:
+                asyncio.run(
+                    nostr_client.subscribe(
+                        callback_events_func=event_callback,
+                        callback_notices_func=None,
+                        callback_eosenotices_func=None,
+                    )
+                )
+            except Exception as e:
+                logger.error(f"CyberHerdEventRouter: Error in subscribe thread: {e}")
+        
+        t = threading.Thread(
+            target=subscribe_thread,
+            name="CyberHerd-NostrClient-Subscribe",
+            daemon=True
+        )
+        t.start()
+        
+        self._registered = True
+        logger.info("✅ CyberHerdEventRouter: Callback registered with nostrclient")
+    
+    async def _route_event(self, event_msg):
+        """Route an event to the appropriate monitor based on subscription_id.
+        
+        Args:
+            event_msg: EventMessage from nostrclient's message_pool
+        """
+        try:
+            # Extract subscription_id from event message
+            subscription_id = getattr(event_msg, 'subscription_id', None)
+            if not subscription_id:
+                return  # No subscription_id, skip
+            
+            # Find the monitor responsible for this subscription
+            monitor = self._monitors.get(subscription_id)
+            if monitor:
+                # Route to monitor's event queue
+                try:
+                    await asyncio.wait_for(
+                        monitor._event_queue.put(event_msg),
+                        timeout=0.5
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"CyberHerdEventRouter: Event queue full for user {monitor.user_id}, "
+                        f"dropping event"
+                    )
+            # Note: If no monitor found, event is silently discarded
+            # (it's for another extension like nwcprovider)
+            
+        except Exception as e:
+            logger.error(f"CyberHerdEventRouter: Error routing event: {e}")
+
+
 class NostrEventMonitor:
     """Monitor Nostr events for CyberHerd using nostrclient.
     
@@ -90,12 +264,12 @@ class NostrEventMonitor:
         self.subscription_ids: list[str] = []
         self.running = False
         self._event_processing_task: asyncio.Task | None = None
-        self._poll_task: asyncio.Task | None = None
         
-        # AsyncIO Queue for event-driven processing (replaces polling)
+        # AsyncIO Queue for event-driven processing (filled by CyberHerdEventRouter)
         self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
         
         # Event callbacks (set these before starting)
+        self.on_note: Callable | None = None  # For kind 1/30311 notes
         self.on_zap_receipt: Callable | None = None
         self.on_repost: Callable | None = None
         self.on_reaction: Callable | None = None
@@ -113,22 +287,27 @@ class NostrEventMonitor:
         self._max_tracked_events = 1000  # Prevent memory bloat
     
     async def start(self, tracked_note_ids: list[str], author_pubkey: str | None = None, 
-                    enable_zaps: bool = True, enable_reposts: bool = False, 
-                    enable_reactions: bool = False, since_timestamp: int | None = None,
-                    note_timestamps: dict[str, int] | None = None) -> bool:
+                    enable_reposts: bool = False, enable_reactions: bool = False, 
+                    enable_note_tracking: bool = True, tracked_tags: list[str] | None = None, 
+                    since_timestamp: int | None = None, note_timestamps: dict[str, int] | None = None) -> bool:
         """Start monitoring Nostr events for tracked notes.
         
         Args:
             tracked_note_ids: List of note IDs to monitor
-            author_pubkey: Optional author pubkey for additional filtering
-            enable_zaps: Subscribe to kind 9735 zap receipts (default: True)
+            author_pubkey: Optional author pubkey for additional filtering AND for note tracking
             enable_reposts: Subscribe to kind 6 reposts (default: False)
             enable_reactions: Subscribe to kind 7 reactions (default: False)
+            enable_note_tracking: Subscribe to kind 1/30311 notes from author (default: True)
+            tracked_tags: Optional list of hashtags to filter notes by
             since_timestamp: Optional epoch timestamp to filter events from
             note_timestamps: Dict mapping note_id -> created_at timestamp (for event recovery)
             
         Returns:
             True if monitoring started successfully, False otherwise
+            
+        Note:
+            Zap receipts (kind 9735) are NOT subscribed via Nostr - they're monitored
+            via LNbits payment webhooks in zap_monitor.py
         """
         if not NOSTRCLIENT_AVAILABLE or not nostr_client:
             logger.warning("Nostrclient not available, cannot start Nostr monitoring")
@@ -164,35 +343,87 @@ class NostrEventMonitor:
         
         try:
             # Subscribe to enabled event types
-            if enable_zaps:
-                await self._subscribe_zap_receipts(tracked_note_ids, since)
-            else:
-                logger.info(f"⚠️  Zaps disabled for user {self.user_id}, skipping zap subscription")
             
-            if enable_reposts or enable_reactions:
-                # Don't use 'since' for reposts/reactions - they can happen at any time
-                # Using the note's timestamp would miss reposts that happened before monitoring started
-                await self._subscribe_social_events(tracked_note_ids, since=None, enable_reposts=enable_reposts, enable_reactions=enable_reactions)
-            else:
-                logger.info(f"⚠️  Reposts and reactions disabled for user {self.user_id}, skipping social subscription")
+            # Subscribe to user's own notes if enabled and author_pubkey provided
+            if enable_note_tracking and author_pubkey:
+                await self._subscribe_user_notes(author_pubkey, tracked_tags or [], since)
+            elif enable_note_tracking and not author_pubkey:
+                logger.warning(f"⚠️  Note tracking enabled but no author_pubkey provided for user {self.user_id}")
             
-            if not (enable_zaps or enable_reposts or enable_reactions):
-                logger.warning(f"No event types enabled for user {self.user_id}, monitoring will be idle")
+            # Only subscribe to engagement events if we have tracked notes
+            # NOTE: Zap receipts (kind 9735) are NOT subscribed here - zaps are monitored
+            # via LNbits payment system (zap_monitor.py watches payment webhooks)
+            if tracked_note_ids:
+                if enable_reposts or enable_reactions:
+                    # Don't use 'since' for reposts/reactions - they can happen at any time
+                    # Using the note's timestamp would miss reposts that happened before monitoring started
+                    await self._subscribe_social_events(tracked_note_ids, since=None, enable_reposts=enable_reposts, enable_reactions=enable_reactions)
+                else:
+                    logger.info(f"⚠️  Reposts and reactions disabled for user {self.user_id}, skipping social subscription")
+            else:
+                logger.info(f"ℹ️  No tracked notes yet for user {self.user_id}, skipping engagement subscriptions (will be added after notes are detected)")
+            
+            if not (enable_reposts or enable_reactions):
+                logger.info(f"ℹ️  Only note tracking enabled for user {self.user_id} (reposts/reactions disabled)")
             
             # Start background tasks
             self.running = True
-            # Task 1: Poll message_pool and push events to queue
-            self._poll_task = asyncio.create_task(self._poll_message_pool())
-            # Task 2: Process events from queue (event-driven, blocks when empty)
+            
+            # Register this monitor with the CyberHerdEventRouter for callback-based event routing
+            router = await CyberHerdEventRouter.get_instance()
+            await router.register_monitor(self, self.subscription_ids)
+            
+            # Start event processing task (events delivered via _event_queue by router)
             self._event_processing_task = asyncio.create_task(self._process_events())
             
-            logger.info(f"Nostr monitor started for user {self.user_id} (event-driven mode)")
+            logger.info(f"Nostr monitor started for user {self.user_id} (callback-based routing via CyberHerdEventRouter)")
             return True
             
         except Exception as e:
             logger.error(f"Failed to start Nostr monitor for user {self.user_id}: {e}")
             self.running = False
             return False
+    
+    async def _subscribe_user_notes(self, author_pubkey: str, tracked_tags: list[str], since: int | None = None):
+        """Subscribe to kind 1 and 30311 notes from the user's author pubkey.
+        
+        This subscription detects new notes as they're published so they can be
+        added to tracked_event_ids automatically. Without this, the system can't
+        discover new notes until force_requery is called manually.
+        
+        Args:
+            author_pubkey: Hex pubkey of the note author to monitor
+            tracked_tags: List of hashtags to filter by (optional, empty = all notes)
+            since: Timestamp to filter from (for event recovery on restart)
+        """
+        sub_id = f"cyberherd_notes_{self.user_id}"
+        
+        filters = [{
+            "kinds": [1, 30311],  # Regular notes and long-form content
+            "authors": [author_pubkey],
+            "limit": 100,
+        }]
+        
+        # Add hashtag filter if tags are configured
+        if tracked_tags:
+            # Normalize tags (remove # prefix, lowercase)
+            normalized_tags = [t.lstrip('#').lower() for t in tracked_tags if t]
+            if normalized_tags:
+                filters[0]["#t"] = normalized_tags
+        
+        # Add since filter if provided (for event recovery)
+        if since is not None:
+            filters[0]["since"] = since
+        
+        nostr_helpers.add_subscription(sub_id, filters)
+        self.subscription_ids.append(sub_id)
+        
+        tags_str = f", tags={tracked_tags}" if tracked_tags else " (all notes)"
+        since_str = f", since={since} ({datetime.fromtimestamp(since).astimezone().isoformat()})" if since else ""
+        logger.info(
+            f"✅ Subscribed to user notes: {sub_id}, "
+            f"author={author_pubkey[:16]}...{tags_str}{since_str}"
+        )
     
     async def _subscribe_zap_receipts(self, note_ids: list[str], since: int | None = None):
         """Subscribe to kind 9735 zap receipts for tracked notes.
@@ -278,87 +509,6 @@ class NostrEventMonitor:
             f"{kinds_str}{since_str}"
         )
     
-    async def _poll_message_pool(self):
-        """Poll nostrclient's message_pool and push events to our queue.
-        
-        This lightweight poller checks the shared message_pool and transfers
-        events to our AsyncIO queue for event-driven processing. Only events
-        matching our subscription IDs are transferred.
-        """
-        logger.info(f"Starting message pool poller for user {self.user_id}, subscription IDs: {self.subscription_ids}")
-        
-        # Create message pool poller
-        poller = nostr_helpers.create_message_pool_poller()
-        
-        # Log EOSE (End Of Stored Events) messages to understand relay responses
-        eose_count = 0
-        while poller.has_eose_notices():
-            eose_msg = poller.get_eose_notice()
-            if eose_msg and eose_msg.subscription_id in self.subscription_ids:
-                eose_count += 1
-                logger.info(f"📭 EOSE received for subscription {eose_msg.subscription_id} from {eose_msg.url} (relay finished sending stored events)")
-        
-        if eose_count > 0:
-            logger.info(f"📭 Received {eose_count} EOSE messages - relays have finished sending historical events")
-        
-        poll_count = 0
-        while self.running:
-            try:
-                # Check if there are new events in the shared message pool
-                events_found = 0
-                events_checked = 0
-                events_for_us = 0
-                
-                # Limit how many events we check per cycle to prevent infinite loops
-                # when putting non-matching events back into the pool
-                max_checks_per_cycle = 100
-                
-                while poller.has_events() and events_checked < max_checks_per_cycle:
-                    event_msg = poller.get_event()
-                    events_checked += 1
-                    
-                    # Only queue events from our subscriptions
-                    if event_msg and event_msg.subscription_id in self.subscription_ids:
-                        events_for_us += 1
-                        try:
-                            # Non-blocking put with timeout to prevent blocking on full queue
-                            await asyncio.wait_for(
-                                self._event_queue.put(event_msg),
-                                timeout=0.1
-                            )
-                            events_found += 1
-                        except asyncio.TimeoutError:
-                            logger.warning(f"Event queue full for user {self.user_id}, dropping event")
-                            self.events_filtered += 1
-                    elif event_msg:
-                        # PUT IT BACK! This event is for another subscription
-                        # (e.g., NWC, other users, etc.) and needs to stay in the pool
-                        poller.put_event_back(event_msg)
-                
-                if events_for_us > 0:
-                    logger.info(f"✅ Found {events_for_us} cyberherd events (zaps/reposts/reactions) for user {self.user_id}")
-                
-                # Periodically log that we're still polling
-                poll_count += 1
-                if poll_count % 120 == 0:  # Every ~60 seconds (assuming 0.5s sleep)
-                    logger.debug(f"Poll active for user {self.user_id}, checked {events_checked} events this cycle, "
-                                f"subscriptions: {self.subscription_ids}, running: {self.running}")
-                
-                # Log every 10 seconds if we're checking events but none are for us
-                if poll_count % 20 == 0 and events_checked > 0 and events_for_us == 0:
-                    logger.info(f"🔍 Polling: checked {events_checked} events in message pool, "
-                               f"none matched our subscriptions {self.subscription_ids} (user: {self.user_id})")
-                
-                # Adaptive sleep: short when processing events, longer when idle
-                if events_found > 0:
-                    await asyncio.sleep(0.05)  # 50ms - stay responsive when active
-                else:
-                    await asyncio.sleep(0.5)   # 500ms - save CPU when idle
-                
-            except Exception as e:
-                logger.error(f"Error polling message pool for user {self.user_id}: {e}")
-                await asyncio.sleep(1)  # Back off on error
-    
     async def _process_events(self):
         """Process events from the queue in an event-driven manner.
         
@@ -433,7 +583,9 @@ class NostrEventMonitor:
             self.last_event_at = int(datetime.now().timestamp())  # Local time
             
             # Route to appropriate handler
-            if kind == 9735 and self.on_zap_receipt:
+            if kind in (1, 30311) and self.on_note:
+                await self._handle_note(event)
+            elif kind == 9735 and self.on_zap_receipt:
                 await self._handle_zap_receipt(event)
             elif kind == 9735 and not self.on_zap_receipt:
                 logger.warning(f"⚠️  Zap receipt handler not set for user {self.user_id}")
@@ -452,6 +604,32 @@ class NostrEventMonitor:
             logger.error(f"Failed to parse event JSON for user {self.user_id}: {e}")
         except Exception as e:
             logger.error(f"Error handling event for user {self.user_id}: {e}")
+    
+    async def _handle_note(self, event: dict):
+        """Process kind 1 or 30311 note event.
+        
+        Calls the on_note callback with the note event so it can be added to
+        tracked_event_ids via process_event_for_user -> _append_today.
+        
+        Args:
+            event: Note event (kind 1 or 30311)
+        """
+        try:
+            event_id = event.get("id")
+            kind = event.get("kind")
+            pubkey = event.get("pubkey", "")
+            
+            logger.info(
+                f"📝 Note event received (kind {kind}): {event_id[:16] if event_id else 'unknown'}... "
+                f"from {pubkey[:16] if pubkey else 'unknown'}... (user: {self.user_id})"
+            )
+            
+            # Call the note callback
+            if self.on_note:
+                await self.on_note(event)
+            
+        except Exception as e:
+            logger.error(f"Error handling note for user {self.user_id}: {e}")
     
     async def _handle_zap_receipt(self, event: dict):
         """Process kind 9735 zap receipt.
@@ -560,14 +738,12 @@ class NostrEventMonitor:
                             f"⚠️  Invalid 'amount' tag in zap receipt {event_id[:16]}...: {e}. "
                             f"Defaulting to 0. (user: {self.user_id})"
                         )
-                    break
             
             if amount_msats == 0:
                 logger.debug(
                     f"Zap receipt {event_id[:16]}... has zero amount or missing 'amount' tag. "
                     f"Proceeding anyway. (user: {self.user_id})"
                 )
-                    break
             
             amount_sats = amount_msats // 1000
             
@@ -717,24 +893,25 @@ class NostrEventMonitor:
             logger.error(f"Error processing reaction: {e}")
     
     async def update_subscriptions(self, tracked_note_ids: list[str],
-                                   enable_zaps: bool = True, enable_reposts: bool = False,
-                                   enable_reactions: bool = False, since_timestamp: int | None = None,
-                                   note_timestamps: dict[str, int] | None = None):
+                                   enable_reposts: bool = False, enable_reactions: bool = False, 
+                                   since_timestamp: int | None = None, note_timestamps: dict[str, int] | None = None):
         """Update subscriptions with new tracked note IDs and/or event type preferences.
         
         This closes old subscriptions and creates new ones with the
         updated note list and event type settings. Useful when:
         - tracked_event_ids change
-        - user enables/disables event types (zaps, reposts, reactions)
+        - user enables/disables event types (reposts, reactions)
         - recovery mode is triggered
         
         Args:
             tracked_note_ids: New list of note IDs to monitor
-            enable_zaps: Subscribe to kind 9735 zap receipts (default: True)
             enable_reposts: Subscribe to kind 6 reposts (default: False)
             enable_reactions: Subscribe to kind 7 reactions (default: False)
             since_timestamp: Optional epoch timestamp to filter events from
             note_timestamps: Dict mapping note_id -> created_at timestamp (for event recovery)
+            
+        Note:
+            Zaps are monitored via LNbits payment system, not Nostr subscriptions
         """
         if not self.running:
             logger.warning("Cannot update subscriptions, monitor not running")
@@ -747,7 +924,7 @@ class NostrEventMonitor:
             since = _get_earliest_timestamp_from_dict(tracked_note_ids, note_timestamps or {}, default_days_ago=30)
         
         logger.info(f"Updating subscriptions for user {self.user_id}, {len(tracked_note_ids)} notes, "
-                   f"zaps={enable_zaps}, reposts={enable_reposts}, reactions={enable_reactions}, since={since} ({datetime.fromtimestamp(since).astimezone().isoformat()})")  # Show in local time
+                   f"reposts={enable_reposts}, reactions={enable_reactions}, since={since} ({datetime.fromtimestamp(since).astimezone().isoformat()})")  # Show in local time
         
         # Close old subscriptions
         for sub_id in self.subscription_ids:
@@ -761,9 +938,6 @@ class NostrEventMonitor:
         
         # Create new subscriptions
         if tracked_note_ids:
-            if enable_zaps:
-                await self._subscribe_zap_receipts(tracked_note_ids, since)
-            
             if enable_reposts or enable_reactions:
                 # Don't use 'since' for reposts/reactions - they can happen at any time
                 await self._subscribe_social_events(tracked_note_ids, since=None, enable_reposts=enable_reposts, enable_reactions=enable_reactions)
@@ -781,15 +955,11 @@ class NostrEventMonitor:
         
         self.running = False
         
-        # Cancel both tasks
-        if self._poll_task:
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except asyncio.CancelledError:
-                pass
-            self._poll_task = None
+        # Unregister from the CyberHerdEventRouter
+        router = await CyberHerdEventRouter.get_instance()
+        await router.unregister_monitor(self.subscription_ids)
         
+        # Cancel event processing task
         if self._event_processing_task:
             self._event_processing_task.cancel()
             try:
@@ -933,3 +1103,238 @@ def get_all_monitors() -> dict[str, NostrEventMonitor]:
         Dictionary of user_id -> NostrEventMonitor
     """
     return _monitors.copy()
+
+
+# Module-level startup function for app integration
+async def start_monitoring_system(app):
+    """Start the CyberHerd monitoring system with callback-based routing.
+    
+    This replaces nostr_adapter.start_adapter() with the new Option A architecture:
+    - Initializes CyberHerdEventRouter singleton
+    - Creates NostrEventMonitor instances for all users with tracking enabled
+    - Registers monitors with the router for callback-based event delivery
+    
+    Args:
+        app: The FastAPI/Starlette application instance
+    """
+    from .. import crud
+    
+    logger.info("🚀 Starting CyberHerd monitoring system (callback-based routing)")
+    
+    # Initialize the router singleton
+    router = await CyberHerdEventRouter.get_instance()
+    logger.info("✅ CyberHerdEventRouter initialized")
+    
+    # Get all users with tracking enabled
+    try:
+        all_settings = await crud.get_cyberherd_settings_for_all_users()
+        
+        for settings in all_settings:
+            user_id = settings.user_id
+            
+            # Skip if user_id is None
+            if not user_id:
+                continue
+            
+            # Type narrowing: create str-typed variable for closures
+            uid: str = user_id
+            
+            # Get effective pubkey and tracked tags for note subscription
+            from .subscriptions import get_effective_pubkey
+            eff_pub = get_effective_pubkey(settings)
+            tracked_tags = getattr(settings, 'tracked_tags', []) or []
+            
+            # Check if any tracking is enabled
+            reposts_enabled = getattr(settings, 'repost_tracking_enabled', False)
+            likes_enabled = getattr(settings, 'likes_tracking_enabled', False)
+            
+            # Note: We don't check zap_tracking_enabled here because zaps are monitored
+            # via payment system, not Nostr subscriptions
+            if not (reposts_enabled or likes_enabled):
+                # Still create monitor if user has tracked_tags - need note subscription
+                if not tracked_tags:
+                    continue
+            
+            # Get tracked note IDs (may be empty initially if user just enabled tracking)
+            tracked_note_ids = getattr(settings, 'tracked_event_ids', []) or []
+            
+            # CRITICAL: Create monitor even if tracked_note_ids is empty!
+            # The note subscription will detect new notes and populate tracked_event_ids.
+            # Old logic skipped monitor creation if no tracked_note_ids, causing chicken-and-egg problem.
+            if not tracked_note_ids:
+                logger.info(f"User {uid} has no tracked notes yet, but creating monitor to detect new notes")
+            
+            # Create or get monitor
+            monitor = get_monitor(uid)
+            if not monitor:
+                monitor = create_monitor(uid)
+                logger.info(f"Created NostrEventMonitor for user {uid}")
+            
+            # Set up callbacks to use existing event processing logic from subscriptions.py
+            from .subscriptions import process_event_for_user
+            
+            async def on_note(event):
+                logger.info(f"📝 Note event received for user {uid}")
+                await process_event_for_user(uid, event, settings, app, recovery_mode=False)
+            
+            async def on_repost(event):
+                logger.info(f"🔄 Repost event received for user {uid}")
+                await process_event_for_user(uid, event, settings, app, recovery_mode=False)
+            
+            async def on_reaction(event):
+                logger.info(f"❤️  Reaction event received for user {uid}")
+                await process_event_for_user(uid, event, settings, app, recovery_mode=False)
+            
+            monitor.on_note = on_note
+            monitor.on_repost = on_repost if reposts_enabled else None
+            monitor.on_reaction = on_reaction if likes_enabled else None
+            # Note: on_zap_receipt callback removed - zaps monitored via payment system
+            
+            # Start the monitor (with empty tracked_note_ids if none exist yet)
+            success = await monitor.start(
+                tracked_note_ids=tracked_note_ids or [],  # Empty list is ok - note subscription will populate it
+                author_pubkey=eff_pub,  # Needed for note subscription
+                tracked_tags=tracked_tags,  # Needed for note subscription
+                enable_reposts=reposts_enabled,
+                enable_reactions=likes_enabled,
+                enable_note_tracking=True,  # Always enable to detect new notes
+            )
+            
+            if success:
+                logger.info(f"✅ Started monitoring for user {uid} ({len(tracked_note_ids)} notes)")
+            else:
+                logger.error(f"❌ Failed to start monitoring for user {uid}")
+        
+        logger.info(f"🎉 CyberHerd monitoring system started ({len(_monitors)} active monitors)")
+        
+    except Exception as e:
+        logger.error(f"Error starting monitoring system: {e}")
+        raise
+
+
+async def stop_monitoring_system():
+    """Stop all monitors and clean up resources."""
+    logger.info("Stopping CyberHerd monitoring system")
+    
+    for user_id in list(_monitors.keys()):
+        try:
+            monitor = _monitors.get(user_id)
+            if monitor:
+                await monitor.stop()
+                del _monitors[user_id]
+        except Exception as e:
+            logger.warning(f"Error stopping monitor for user {user_id}: {e}")
+
+
+async def force_requery_for_user(app, user_id: str | None):
+    """Force a requery of recent events for a specific user.
+    
+    This function:
+    1. Queries recent notes (kind 1/30311) from the user's effective pubkey
+    2. Auto-populates tracked_event_ids via _append_today
+    3. Queries engagement events (kind 6/7) for those tracked notes
+    4. Processes them via the existing event handlers
+    
+    Args:
+        app: Application instance
+        user_id: User ID to requery for
+        
+    Returns:
+        List of note IDs that were added, or None on error
+    """
+    if not user_id:
+        logger.warning("force_requery_for_user: user_id is None")
+        return None
+    
+    try:
+        from .. import crud
+        from . import nostr_helpers
+        from .subscriptions import process_event_for_user, get_effective_pubkey, _get_cache, _append_today
+        
+        # Get user settings
+        settings = await crud.get_settings(user_id)
+        if not settings:
+            logger.warning(f"force_requery_for_user: No settings found for user {user_id}")
+            return None
+        
+        eff_pub = get_effective_pubkey(settings)
+        if not eff_pub:
+            logger.warning(f"force_requery_for_user: No effective pubkey for user {user_id}")
+            return None
+        
+        tags = getattr(settings, 'tracked_tags', []) or []
+        cache = _get_cache(app)
+        
+        # Check nostr_helpers availability
+        if not nostr_helpers.check_availability():
+            logger.warning("force_requery_for_user: nostr_helpers not available")
+            return None
+        
+        # Query recent notes (kind 1 and 30311)
+        logger.info(f"🔍 Querying recent notes for user {user_id} (pubkey: {eff_pub[:16]}...)")
+        
+        # Query last 7 days of notes
+        import time
+        since_ts = int(time.time()) - (7 * 24 * 60 * 60)
+        
+        filters = {
+            "authors": [eff_pub],
+            "kinds": [1, 30311],
+            "since": since_ts,
+        }
+        
+        events = await nostr_helpers.query_events(filters, limit=100, timeout=10.0)
+        logger.info(f"📥 Retrieved {len(events)} note events for user {user_id}")
+        
+        # Process notes and auto-populate tracked_event_ids
+        appended_ids = []
+        for event in events:
+            result = await _append_today(cache, user_id, eff_pub, tags, event, app)
+            if result:
+                eid = event.get("id")
+                if eid:
+                    appended_ids.append(eid)
+        
+        logger.info(f"✅ Added {len(appended_ids)} note IDs to tracked_event_ids for user {user_id}")
+        
+        # Now query engagement events (reposts and reactions) for tracked notes
+        tracked_note_ids = getattr(settings, 'tracked_event_ids', []) or []
+        if not tracked_note_ids:
+            logger.info(f"No tracked notes found for user {user_id}, skipping engagement query")
+            return appended_ids
+        
+        logger.info(f"🔍 Querying engagement events for {len(tracked_note_ids)} tracked notes")
+        
+        # Query reposts (kind 6) if enabled
+        if getattr(settings, 'repost_tracking_enabled', False):
+            repost_filters = {
+                "kinds": [6],
+                "#e": tracked_note_ids,
+                "since": since_ts,
+            }
+            repost_events = await nostr_helpers.query_events(repost_filters, limit=500, timeout=10.0)
+            logger.info(f"📥 Retrieved {len(repost_events)} repost events for user {user_id}")
+            
+            for event in repost_events:
+                await process_event_for_user(user_id, event, settings, app, recovery_mode=True)
+        
+        # Query reactions (kind 7) if enabled
+        if getattr(settings, 'likes_tracking_enabled', False):
+            reaction_filters = {
+                "kinds": [7],
+                "#e": tracked_note_ids,
+                "since": since_ts,
+            }
+            reaction_events = await nostr_helpers.query_events(reaction_filters, limit=500, timeout=10.0)
+            logger.info(f"📥 Retrieved {len(reaction_events)} reaction events for user {user_id}")
+            
+            for event in reaction_events:
+                await process_event_for_user(user_id, event, settings, app, recovery_mode=True)
+        
+        logger.info(f"✅ Completed force_requery for user {user_id}")
+        return appended_ids
+        
+    except Exception as e:
+        logger.error(f"Error in force_requery_for_user for user {user_id}: {e}")
+        return None
+

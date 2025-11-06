@@ -308,10 +308,10 @@ def _get_cache_note_ids(cache: dict, key, create: bool = False) -> list[str]:
 
     if isinstance(entry, dict):
         # views_api stores {"note_ids": [...], "ts": ...}; maintain that shape
-        note_ids = entry.get("note_ids")
-        if isinstance(note_ids, list):
-            return note_ids
-        note_ids = []
+        note_ids_maybe = entry.get("note_ids")
+        if isinstance(note_ids_maybe, list):
+            return note_ids_maybe
+        note_ids: list[str] = []
         entry["note_ids"] = note_ids
         return note_ids
 
@@ -407,7 +407,7 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
         # Log at INFO level if CYBERHERD_DEBUG is enabled, otherwise DEBUG
         if CYBERHERD_DEBUG:
             logger.info(
-                f"📝 Skipping event {eid[:16]}... from pubkey {event_pubkey[:16]}... "
+                f"📝 Skipping event {eid[:16] if eid else 'unknown'}... from pubkey {event_pubkey[:16] if event_pubkey else 'None'}... "
                 f"(not matching effective pubkey {eff_pub[:16] if eff_pub else 'None'}...) "
                 f"user_id={user_id}"
             )
@@ -705,9 +705,9 @@ async def _tracked_ids_monitor(app, check_interval: float = 10.0):
 
 
 async def _authoritative_tag_subscription(app):  # kept for backward import paths
-    # Delegate start to adapter (idempotent)
-    from . import nostr_adapter
-    await nostr_adapter.start_adapter(app)
+    # NEW: Use callback-based monitoring system instead of adapter
+    from .nostr_event_monitor import start_monitoring_system
+    await start_monitoring_system(app)
 
 def start_subscriptions(app):
     """Start cyberherd subscriptions.
@@ -791,55 +791,6 @@ def start_subscriptions(app):
                 # Give the manager loop a moment to process the refresh
                 await asyncio.sleep(1)
                 
-                # Register a simple callback with nostr_adapter so it can notify
-                # this module when it considers updating filters. The callback
-                # will trigger a subscription refresh which the adapter already
-                # responds to via its manager loop.
-                try:
-                    from . import nostr_adapter
-
-                    def _adapter_notify_cb(a, reason=None):
-                        try:
-                            trigger_subscription_refresh(a, reason=f"adapter_notify:{reason}")
-                        except Exception:
-                            pass
-
-                    try:
-                        nostr_adapter.register_filter_update_callback(_adapter_notify_cb)
-                    except Exception:
-                        pass
-                    try:
-                        # Register a richer provider so the adapter can request
-                        # per-user prepared filters (Option A). The provider will
-                        # delegate to the adapter's internal prepare helper if
-                        # available to avoid duplicating logic.
-                        async def _adapter_filter_provider(a, ctx):
-                            try:
-                                # Attempt to use adapter's prepare helper if present
-                                prep = getattr(nostr_adapter, '_prepare_websocket_subscription', None)
-                                if callable(prep):
-                                    # prep expects (user_id, settings, app)
-                                    uid = ctx.get('user_id')
-                                    settings = ctx.get('settings')
-                                    try:
-                                        res = prep(uid, settings, a)
-                                        if asyncio.iscoroutine(res):
-                                            res = await res
-                                        return res
-                                    except Exception:
-                                        return None
-                                return None
-                            except Exception:
-                                return None
-
-                        try:
-                            nostr_adapter.register_filter_provider(_adapter_filter_provider)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
                 logger.info("Cyberherd nostr adapter started")
                 
                 # Start background monitor to watch for tracked_event_ids added later
