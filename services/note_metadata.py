@@ -28,17 +28,18 @@ def extract_30311_address(event: dict) -> str | None:
     if not isinstance(pubkey, str) or not pubkey:
         return None
 
-    d_tag = None
+    # Per NIP-33: d-tag is REQUIRED for parameterized replaceable events
+    # If missing, treat as empty string (default identifier)
+    d_tag = ""
     for tag in event.get("tags") or []:
         if isinstance(tag, list) and len(tag) > 1 and tag[0] == "d":
             candidate = tag[1]
-            if isinstance(candidate, str) and candidate:
+            if isinstance(candidate, str):
                 d_tag = candidate
                 break
 
-    if not d_tag:
-        return None
-
+    # Always return address, using empty string if no d-tag found
+    # This matches NIP-33 spec: missing d-tag = empty string identifier
     return f"30311:{pubkey}:{d_tag}"
 
 

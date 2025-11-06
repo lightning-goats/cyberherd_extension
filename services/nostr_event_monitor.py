@@ -161,19 +161,29 @@ class CyberHerdEventRouter:
         
         logger.info("🔌 CyberHerdEventRouter: Registering callback with nostrclient...")
         
+        # CRITICAL: Get the main event loop BEFORE creating the background thread
+        # The callback needs to schedule work in THIS loop, not a new one
+        try:
+            main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Fallback: try to get the current event loop
+            main_loop = asyncio.get_event_loop()
+        
         def event_callback(event_msg):
             """Called by nostrclient for every event.
             
             This runs in nostrclient's polling thread, so we schedule
-            the async routing in the event loop.
+            the async routing in the main event loop.
+            
+            CRITICAL: Must use main_loop (captured at registration time),
+            NOT asyncio.get_event_loop() which would return the wrong loop.
             """
             try:
-                # Get the event loop and schedule routing
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
+                # Schedule routing in the MAIN event loop (not the subscribe thread's loop)
+                if main_loop.is_running():
                     asyncio.run_coroutine_threadsafe(
                         self._route_event(event_msg),
-                        loop
+                        main_loop
                     )
             except Exception as e:
                 logger.error(f"CyberHerdEventRouter: Error in event_callback: {e}")
@@ -182,7 +192,11 @@ class CyberHerdEventRouter:
         import threading
         
         def subscribe_thread():
-            """Background thread that runs nostrclient.subscribe()."""
+            """Background thread that runs nostrclient.subscribe().
+            
+            This creates its own event loop for the nostrclient.subscribe() call,
+            but events are routed back to the main loop via event_callback.
+            """
             try:
                 asyncio.run(
                     nostr_client.subscribe(
@@ -264,6 +278,7 @@ class NostrEventMonitor:
         self.subscription_ids: list[str] = []
         self.running = False
         self._event_processing_task: asyncio.Task | None = None
+        self._subscription_refresh_task: asyncio.Task | None = None
         
         # AsyncIO Queue for event-driven processing (filled by CyberHerdEventRouter)
         self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
@@ -317,9 +332,20 @@ class NostrEventMonitor:
             logger.warning(f"Nostr monitor already running for user {self.user_id}")
             return True
         
-        if not tracked_note_ids:
-            logger.warning(f"No tracked notes for user {self.user_id}, nothing to monitor")
+        # Allow starting with empty tracked_note_ids if note_tracking is enabled
+        # (the note subscription will populate tracked_event_ids over time)
+        if not tracked_note_ids and not enable_note_tracking:
+            logger.warning(
+                f"No tracked notes for user {self.user_id} and note tracking disabled, "
+                f"nothing to monitor"
+            )
             return False
+        
+        if not tracked_note_ids:
+            logger.info(
+                f"No tracked notes yet for user {self.user_id}, but starting monitor to detect "
+                f"new notes via note subscription"
+            )
         
         # Wait for relays to be connected before subscribing
         if not await self._wait_for_relays(timeout=30):
@@ -355,9 +381,10 @@ class NostrEventMonitor:
             # via LNbits payment system (zap_monitor.py watches payment webhooks)
             if tracked_note_ids:
                 if enable_reposts or enable_reactions:
-                    # Don't use 'since' for reposts/reactions - they can happen at any time
-                    # Using the note's timestamp would miss reposts that happened before monitoring started
-                    await self._subscribe_social_events(tracked_note_ids, since=None, enable_reposts=enable_reposts, enable_reactions=enable_reactions)
+                    # Use 'since' timestamp to establish a baseline - relays need this to properly
+                    # deliver both historical events (from 'since' forward) AND new real-time events
+                    # Without 'since', some relays may not deliver events at all
+                    await self._subscribe_social_events(tracked_note_ids, since=since, enable_reposts=enable_reposts, enable_reactions=enable_reactions)
                 else:
                     logger.info(f"⚠️  Reposts and reactions disabled for user {self.user_id}, skipping social subscription")
             else:
@@ -375,6 +402,9 @@ class NostrEventMonitor:
             
             # Start event processing task (events delivered via _event_queue by router)
             self._event_processing_task = asyncio.create_task(self._process_events())
+            
+            # Start subscription refresh monitor (watches for new tracked notes)
+            self._subscription_refresh_task = asyncio.create_task(self._monitor_subscription_refresh())
             
             logger.info(f"Nostr monitor started for user {self.user_id} (callback-based routing via CyberHerdEventRouter)")
             return True
@@ -401,7 +431,6 @@ class NostrEventMonitor:
         filters = [{
             "kinds": [1, 30311],  # Regular notes and long-form content
             "authors": [author_pubkey],
-            "limit": 100,
         }]
         
         # Add hashtag filter if tags are configured
@@ -440,7 +469,6 @@ class NostrEventMonitor:
         filters = [{
             "kinds": [9735],  # Zap receipts
             "#e": note_ids,   # Zapped note IDs
-            "limit": 100,     # Request up to 100 historical zaps
         }]
         
         # Add since filter if provided (for event recovery)
@@ -491,7 +519,6 @@ class NostrEventMonitor:
         filters = [{
             "kinds": kinds,
             "#e": note_ids,   # Referenced note IDs
-            "limit": 100,     # Request up to 100 historical events per note
         }]
         
         # Add since filter if provided (for event recovery)
@@ -535,6 +562,77 @@ class NostrEventMonitor:
             except Exception as e:
                 logger.error(f"Error processing event for user {self.user_id}: {e}")
                 await asyncio.sleep(0.1)  # Brief backoff on error
+    
+    async def _monitor_subscription_refresh(self):
+        """Monitor for tracked_event_ids changes and refresh subscriptions.
+        
+        This watches for the refresh event signal that's set when new notes are
+        detected and added to tracked_event_ids. When triggered, it fetches the
+        latest settings and updates subscriptions to include the new notes.
+        """
+        from . import subscriptions
+        
+        logger.info(f"Starting subscription refresh monitor for user {self.user_id}")
+        
+        while self.running:
+            try:
+                # Wait for refresh signal (blocks until signal fires)
+                refresh_event = subscriptions.get_refresh_event()
+                if refresh_event:
+                    # Wait for the event to be set (with timeout to check running flag periodically)
+                    try:
+                        await asyncio.wait_for(refresh_event.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        continue  # Timeout, check running flag and try again
+                    
+                    # Event was signaled - refresh our subscriptions
+                    logger.info(f"🔄 Refresh signal received for user {self.user_id}, updating subscriptions...")
+                    
+                    try:
+                        # Get latest settings with updated tracked_event_ids
+                        from .. import crud
+                        settings = await crud.get_settings(self.user_id)
+                        if not settings:
+                            logger.warning(f"Could not load settings for user {self.user_id}")
+                            continue
+                        
+                        tracked_note_ids = getattr(settings, 'tracked_event_ids', []) or []
+                        enable_reposts = getattr(settings, 'repost_tracking_enabled', False)
+                        enable_reactions = getattr(settings, 'likes_tracking_enabled', False)
+                        note_timestamps = getattr(settings, 'note_timestamps', {}) or {}
+                        
+                        logger.info(
+                            f"📝 Updating subscriptions for user {self.user_id}: "
+                            f"{len(tracked_note_ids)} tracked notes, "
+                            f"reposts={enable_reposts}, reactions={enable_reactions}"
+                        )
+                        
+                        # Update subscriptions with new note IDs
+                        await self.update_subscriptions(
+                            tracked_note_ids=tracked_note_ids,
+                            enable_reposts=enable_reposts,
+                            enable_reactions=enable_reactions,
+                            note_timestamps=note_timestamps
+                        )
+                        
+                        logger.info(f"✅ Subscriptions updated for user {self.user_id}")
+                        
+                    except Exception as e:
+                        logger.error(f"Error refreshing subscriptions for user {self.user_id}: {e}")
+                    
+                    # Clear the event so we can wait for the next signal
+                    subscriptions.clear_refresh_event()
+                    
+                else:
+                    # No refresh event available, wait a bit and retry
+                    await asyncio.sleep(5.0)
+                    
+            except asyncio.CancelledError:
+                logger.info(f"Subscription refresh monitor cancelled for user {self.user_id}")
+                break
+            except Exception as e:
+                logger.error(f"Error in subscription refresh monitor for user {self.user_id}: {e}")
+                await asyncio.sleep(5.0)  # Backoff on error
     
     async def _handle_event(self, event_msg):
         """Handle a received event message.
@@ -805,26 +903,19 @@ class NostrEventMonitor:
             if len(unique_e_tags) > 1:
                 logger.info(
                     f"📋 Repost {event_id[:16]}... has {len(e_tags)} 'e' tags ({len(unique_e_tags)} unique): "
-                    f"{[e[:8]+'...' for e in unique_e_tags[:5]]}. Processing all. (user: {self.user_id})"
+                    f"{[e[:8]+'...' for e in unique_e_tags[:5]]}. Will process all. (user: {self.user_id})"
                 )
             
-            # Process each reposted note (callback can filter by tracked notes)
-            for reposted_note_id in unique_e_tags:
-                self.reposts_detected += 1
-                
-                logger.info(
-                    f"Repost detected: {reposter_pubkey[:8]}... reposted {reposted_note_id[:8]}... "
-                    f"(event: {event_id[:16]}..., user: {self.user_id})"
-                )
-                
-                # Call callback if set
-                if self.on_repost:
-                    await self.on_repost(
-                        reposter_pubkey=reposter_pubkey,
-                        reposted_note_id=reposted_note_id,
-                        event_id=event_id,
-                        event=event
-                    )
+            # Log detection
+            self.reposts_detected += 1
+            logger.info(
+                f"Repost detected: {reposter_pubkey[:8]}... reposted {len(unique_e_tags)} note(s) "
+                f"(event: {event_id[:16]}..., user: {self.user_id})"
+            )
+            
+            # Call callback ONCE with the full event - let it extract and process all e_tags
+            if self.on_repost:
+                await self.on_repost(event)
                 
         except Exception as e:
             logger.error(f"Error processing repost: {e}")
@@ -867,27 +958,19 @@ class NostrEventMonitor:
             if len(unique_e_tags) > 1:
                 logger.info(
                     f"📋 Reaction {event_id[:16]}... has {len(e_tags)} 'e' tags ({len(unique_e_tags)} unique): "
-                    f"{[e[:8]+'...' for e in unique_e_tags[:5]]}. Processing all. (user: {self.user_id})"
+                    f"{[e[:8]+'...' for e in unique_e_tags[:5]]}. Will process all. (user: {self.user_id})"
                 )
             
-            # Process each reacted note (callback can filter by tracked notes)
-            for reacted_note_id in unique_e_tags:
-                self.reactions_detected += 1
-                
-                logger.info(
-                    f"Reaction detected: {reactor_pubkey[:8]}... reacted '{reaction_content}' "
-                    f"to {reacted_note_id[:8]}... (event: {event_id[:16]}..., user: {self.user_id})"
-                )
-                
-                # Call callback if set
-                if self.on_reaction:
-                    await self.on_reaction(
-                        reactor_pubkey=reactor_pubkey,
-                        reacted_note_id=reacted_note_id,
-                        reaction_content=reaction_content,
-                        event_id=event_id,
-                        event=event
-                    )
+            # Log detection
+            self.reactions_detected += 1
+            logger.info(
+                f"Reaction detected: {reactor_pubkey[:8]}... reacted '{reaction_content}' "
+                f"to {len(unique_e_tags)} note(s) (event: {event_id[:16]}..., user: {self.user_id})"
+            )
+            
+            # Call callback ONCE with the full event - let it extract and process all e_tags
+            if self.on_reaction:
+                await self.on_reaction(event)
                 
         except Exception as e:
             logger.error(f"Error processing reaction: {e}")
@@ -939,8 +1022,9 @@ class NostrEventMonitor:
         # Create new subscriptions
         if tracked_note_ids:
             if enable_reposts or enable_reactions:
-                # Don't use 'since' for reposts/reactions - they can happen at any time
-                await self._subscribe_social_events(tracked_note_ids, since=None, enable_reposts=enable_reposts, enable_reactions=enable_reactions)
+                # Use 'since' timestamp to establish proper subscription baseline
+                # This ensures relays deliver both historical events (from 'since') AND new real-time events
+                await self._subscribe_social_events(tracked_note_ids, since=since, enable_reposts=enable_reposts, enable_reactions=enable_reactions)
             
             logger.info(f"Updated subscriptions for user {self.user_id}")
         else:
@@ -967,6 +1051,15 @@ class NostrEventMonitor:
             except asyncio.CancelledError:
                 pass
             self._event_processing_task = None
+        
+        # Cancel subscription refresh monitor
+        if self._subscription_refresh_task:
+            self._subscription_refresh_task.cancel()
+            try:
+                await self._subscription_refresh_task
+            except asyncio.CancelledError:
+                pass
+            self._subscription_refresh_task = None
         
         # Clear the queue
         while not self._event_queue.empty():
@@ -1175,15 +1268,21 @@ async def start_monitoring_system(app):
             
             async def on_note(event):
                 logger.info(f"📝 Note event received for user {uid}")
-                await process_event_for_user(uid, event, settings, app, recovery_mode=False)
+                # Reload settings to get current tracked_event_ids
+                current_settings = await crud.get_settings(uid)
+                await process_event_for_user(uid, event, current_settings or settings, app, recovery_mode=False)
             
             async def on_repost(event):
                 logger.info(f"🔄 Repost event received for user {uid}")
-                await process_event_for_user(uid, event, settings, app, recovery_mode=False)
+                # Reload settings to get current tracked_event_ids
+                current_settings = await crud.get_settings(uid)
+                await process_event_for_user(uid, event, current_settings or settings, app, recovery_mode=False)
             
             async def on_reaction(event):
                 logger.info(f"❤️  Reaction event received for user {uid}")
-                await process_event_for_user(uid, event, settings, app, recovery_mode=False)
+                # Reload settings to get current tracked_event_ids
+                current_settings = await crud.get_settings(uid)
+                await process_event_for_user(uid, event, current_settings or settings, app, recovery_mode=False)
             
             monitor.on_note = on_note
             monitor.on_repost = on_repost if reposts_enabled else None

@@ -28,12 +28,12 @@ class CyberherdSettings(BaseModel):
     zap_monitor_mode: str = "websocket"
     # owner whose templates in cyberherd_messaging should be used for rendering
     templates_owner_user: Optional[str] = None
-    # toggle to opt-in to nightly midnight reset behavior (deactivate members + reset splits)
+    # toggle to enable/disable nightly midnight reset behavior (deactivate members + reset splits)
     midnight_reset_enabled: bool = True
     # toggle to enable/disable repost (kind 6) event tracking
-    repost_tracking_enabled: bool = False
+    repost_tracking_enabled: bool = True
     # toggle to enable/disable likes/reactions (kind 7) event tracking
-    likes_tracking_enabled: bool = False
+    likes_tracking_enabled: bool = True
     # minimum sats required for zap to count towards cyberherd membership
     minimum_sats: int = 10
     # optional feeder trigger threshold (sats) supplied by external automation
