@@ -264,12 +264,24 @@ class ZapMonitorService:
     async def start_monitoring(self):
         """Start monitoring for zaps via payment listener.
         
+        The payment listener is started when:
+        - zap_tracking_enabled is true (for processing zaps), OR
+        - send_splits_enabled is true (for automatic splits)
+        
         Nostr event monitoring (reposts/reactions) is handled separately by subscriptions.py.
         """
         # Get user settings
         settings = await crud.get_settings(self.user_id)
-        if not getattr(settings, 'zap_tracking_enabled', False):
-            logger.info(f"Zap tracking not enabled for user {self.user_id}")
+        
+        # Start payment listener if either zap tracking OR automatic splits are enabled
+        zap_tracking = getattr(settings, 'zap_tracking_enabled', False)
+        auto_splits = getattr(settings, 'send_splits_enabled', False)
+        
+        if not zap_tracking and not auto_splits:
+            logger.info(
+                f"Payment listener not needed for user {self.user_id}: "
+                f"zap_tracking_enabled={zap_tracking}, send_splits_enabled={auto_splits}"
+            )
             if self._running:
                 await self.stop_monitoring()
             return
@@ -279,9 +291,12 @@ class ZapMonitorService:
             
         self._running = True
         
-        # Start payment listener for LNURLp zaps (primary zap detection mechanism)
+        # Start payment listener for LNURLp zaps AND automatic splits
         self._payment_listener_task = asyncio.create_task(self.payment_listener())
-        logger.info(f"Started zap monitoring for user {self.user_id}")
+        logger.info(
+            f"Started payment listener for user {self.user_id} "
+            f"(zap_tracking={zap_tracking}, auto_splits={auto_splits})"
+        )
 
     async def stop_monitoring(self):
         """Stop monitoring Nostr events."""
