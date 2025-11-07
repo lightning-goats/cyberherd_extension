@@ -601,87 +601,24 @@ class ZapMonitorService:
                     )
             else:
                 # New member: enforce strict tracking requirements
-                # CRITICAL FIX: Only accept zaps for TODAY's tracked events
-                # Filter tracked_event_ids to only include events from today's local day
+                # Simple rule: If the zapped note is in tracked_event_ids, it's valid
+                # tracked_event_ids only contains notes from TODAY with the required tags
                 tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
-                timestamps_map = getattr(settings, 'tracked_event_timestamps', {}) or {}
                 
-                # Get today's boundaries (UTC-first approach, consistent with subscriptions.py)
-                from .subscriptions import _get_today_boundaries_utc
-                boundaries = _get_today_boundaries_utc()
-                
-                # Filter to only include events from today (local day)
-                today_tracked_notes = []
-                earliest_event_ts = None
-                for note_id in tracked_notes:
-                    note_ts = timestamps_map.get(note_id)
-                    if note_ts and boundaries.is_timestamp_in_local_day(note_ts):
-                        today_tracked_notes.append(note_id)
-                        if earliest_event_ts is None or note_ts < earliest_event_ts:
-                            earliest_event_ts = note_ts
-                
-                logger.info(
-                    f"📅 Zap validation: {len(tracked_notes)} total tracked events, "
-                    f"{len(today_tracked_notes)} from today (local day). "
-                    f"Earliest today event: {earliest_event_ts}"
-                )
-                
-                # Check if target note is in TODAY's tracked events
-                is_tracked = target_note_id in today_tracked_notes
+                # Check if target note is in tracked events
+                is_tracked = target_note_id in tracked_notes
                 
                 if not is_tracked:
                     logger.info(
-                        f"❌ Zap target {target_note_id[:8]}... is NOT in today's tracked events "
-                        f"({len(today_tracked_notes)} events from today). Ignoring zap."
+                        f"❌ Zap target {target_note_id[:8]}... is NOT in tracked_event_ids "
+                        f"({len(tracked_notes)} tracked events). Ignoring zap."
                     )
-                    self.last_error = "note_not_today"
+                    self.last_error = "note_not_tracked"
                     return False
                 
-                # CRITICAL FIX: Validate zap timestamp - must be after earliest event from today
-                # This prevents old zaps from previous days from counting
-                if earliest_event_ts is not None:
-                    # Get payment timestamp (try multiple field names for compatibility)
-                    payment_ts = None
-                    try:
-                        # Try common timestamp fields on payment object
-                        payment_ts_raw = getattr(payment, 'time', None) or getattr(payment, 'created_at', None)
-                        if payment_ts_raw is None:
-                            # If no timestamp field, use current time (best effort)
-                            payment_ts = int(datetime.now(timezone.utc).timestamp())
-                            logger.debug(
-                                f"⚠️  Payment timestamp not available, using current time: {payment_ts}"
-                            )
-                        else:
-                            # Normalize to integer timestamp (handle both datetime objects and int/float timestamps)
-                            if isinstance(payment_ts_raw, datetime):
-                                payment_ts = int(payment_ts_raw.timestamp())
-                            elif isinstance(payment_ts_raw, (int, float)):
-                                payment_ts = int(payment_ts_raw)
-                            else:
-                                # Fallback to current time if unexpected type
-                                payment_ts = int(datetime.now(timezone.utc).timestamp())
-                                logger.debug(
-                                    f"⚠️  Payment timestamp unexpected type {type(payment_ts_raw)}, using current time: {payment_ts}"
-                                )
-                    except Exception as e:
-                        logger.warning(f"Failed to get payment timestamp: {e}")
-                        payment_ts = int(datetime.now(timezone.utc).timestamp())
-                    
-                    if payment_ts < earliest_event_ts:
-                        logger.info(
-                            f"❌ Zap occurred at {payment_ts} (before earliest event at {earliest_event_ts}). "
-                            f"Only zaps after the first tracked event from today are valid. Ignoring zap."
-                        )
-                        self.last_error = "zap_too_old"
-                        return False
-                    else:
-                        logger.debug(
-                            f"✅ Zap timestamp {payment_ts} is after earliest event {earliest_event_ts}"
-                        )
-                
-                # Note is validated as being in today's tracked events and zap timestamp is valid
+                # Note is validated as being in tracked_event_ids
                 logger.debug(
-                    f"✅ Zap target {target_note_id[:16]}... IS in today's tracked notes. "
+                    f"✅ Zap target {target_note_id[:16]}... IS in tracked_event_ids. "
                     f"Proceeding with headbutt processing..."
                 )
             
