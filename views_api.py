@@ -2168,13 +2168,16 @@ async def api_put_member(
     if payload.amount is not None:
         try:
             prev = int(row.get("amount", 0))
-            increase_amt = int(payload.amount)  # Amount is the increase in sats
-            if increase_amt < 0:
-                raise ValueError
-            new_amt = prev + increase_amt
+            new_amt = int(payload.amount)  # For UI edits, this is the new total amount
+            
+            if new_amt < 0:
+                raise ValueError("Amount cannot be negative")
+            
+            # Calculate the increase (could be negative if decreasing)
+            increase_amt = new_amt - prev
             
             # Update amount (member already activated above)
-            logger.info(f"cyberherd: updating member {pubkey[:8]}... amount: {prev} -> {new_amt} (+{increase_amt})")
+            logger.info(f"cyberherd: updating member {pubkey[:8]}... amount: {prev} -> {new_amt} (change: {increase_amt:+d})")
             event_for_storage = tracked_event_id or zap_event_id
             await crud.update_and_activate_member(
                 pubkey,

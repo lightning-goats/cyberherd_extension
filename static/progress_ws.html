@@ -490,12 +490,14 @@
       const MAX_RECONNECT_INTERVAL = 60000; 
       const FETCH_INTERVAL = 16000;
       const SATS_LEFT_DISPLAY_DURATION = 2500; 
-      // Single WebSocket URL for all CyberHerd and payment updates
-      const WS_URL = `ws://192.168.1.161:3002/api/v1/ws/${HERD_WALLET_READ_KEY}`;
-      const API_BASE_URL = 'http://192.168.1.161:8090';
+    // Single WebSocket URL for all CyberHerd and payment updates
+    const WS_URL = `ws://192.168.1.161:3002/api/v1/ws/${HERD_WALLET_READ_KEY}`;
+    const STATUS_URL = 'http://192.168.1.161:3002/lightning_goats/api/v1/status';
+    const CYBERHERD_SETTINGS_URL = 'http://192.168.1.161:3002/cyberherd/api/v1/settings';
+  
       const MAX_PROCESSED_HASHES = 25;
       const MAX_DISPLAYED_MEMBERS = 10; 
-      const BTC_FETCH_INTERVAL = 10000;
+    const STATUS_FETCH_INTERVAL = 10000;
       
       const animationConfig = {
         message: {
@@ -577,6 +579,12 @@
       
       let reconnectInterval = RECONNECT_INTERVAL_BASE;
       let processedPaymentHashes = new Set();
+
+  let lastStatusPayload = null;
+  let statusFetchPromise = null;
+  let statusProgressPercent = null;
+  let cyberherdSettings = null;
+  let cyberherdSettingsFetchPromise = null;
       
       const goats = {
         "Newton": { img: "images/newton.png" },
@@ -640,120 +648,209 @@
         }
       }
       
-      async function fetchGoal() {
-        if (goal <= 0) {
-          try {
-            const data = await fetchData(`${API_BASE_URL}/trigger_amount`);
-            const newGoal = parseFloat(data.trigger_amount);
-            if (!isNaN(newGoal)) {
-              lastSuccessfulGoal = newGoal;
-              goal = newGoal;
-            } else {
-              throw new Error("Invalid trigger amount received");
-            }
-          } catch (error) {
-            goal = lastSuccessfulGoal;
-          }
+      function updateSpotsRemainingDisplay(activeCount, maxMembers) {
+        if (!spotsRemainingElem) {
+          return;
         }
-      }
-      
-      async function fetchBalance() {
-        if (balance <= 0) {
-          try {
-            const data = await fetchData(`${API_BASE_URL}/balance`);
-            if (data && typeof data.balance === 'number' && data.balance >= 0) {
-              const balanceInSats = Math.round(data.balance / 1000);
-              lastSuccessfulBalance = balanceInSats;
-              balance = balanceInSats;
-            } else {
-              balance = lastSuccessfulBalance || 0;
-              throw new Error("Invalid balance data received");
-            }
-          } catch (error) {
-            balance = lastSuccessfulBalance || 0;
-          }
-        }
-        updateSatsLeftDisplay(); 
-      }
-      
-      async function fetchSpotsRemaining() {
-        try {
-          const data = await fetchData('http://192.168.1.161:8090/cyberherd/active_count');
-          if (data && typeof data.active_count === 'number') {
-            const activeCount = data.active_count;
-            const spots = Math.max(0, 3 - activeCount);
-            const displayText = spots === 0 ? 'The CyberHerd is Full' : `CyberHerd spots left: ${spots}`;
-            animateTextUpdate(spotsRemainingElem, 
-                              displayText,
-                              animationConfig.dataUpdate.highlightColor,
-                              animationConfig.dataUpdate.originalColorText,
-                              animationConfig.dataUpdate.duration);
-          } else {
-            spotsRemainingElem.innerText = '';
-          }
-        } catch (error) {
+        
+        // Use provided values or fall back to cyberherdSettings
+        const maxMembersValue = typeof maxMembers === 'number' ? maxMembers : 
+                                 (cyberherdSettings?.max_members ?? 3);
+        const activeCountValue = typeof activeCount === 'number' ? activeCount : 
+                                  (cyberherdSettings?.active_members ?? 0);
+        
+        if (!Number.isNaN(activeCountValue) && !Number.isNaN(maxMembersValue)) {
+          const spots = Math.max(0, maxMembersValue - activeCountValue);
+          const displayText = spots === 0 ? 'The CyberHerd is Full' : `CyberHerd spots left: ${spots}`;
+          animateTextUpdate(
+            spotsRemainingElem,
+            displayText,
+            animationConfig.dataUpdate.highlightColor,
+            animationConfig.dataUpdate.originalColorText,
+            animationConfig.dataUpdate.duration
+          );
+        } else {
           spotsRemainingElem.innerText = '';
         }
-      }      async function fetchBitcoinData() {
+      }
+
+      function updateBitcoinDisplay(priceUsd, percentChange) {
         if (!btcPriceElem || !btcChangeElem) {
           return;
         }
-        try {
-          const data = await fetchData(`${API_BASE_URL}/openhab/bitcoin_data`);
-          if (data && typeof data.btc_usd_price === 'number') {
-            const formattedPrice = data.btc_usd_price.toLocaleString('en-US', {
-              style: 'currency',
-              currency: 'USD',
-              minimumFractionDigits: 0,
-              maximumFractionDigits: 0
-            });
-            animateTextUpdate(
-              btcPriceElem,
-              `BTC: ${formattedPrice}`,
-              animationConfig.dataUpdate.highlightColor,
-              animationConfig.dataUpdate.originalColorText,
-              animationConfig.dataUpdate.duration
-            );
-          } else {
-            btcPriceElem.innerText = 'BTC: --';
-            btcPriceElem.style.color = animationConfig.dataUpdate.originalColorText;
-          }
 
-          if (data && typeof data.btc_price_24h_percent_change === 'number') {
-            const change = data.btc_price_24h_percent_change;
-            const sign = change >= 0 ? '+' : '';
-            const formattedChange = `${sign}${change.toFixed(2)}%`;
-            const newChangeText = `(24h: ${formattedChange})`;
-
-            btcChangeElem.classList.remove('btc-change-positive', 'btc-change-negative');
-
-            let targetColor = animationConfig.dataUpdate.originalColorText;
-            if (change > 0) {
-              targetColor = '#4CAF50';
-              btcChangeElem.classList.add('btc-change-positive');
-            } else if (change < 0) {
-              targetColor = '#F44336';
-              btcChangeElem.classList.add('btc-change-negative');
-            }
-
-            animateTextUpdate(
-              btcChangeElem,
-              newChangeText,
-              animationConfig.dataUpdate.highlightColor,
-              targetColor,
-              animationConfig.dataUpdate.duration
-            );
-          } else {
-            btcChangeElem.classList.remove('btc-change-positive', 'btc-change-negative');
-            btcChangeElem.innerText = '(24h: --)';
-            btcChangeElem.style.color = animationConfig.dataUpdate.originalColorText;
-          }
-        } catch (error) {
+        if (typeof priceUsd === 'number' && Number.isFinite(priceUsd)) {
+          const formattedPrice = priceUsd.toLocaleString('en-US', {
+            style: 'currency',
+            currency: 'USD',
+            minimumFractionDigits: 0,
+            maximumFractionDigits: 0,
+          });
+          animateTextUpdate(
+            btcPriceElem,
+            `BTC: ${formattedPrice}`,
+            animationConfig.dataUpdate.highlightColor,
+            animationConfig.dataUpdate.originalColorText,
+            animationConfig.dataUpdate.duration
+          );
+        } else {
           btcPriceElem.innerText = 'BTC: --';
-          btcChangeElem.innerText = '(24h: --)';
-          btcChangeElem.classList.remove('btc-change-positive', 'btc-change-negative');
           btcPriceElem.style.color = animationConfig.dataUpdate.originalColorText;
+        }
+
+        if (typeof percentChange === 'number' && Number.isFinite(percentChange)) {
+          const sign = percentChange >= 0 ? '+' : '';
+          const formattedChange = `${sign}${percentChange.toFixed(2)}%`;
+          const newChangeText = `(24h: ${formattedChange})`;
+
+          btcChangeElem.classList.remove('btc-change-positive', 'btc-change-negative');
+
+          let targetColor = animationConfig.dataUpdate.originalColorText;
+          if (percentChange > 0) {
+            targetColor = '#4CAF50';
+            btcChangeElem.classList.add('btc-change-positive');
+          } else if (percentChange < 0) {
+            targetColor = '#F44336';
+            btcChangeElem.classList.add('btc-change-negative');
+          }
+
+          animateTextUpdate(
+            btcChangeElem,
+            newChangeText,
+            animationConfig.dataUpdate.highlightColor,
+            targetColor,
+            animationConfig.dataUpdate.duration
+          );
+        } else {
+          btcChangeElem.classList.remove('btc-change-positive', 'btc-change-negative');
+          btcChangeElem.innerText = '(24h: --)';
           btcChangeElem.style.color = animationConfig.dataUpdate.originalColorText;
+        }
+      }
+
+      function applyStatus(status) {
+        if (!status || typeof status !== 'object') {
+          return;
+        }
+
+        lastStatusPayload = status;
+
+        const triggerAmountRaw = status.trigger_amount;
+        const triggerAmount = typeof triggerAmountRaw === 'number' ? triggerAmountRaw : Number(triggerAmountRaw);
+        if (Number.isFinite(triggerAmount) && triggerAmount >= 0) {
+          goal = Math.round(triggerAmount);
+          lastSuccessfulGoal = goal;
+        }
+
+        const balanceRaw = status.balance_sats ?? status.balance_sat ?? status.balance;
+        const balanceValue = typeof balanceRaw === 'number' ? balanceRaw : Number(balanceRaw);
+        if (Number.isFinite(balanceValue) && balanceValue >= 0) {
+          balance = Math.round(balanceValue);
+          lastSuccessfulBalance = balance;
+        }
+
+        const progressRaw = status.progress_percent;
+        const progressValue = typeof progressRaw === 'number' ? progressRaw : Number(progressRaw);
+        if (Number.isFinite(progressValue)) {
+          statusProgressPercent = progressValue;
+        } else {
+          statusProgressPercent = null;
+        }
+
+        const activeMembersRaw = status.active_members;
+        const activeMembers = typeof activeMembersRaw === 'number' ? activeMembersRaw : Number(activeMembersRaw);
+        const maxMembersValue = cyberherdSettings?.max_members ?? 3;
+        updateSpotsRemainingDisplay(
+          Number.isFinite(activeMembers) ? activeMembers : undefined,
+          maxMembersValue
+        );
+
+        const priceUsdRaw = status.btc_price_usd;
+        const priceUsd = typeof priceUsdRaw === 'number' ? priceUsdRaw : Number(priceUsdRaw);
+        const percentChangeRaw = status.btc_24h_change;
+        const percentChange = typeof percentChangeRaw === 'number' ? percentChangeRaw : Number(percentChangeRaw);
+        updateBitcoinDisplay(
+          Number.isFinite(priceUsd) ? priceUsd : undefined,
+          Number.isFinite(percentChange) ? percentChange : undefined
+        );
+
+        updateSatsLeftDisplay();
+      }
+
+      async function fetchStatusSnapshot(force = false) {
+        if (!force && statusFetchPromise) {
+          return statusFetchPromise;
+        }
+
+        const headers = {
+          'X-Api-Key': 'd1bd74429c304677abc07cd4559a4197',
+          Accept: 'application/json',
+        };
+
+        statusFetchPromise = (async () => {
+          try {
+            const status = await fetchData(STATUS_URL, { headers });
+            applyStatus(status);
+            return status;
+          } finally {
+            statusFetchPromise = null;
+          }
+        })();
+
+        return statusFetchPromise;
+      }
+
+      async function fetchCyberherdSettings(force = false) {
+        if (!force && cyberherdSettingsFetchPromise) {
+          return cyberherdSettingsFetchPromise;
+        }
+
+        const headers = {
+          'X-Api-Key': HERD_WALLET_READ_KEY,
+          Accept: 'application/json',
+        };
+
+        cyberherdSettingsFetchPromise = (async () => {
+          try {
+            const settings = await fetchData(CYBERHERD_SETTINGS_URL, { headers });
+            cyberherdSettings = settings;
+            console.log('[CyberHerd Settings] Fetched:', settings);
+            
+            // Settings only has max_members, not active_members
+            // Active members count comes from the status endpoint
+            
+            return settings;
+          } catch (error) {
+            console.error('[CyberHerd Settings] Fetch failed:', error);
+            return null;
+          } finally {
+            cyberherdSettingsFetchPromise = null;
+          }
+        })();
+
+        return cyberherdSettingsFetchPromise;
+      }
+
+      async function fetchSpotsRemaining(force = false) {
+        try {
+          // Fetch both status and settings in parallel
+          const [status, settings] = await Promise.all([
+            fetchStatusSnapshot(force),
+            fetchCyberherdSettings(force)
+          ]);
+          
+          if (!status || typeof status.active_members !== 'number') {
+            if (!lastStatusPayload || typeof lastStatusPayload.active_members !== 'number') {
+              updateSpotsRemainingDisplay(undefined, settings?.max_members);
+            }
+            return status ?? null;
+          }
+          return status;
+        } catch (error) {
+          if (!lastStatusPayload || typeof lastStatusPayload.active_members !== 'number') {
+            updateSpotsRemainingDisplay(undefined, cyberherdSettings?.max_members);
+          }
+          return null;
         }
       }
       
@@ -931,12 +1028,14 @@
             return;
         }
 
-        const currentProgressVal = (goal > 0) ? (balance / goal) * 100 : 0;
-        if (activeMessages.length > 0 && currentProgressVal < 100) { // If messages active AND not 100% yet
+    const fallbackProgressVal = goal > 0 ? (balance / goal) * 100 : 0;
+    const hasStatusProgress = typeof statusProgressPercent === 'number' && Number.isFinite(statusProgressPercent);
+    const currentProgressVal = hasStatusProgress ? statusProgressPercent : fallbackProgressVal;
+    if (activeMessages.length > 0 && currentProgressVal < 100) { // If messages active AND not 100% yet
             return; 
         }
 
-        if (goal === 0) {
+    if (!hasStatusProgress && goal === 0) {
             gsap.to(progressFill, { width: '0%', duration: animationConfig.progressBar.updateDuration / 1000 });
             progressFill.classList.remove('is-filling');
             progressFill.classList.remove('shine-effect'); 
@@ -1029,10 +1128,12 @@
                 isFeederAnimating = false; // Reset the flag here
                 progressPercentage.innerText = '0%'; // Reset percentage display
                 // Force balance refresh after feeder reset since balance = 0 now
-                fetchBalance().then(() => {
+                fetchStatusSnapshot(true)
+                  .catch(() => {})
+                  .finally(() => {
                     updateSatsLeftDisplay();   // Update display and potentially progress bar
                     tryDisplayMessage();       // Allow messages to check if they can start
-                });
+                  });
             }
         });
 
@@ -1101,6 +1202,8 @@
               // Always update balance to reflect actual wallet state
               balance = walletBalanceSats;
               lastSuccessfulBalance = balance;
+              statusProgressPercent = null;
+              updateProgressBar();
               console.log('[WebSocket] Balance updated:', {
                 balance: balance,
                 goal: goal,
@@ -1811,9 +1914,12 @@
       }
       
       document.addEventListener('DOMContentLoaded', async function () {
+        console.log('[Init] Starting initialization...');
+        
         try {
           await imageCache.initCache();
-          imageCache.preloadImages(getPreloadImageUrls());
+          const imageUrls = getPreloadImageUrls();
+          imageCache.preloadImages(imageUrls);
           
           updateCurrentTime(); 
           satsLeftElem.innerText = `⚡Loading...⚡`;
@@ -1832,19 +1938,24 @@
           // Initialize single unified WebSocket connection
           initWebSocket();
           
+          // Fetch initial data
+          console.log('[Init] Fetching CyberHerd settings...');
+          await fetchCyberherdSettings(true);
+          console.log('[Init] Fetching status snapshot...');
+          
           const fetchPromises = [
-            fetchGoal(),
-            fetchBalance(),
             fetchSpotsRemaining(),
-            fetchTemperature(),
-            fetchBitcoinData()
+            fetchTemperature()
           ];
           await Promise.allSettled(fetchPromises);
           
           updateSatsLeftDisplay();
           
           setInterval(fetchTemperature, FETCH_INTERVAL);
-          setInterval(fetchBitcoinData, BTC_FETCH_INTERVAL);
+          setInterval(fetchSpotsRemaining, STATUS_FETCH_INTERVAL);
+          setInterval(() => {
+            fetchCyberherdSettings(true).catch(console.error);
+          }, STATUS_FETCH_INTERVAL * 6); // Update settings every minute
           setInterval(updateCurrentTime, 1000);
           setTimeout(() => { imageCache.cleanCache(7); }, 60000); 
           
