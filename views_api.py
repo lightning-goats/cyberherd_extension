@@ -684,9 +684,25 @@ async def api_get_diagnostics(
 
 @cyberherd_api_router.post("/api/v1/recover_events")
 async def api_recover_events(request: Request, wallet_info: WalletTypeInfo = Depends(require_admin_key)):
-    """Trigger recovery of missed zaps (payments) and missed reposts/reactions (kinds 6 & 7) for the authenticated admin wallet.
-
-    This endpoint is idempotent and runs recovery in-process; it will return once recovery tasks are scheduled/completed.
+    """Trigger recovery of qualifying CyberHerd events and zaps.
+    
+    Recovery process:
+    1. Fetch and process today's events (single query handles both):
+       - Notes (kind 1/30311) matching tracked tags → populates tracked_event_ids
+       - Engagement events (kind 6/7 reposts/reactions) for those notes
+    2. Recover missed zaps (payment-based):
+       - Scans payments to herd wallet since midnight
+       - Only processes zaps for notes in tracked_event_ids
+    
+    This endpoint is idempotent and runs recovery in-process.
+    Only processes events and zaps that qualify for CyberHerd:
+    - Notes must be from today and have required tags (#CyberHerd)
+    - Zaps must target notes in tracked_event_ids
+    - Engagement events must reference tracked notes
+    
+    Returns diagnostics showing:
+    - events_recovered: {notes, reposts, reactions, total}
+    - zaps: {processed, errors}
     """
     user_id = wallet_info.wallet.user
 
@@ -700,41 +716,62 @@ async def api_recover_events(request: Request, wallet_info: WalletTypeInfo = Dep
     async def _do_recovery() -> dict:
         diagnostics = {
             "user_id": user_id,
-            "reposts_reactions": {"attempted": False, "processed": 0, "errors": []},
+            "events_recovered": {"attempted": False, "notes": 0, "reposts": 0, "reactions": 0, "total": 0, "errors": []},
             "zaps": {"attempted": False, "processed": 0, "errors": []},
             "messages": []
         }
 
-        # Run subscriptions (reposts/likes) recovery if subscription service available
+        # Step 1: Fetch today's tracked notes and engagement events
+        # Note: force_requery_for_user handles BOTH notes (kind 1/30311) AND engagement (kind 6/7)
+        # in a single pass to avoid duplicate queries
         try:
             from .services.subscriptions import force_requery_for_user
-
-            diagnostics["reposts_reactions"]["attempted"] = True
+            
+            diagnostics["events_recovered"]["attempted"] = True
             try:
-                # Use force_requery_for_user which handles all event recovery (notes + engagement)
+                # force_requery_for_user does:
+                # 1. Query notes (kind 1/30311) matching tracked tags
+                # 2. Process notes to populate tracked_event_ids
+                # 3. Query engagement events (kind 6/7) for those tracked notes
+                # 4. Process engagement events (reposts/reactions)
                 res = await force_requery_for_user(request.app, user_id)
                 if isinstance(res, list):
-                    # force_requery_for_user returns list of event ids
-                    diagnostics["reposts_reactions"]["processed"] = len(res)
-                    diagnostics["messages"].append(f"Reposts/reactions recovery attempted via force_requery_for_user: {len(res)} events")
+                    # res contains all processed event IDs (notes + engagement)
+                    diagnostics["events_recovered"]["total"] = len(res)
+                    
+                    # Get updated settings to count notes vs engagement
+                    try:
+                        updated_settings = await crud.get_settings(user_id)
+                        tracked_note_count = len(getattr(updated_settings, 'tracked_event_ids', []) or [])
+                        engagement_count = len(res) - tracked_note_count if len(res) >= tracked_note_count else 0
+                        
+                        diagnostics["events_recovered"]["notes"] = tracked_note_count
+                        diagnostics["events_recovered"]["reposts"] = engagement_count  # Combined reposts+reactions
+                        
+                        diagnostics["messages"].append(
+                            f"Recovered {len(res)} events from today: "
+                            f"{tracked_note_count} notes, {engagement_count} engagement events (reposts/reactions)"
+                        )
+                    except Exception:
+                        # Fallback if we can't break down the counts
+                        diagnostics["messages"].append(f"Recovered {len(res)} events from today (notes + engagement)")
                 else:
-                    diagnostics["reposts_reactions"]["processed"] = 0
-                    diagnostics["messages"].append("Reposts/reactions recovery attempted via force_requery_for_user")
+                    diagnostics["events_recovered"]["total"] = 0
+                    diagnostics["messages"].append("Event recovery completed (no events found)")
             except Exception as e:
-                msg = f"Failed recovering reposts/reactions for user {user_id}: {e}"
+                msg = f"Failed recovering events for user {user_id}: {e}"
                 logger.warning(msg)
-                diagnostics["reposts_reactions"]["errors"].append(str(e))
+                diagnostics["events_recovered"]["errors"].append(str(e))
                 diagnostics["messages"].append(msg)
         except Exception:
-            logger.debug("Subscriptions recovery not available")
-            diagnostics["messages"].append("Subscriptions recovery not available")
+            logger.debug("Subscriptions service not available for event recovery")
+            diagnostics["messages"].append("Subscriptions service not available")
 
-        # Run zap recovery via zap_monitor if available
+        # Step 2: Recover missed zaps (payment-based, validated against tracked_event_ids)
         try:
             zap_monitor = get_zap_monitor(app=request.app, db=crud, user_id=user_id)
             if zap_monitor:
                 diagnostics["zaps"]["attempted"] = True
-                # Force payment-based recovery when the zap monitor implements it
                 try:
                     settings = await crud.get_settings(user_id)
                 except Exception:
@@ -747,16 +784,16 @@ async def api_recover_events(request: Request, wallet_info: WalletTypeInfo = Dep
                             diagnostics["zaps"]["processed"] = int(resz.get("processed", 0))
                             if resz.get("errors"):
                                 diagnostics["zaps"]["errors"].extend(resz.get("errors") or [])
-                        diagnostics["messages"].append("Zap recovery attempted")
+                        diagnostics["messages"].append(f"Zap recovery: {diagnostics['zaps']['processed']} qualifying zaps processed")
                     except Exception as e:
                         msg = f"Failed recovering zaps for user {user_id}: {e}"
                         logger.warning(msg)
                         diagnostics["zaps"]["errors"].append(str(e))
                         diagnostics["messages"].append(msg)
                 else:
-                    diagnostics["messages"].append("No zap payment recovery available for user")
+                    diagnostics["messages"].append("No zap payment recovery available")
             else:
-                diagnostics["messages"].append("No zap monitor available for user")
+                diagnostics["messages"].append("No zap monitor available")
         except Exception as e:
             msg = f"Zap recovery failed to start for user {user_id}: {e}"
             logger.warning(msg)
@@ -765,7 +802,12 @@ async def api_recover_events(request: Request, wallet_info: WalletTypeInfo = Dep
 
         # Log structured diagnostics for server-side troubleshooting
         try:
-            logger.info(f"Cyberherd recovery diagnostics: user={user_id} reposts={diagnostics['reposts_reactions']} zaps={diagnostics['zaps']} messages={diagnostics['messages']}")
+            logger.info(
+                f"Cyberherd recovery diagnostics: user={user_id} "
+                f"events={diagnostics['events_recovered']} "
+                f"zaps={diagnostics['zaps']} "
+                f"messages={diagnostics['messages']}"
+            )
         except Exception:
             pass
 
@@ -826,7 +868,6 @@ async def api_recover_events(request: Request, wallet_info: WalletTypeInfo = Dep
     # Foreground mode: run and return diagnostics
     diagnostics = await _do_recovery()
     return JSONResponse(status_code=HTTPStatus.OK, content={"ok": True, "diagnostics": diagnostics})
-
 
 
 @cyberherd_api_router.post("/api/v1/pay_members")

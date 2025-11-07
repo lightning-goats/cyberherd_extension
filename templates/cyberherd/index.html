@@ -100,11 +100,10 @@
             <h5 class="text-subtitle1 q-my-none">Cyberherd Members</h5>
           </div>
           <div class="col-auto">
-            <q-btn flat color="grey" @click="refreshMembers">Refresh</q-btn>
+            <q-btn flat color="blue" @click="refreshMembers">Recover</q-btn>
             <q-btn flat color="primary" @click="openAddDialog">Add Member</q-btn>
             <q-btn flat color="teal" @click="recomputeSplits">Recompute Splits</q-btn>
             <q-btn flat color="red" @click="confirmReset">Reset Today</q-btn>
-            <q-btn flat color="blue" @click="triggerRecovery">Recover Events</q-btn>
           </div>
         </div>
         <q-table dense flat :rows="cyberherdData.members" row-key="pubkey" :columns="cyberherdData.columns">

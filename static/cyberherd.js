@@ -473,12 +473,12 @@ window.app = Vue.createApp({
       try {
         const authKey = this.getAuthKey()
         if (authKey) {
-          // Trigger backend recovery of zaps and kinds 6/7 before refreshing UI
+          // Trigger backend recovery of today's notes, zaps, and kinds 6/7 before refreshing UI
           try {
             // Show a modal spinner while recovery runs
             this.$q.dialog({
               component: {
-                template: `<div style="padding:18px;text-align:center;"><q-spinner-dots size="48px"/><div style="margin-top:12px">Running recovery...</div></div>`
+                template: `<div style="padding:18px;text-align:center;"><q-spinner-dots size="48px"/><div style="margin-top:12px">Recovering qualifying events and zaps...</div></div>`
               },
               persistent: true
             })
@@ -490,10 +490,16 @@ window.app = Vue.createApp({
               const d = res.data.diagnostics
               const msgs = []
               try {
-                if (d.reposts_reactions && typeof d.reposts_reactions.processed === 'number') msgs.push(`${d.reposts_reactions.processed} reposts/reactions processed`)
-                if (d.reposts_reactions && d.reposts_reactions.errors) msgs.push(`${d.reposts_reactions.errors.length || 0} reposts/reactions errors`)
+                if (d.events_recovered && typeof d.events_recovered.total === 'number') {
+                  const notes = d.events_recovered.notes || 0
+                  const engagement = d.events_recovered.reposts || 0
+                  msgs.push(`${d.events_recovered.total} events recovered (${notes} notes, ${engagement} engagement)`)
+                }
+                if (d.events_recovered && d.events_recovered.errors && d.events_recovered.errors.length) {
+                  msgs.push(`${d.events_recovered.errors.length} event recovery errors`)
+                }
                 if (d.zaps && typeof d.zaps.processed === 'number') msgs.push(`${d.zaps.processed} zaps processed`)
-                if (d.zaps && d.zaps.errors) msgs.push(`${d.zaps.errors.length || 0} zap errors`)
+                if (d.zaps && d.zaps.errors && d.zaps.errors.length) msgs.push(`${d.zaps.errors.length} zap errors`)
               } catch (e) {}
               const summary = msgs.length ? msgs.join(', ') : 'Recovery completed'
               this.$q.notify({ type: 'positive', message: summary })
@@ -535,6 +541,8 @@ window.app = Vue.createApp({
         console.warn('Failed to invoke recovery endpoint', e)
       }
 
+      // The /api/v1/recover_events endpoint handles fetchTodayNotes internally,
+      // but we still need to refresh the UI state after recovery completes
       await this.fetchMembers()
       await this.fetchShares()
       await this.fetchTodayNotes()
@@ -654,25 +662,6 @@ window.app = Vue.createApp({
         LNbits.utils.notifyApiError(e)
       }
     },
-    async triggerRecovery() {
-      try {
-        const ok = confirm('Trigger manual event recovery? This will re-process missed Nostr events and zaps for the current day.')
-        if (!ok) return
-        
-        this.$q.notify({ type: 'info', message: 'Starting recovery...' })
-        
-        const res = await this._cyberherdFetch('POST', '/api/v1/recover_events', this.getAuthKey() || null, {})
-        
-        if (res && res.data) {
-          const msg = res.data.message || 'Recovery completed'
-          this.$q.notify({ type: 'positive', message: msg })
-          await this.refreshMembers()
-        }
-      } catch (e) {
-        LNbits.utils.notifyApiError(e)
-      }
-    }
-    ,
     // Return full websocket path clients can use to subscribe to messages for the configured herd wallet
     getWebsocketPath() {
       try {

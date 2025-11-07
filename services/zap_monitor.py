@@ -1173,60 +1173,28 @@ class ZapMonitorService:
         return True
     
     async def recover_events_since_midnight(self):
-        """Recover events since midnight today by updating subscriptions with 'since' filter.
+        """DEPRECATED: This method is no longer used and should not be called.
         
-        This is useful for:
-        - Server restarts (recover events that happened while offline)
-        - Extension reloads
-        - Initial setup
+        Original purpose: Recover events since midnight by updating Nostr subscriptions.
         
-        The subscriptions will automatically include a 'since' filter set to midnight today,
-        and Nostr relays will send all matching events from that time onwards.
+        Why deprecated:
+        - NostrEventMonitor (self.nostr_monitor) was never implemented
+        - Event monitoring is handled by subscriptions.py WebSocket system
+        - Recovery is now handled by force_requery_for_user() in subscriptions.py
+        - This method references non-existent self.nostr_monitor.update_subscriptions()
+        
+        Migration:
+        - Use force_requery_for_user(app, user_id) from subscriptions.py instead
+        - That function properly queries and processes events from today
+        
+        This method will be removed in a future version.
         """
-        if not self.nostr_monitor or not self._running:
-            logger.warning(f"Cannot recover events - monitor not running for user {self.user_id}")
-            return False
-        
-        try:
-            # Get current settings
-            settings = await crud.get_settings(self.user_id)
-            if not settings:
-                logger.warning(f"No settings found for user {self.user_id}")
-                return False
-            
-            tracked_note_ids = getattr(settings, 'tracked_event_ids', []) or []
-            if not tracked_note_ids:
-                logger.info(f"No tracked notes for user {self.user_id}, nothing to recover")
-                return False
-            
-            # Get event type preferences
-            enable_zaps = getattr(settings, 'zap_tracking_enabled', False)
-            enable_reposts = getattr(settings, 'repost_tracking_enabled', False)  # Note: singular "repost"
-            enable_reactions = getattr(settings, 'likes_tracking_enabled', False)
-            
-            # Calculate midnight timestamp in UTC - Nostr events use UTC timestamps
-            from datetime import datetime, timezone
-            now = datetime.now(timezone.utc)
-            midnight = datetime.combine(now.date(), datetime.min.time()).replace(tzinfo=timezone.utc)
-            since_midnight = int(midnight.timestamp())
-            
-            logger.info(f"Recovering events for user {self.user_id} since midnight ({since_midnight})")
-            
-            # Update subscriptions with 'since' filter
-            await self.nostr_monitor.update_subscriptions(
-                tracked_note_ids,
-                enable_zaps=enable_zaps,
-                enable_reposts=enable_reposts,
-                enable_reactions=enable_reactions,
-                since_timestamp=since_midnight
-            )
-            
-            logger.info(f"Recovery initiated for user {self.user_id}, events since midnight will be processed")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error recovering events for user {self.user_id}: {e}")
-            return False
+        logger.warning(
+            f"DEPRECATED: recover_events_since_midnight() called for user {self.user_id}. "
+            f"Use force_requery_for_user() from subscriptions.py instead. "
+            f"This method will be removed in a future version."
+        )
+        return False
     
     async def _start_nostr_monitoring(self, settings, note_timestamps: dict[str, int] | None = None):
         """Start Nostr event monitoring for tracked notes.
