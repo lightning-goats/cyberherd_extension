@@ -3,6 +3,7 @@
 Nostr-based event monitoring for zaps, reposts, and reactions.
 """
 
+import asyncio
 import os
 import logging
 from datetime import datetime, timedelta
@@ -12,6 +13,7 @@ logger = logging.getLogger(__name__)
 from fastapi import APIRouter, Request
 from starlette.responses import FileResponse
 from starlette.staticfiles import StaticFiles
+from lnbits.tasks import create_permanent_unique_task
 
 # Keep a reference to the db module (which provides init_db) so
 # `init_extension` can call the module-level init helper when needed.
@@ -24,7 +26,7 @@ from .crud import db
 from . import crud
 from .setup import register_services
 from .tasks import cyberherd_tasks
-from .services.subscriptions import start_subscriptions
+from .services.subscriptions import cyberherd_subscription_handler
 from .services.note_metadata import apply_event_address
 from .utils.common import extract_t_tags_from_event, utc_now
 
@@ -35,17 +37,47 @@ from .models import CyberherdMember
 # Define the extension router and include both web UI and API subrouters
 cyberherd_ext: APIRouter = APIRouter(prefix="/cyberherd", tags=["cyberherd"])
 
-# Export scheduled_tasks for LNbits core to pick up
-# This ensures init_extension is called during startup
-def _cyberherd_startup_task(app):
-    """Wrapper to ensure init_extension is called as a scheduled task."""
-    try:
-        logger.info("Cyberherd: _cyberherd_startup_task called")
-        init_extension(app)
-    except Exception as e:
-        logger.error(f"Cyberherd: startup task failed: {e}", exc_info=True)
+# Keep track of background tasks
+scheduled_tasks: list = []
 
-scheduled_tasks = [_cyberherd_startup_task]
+
+def cyberherd_stop():
+    """Stop all cyberherd background tasks."""
+    for task in scheduled_tasks:
+        try:
+            task.cancel()
+        except Exception as ex:
+            logger.warning(f"Error cancelling task: {ex}")
+
+
+def cyberherd_start():
+    """Start cyberherd background tasks using LNbits task system."""
+    logger.info("🚀 Cyberherd: Starting background tasks...")
+    
+    # Create permanent task for subscription handler (like nwcprovider does)
+    task = create_permanent_unique_task("ext_cyberherd_subscriptions", cyberherd_subscription_handler)
+    scheduled_tasks.append(task)
+    logger.info(f"✅ Cyberherd: Subscription handler task created: {task}")
+    
+    # Create permanent task for WebSocket monitor management
+    try:
+        async def _start_websocket_monitors():
+            try:
+                from .services.websocket_monitor_tasks import handle_websocket_monitors
+                # Get app reference from LNbits - we need it for event processing
+                # For now, pass None and monitors will work without app-specific features
+                await handle_websocket_monitors(None)
+            except asyncio.CancelledError:
+                logger.info("Cyberherd: WebSocket monitor task cancelled")
+                raise
+            except Exception as e:
+                logger.error(f"Cyberherd: WebSocket monitor task error: {e}", exc_info=True)
+        
+        ws_task = create_permanent_unique_task("ext_cyberherd_websocket_monitors", _start_websocket_monitors)
+        scheduled_tasks.append(ws_task)
+        logger.info(f"✅ Cyberherd: WebSocket monitor task created: {ws_task}")
+    except Exception as e:
+        logger.error(f"Cyberherd: Failed to create WebSocket monitor task: {e}", exc_info=True)
 
 
 # Match standard pattern (splitpayments): directly include routers without alias.
@@ -83,7 +115,6 @@ async def _debug_routes(request: Request):  # pragma: no cover - diagnostic
     except Exception as e:
         return {"error": str(e)}
 
-__all__ = ["cyberherd_ext", "db"]
 
 cyberherd_static_files = [
     {"path": "/cyberherd/static", "name": "cyberherd_static"},
@@ -115,13 +146,9 @@ def init_extension(app):
         cyberherd_tasks(app)
     except Exception as e:
         logger.warning(f"Cyberherd tasks init failed: {e}")
-    # Start subscriptions (startup scan + realtime stream)
-    try:
-        logger.info("Cyberherd: About to call start_subscriptions()")
-        start_subscriptions(app)
-        logger.info("Cyberherd: start_subscriptions() returned successfully")
-    except Exception as e:
-        logger.error(f"Cyberherd subscriptions failed to start: {e}", exc_info=True)
+    
+    # WebSocket-based event monitoring is started via cyberherd_start() using create_permanent_unique_task
+    # (see cyberherd_start() function above)
     
     # Per-user zap monitors are instantiated lazily when settings accessed; removed legacy singleton.
 
@@ -152,6 +179,7 @@ def init_extension(app):
                 
                 # Now start monitors
                 from .crud import db as _cdb, get_settings
+                from .utils.common import is_extension_enabled_for_user
                 try:
                     rows = await _cdb.fetchall("SELECT user_id FROM cyberherd.settings WHERE zap_tracking_enabled = 1")
                 except Exception as db_err:
@@ -163,6 +191,11 @@ def init_extension(app):
                     uid = r.get('user_id')
                     if not uid:
                         continue
+                    
+                    # Check if user has cyberherd extension enabled
+                    if not await is_extension_enabled_for_user(uid):
+                        continue
+                    
                     try:
                         s = await get_settings(uid)
                     except Exception:
@@ -177,7 +210,8 @@ def init_extension(app):
                         logger.info(f"Cyberherd: started zap monitor user={uid[:12]} mode={zm.mode}")
                     except Exception as ie:
                         logger.warning(f"Cyberherd: failed starting zap monitor for user {uid}: {ie}")
-                logger.info(f"Cyberherd: zap monitor startup complete started={started}")
+                if started > 0:
+                    logger.info(f"Cyberherd: zap monitor startup complete - {started} started")
             except Exception as e:  # pragma: no cover
                 logger.warning(f"Cyberherd multi zap monitoring init failed: {e}")
         asyncio.create_task(_run_multi_start())
@@ -330,19 +364,18 @@ async def _start_zap_monitoring_if_enabled(app):
 
 
 async def _warm_start_today_cache_and_recovery(app):
-    """Populate today's note IDs per user into cache and run missed zap recovery.
-
-    This helps the UI show Today’s Note IDs immediately after startup and ensures
-    payments-based zap recovery runs even if no settings change occurs.
+    """Populate today's note IDs per user into cache for immediate UI display.
+    
+    Note: Automatic recovery removed - users can manually trigger recovery via UI button.
     """
     try:
         from datetime import datetime, timezone
         from . import crud
         from .views_api import _get_cached_effective_pubkey, _utc_midnight_timestamp, _cache_notes
         from .services import nostr_helpers
-        from .services.zap_monitor import get_zap_monitor
+        from .utils.common import is_extension_enabled_for_user
 
-        logger.info("Cyberherd warm start: begin prefetch + recovery")
+        logger.info("Cyberherd warm start: begin prefetch")
         try:
             rows = await crud.db.fetchall("SELECT * FROM cyberherd.settings")
             logger.info(f"Cyberherd warm start: database query succeeded, got {len(rows or [])} rows")
@@ -363,9 +396,15 @@ async def _warm_start_today_cache_and_recovery(app):
         except Exception:
             pass
 
+        processed = 0
         for r in rows:
             try:
                 uid = r.get("user_id")
+                
+                # Check if user has cyberherd extension enabled
+                if not await is_extension_enabled_for_user(uid):
+                    continue
+
                 s = await crud.get_settings(uid)
                 tags = [t.lstrip('#').lower() for t in (getattr(s, 'tracked_tags', []) or [])]
                 eff_pub = _get_cached_effective_pubkey(s)
@@ -396,239 +435,26 @@ async def _warm_start_today_cache_and_recovery(app):
                         _cache_notes(app, (day_key, uid, eff_pub, tagset), ids)
                         _cache_notes(app, (day_key, None, eff_pub, tagset), ids)
                         
-                        # Update settings with tracked_event_ids AND timestamps
+                        # Update settings with tracked_event_ids (current day only)
                         if ids:
                             try:
                                 s.tracked_event_ids = ids
-                                # Merge new timestamps with existing ones (don't overwrite old ones)
-                                existing_timestamps = getattr(s, 'tracked_event_timestamps', {}) or {}
-                                existing_timestamps.update(timestamps)
-                                
-                                # Backfill timestamps for any tracked notes that don't have timestamps yet
-                                # This handles notes added before timestamp tracking was implemented
-                                existing_tracked = getattr(s, 'tracked_event_ids', []) or []
-                                missing_timestamp_notes = [note_id for note_id in existing_tracked if note_id not in existing_timestamps]
-                                
-                                if missing_timestamp_notes:
-                                    logger.info(f"Warm start: backfilling timestamps for {len(missing_timestamp_notes)} notes for user {uid}")
-                                    try:
-                                        # Query for these specific notes to get their timestamps (no time restriction)
-                                        # Include kind 1 (notes) and kind 30311 (long-form content)
-                                        backfill_events = await nostr_helpers.query_events(
-                                            {"kinds": [1, 30311], "ids": missing_timestamp_notes}, 
-                                            limit=len(missing_timestamp_notes), 
-                                            timeout=8.0
-                                        )
-                                        for ev in backfill_events or []:
-                                            if isinstance(ev.get('id'), str):
-                                                try:
-                                                    existing_timestamps[ev['id']] = int(ev.get('created_at') or 0)
-                                                except Exception:
-                                                    pass
-                                                apply_event_address(addresses, ev)
-                                        logger.info(f"Warm start: backfilled {len([n for n in missing_timestamp_notes if n in existing_timestamps])} timestamps")
-                                    except Exception as e:
-                                        logger.warning(f"Warm start: timestamp backfill failed for user {uid}: {e}")
-                                
-                                s.tracked_event_timestamps = existing_timestamps
-                                # Restrict address map to currently tracked notes only
-                                s.tracked_event_addresses = {
-                                    nid: addr for nid, addr in addresses.items() if nid in ids
-                                }
+                                s.tracked_event_timestamps = timestamps
+                                s.tracked_event_addresses = addresses
                                 await crud.upsert_settings(s, uid)
-                                logger.info(f"Warm start: updated tracked_event_ids for user {uid}: {len(ids)} events with timestamps")
+                                logger.info(f"Warm start: updated tracked_event_ids for user {uid}: {len(ids)} events")
+                                processed += 1
                             except Exception as e:
                                 logger.error(f"Warm start: failed to update tracked_event_ids for user {uid}: {e}")
-                        
-                        # Start Nostr event subscriptions if any tracking is enabled
-                        if ids and getattr(s, 'zap_tracking_enabled', False):
-                            try:
-                                zm = get_zap_monitor(app=app, db=crud.db, user_id=uid)
-                                if not zm._running:
-                                    # Start monitoring with timestamps for event recovery
-                                    await zm.start_monitoring_with_timestamps(existing_timestamps)
-                                    logger.info(f"Warm start: started subscriptions for user {uid} with {len(ids)} tracked notes, earliest timestamp: {min(existing_timestamps.values()) if existing_timestamps else 'none'}")
-                            except Exception as e:
-                                logger.warning(f"Warm start: failed to start subscriptions for user {uid}: {e}")
-                        elif ids:
-                            logger.debug(f"Warm start: zap tracking disabled for user {uid}, skipping zap monitor start")
                     except Exception as e:
                         logger.debug(f"Warm start: note prefetch failed user={uid}: {e}")
-                # Note: Zap recovery removed - now using Nostr-only event monitoring
-                # All zaps are detected via kind 9735 events from Nostr relays
             except Exception as e:
                 logger.debug(f"Warm start: settings row error: {e}")
+        
+        if processed > 0:
+            logger.info(f"Cyberherd warm start: complete - {processed} users processed")
     except Exception as e:
         logger.warning(f"Warm start error: {e}")
 
 
-__all__ = ["cyberherd_ext", "db", "init_extension"]
-
-
-def cyberherd_start():
-    """LNbits extension start hook.
-
-    Called by the core after routes are registered. This is the ACTUAL
-    initialization hook that LNbits calls.
-    """
-    try:
-        logger.info("=" * 50)
-        logger.info("CYBERHERD: cyberherd_start() STARTING")
-        logger.info("=" * 50)
-    except Exception:
-        print("CYBERHERD: cyberherd_start called (logger failed)")
-    
-    # Schedule midnight reset recurring task
-    try:
-        from .tasks import cyberherd_tasks
-        cyberherd_tasks()
-    except Exception as e:
-        logger.warning(f"Cyberherd tasks init failed: {e}")
-    
-    # Start zap monitoring for each user with tracking enabled
-    try:
-        import asyncio
-        async def _run_multi_start():
-            try:
-                # Quick check if migrations have completed
-                logger.info("Cyberherd: checking if migrations complete...")
-                from .crud import db as _cdb
-                from lnbits.core.crud import get_db_version
-                
-                # Check migration version
-                db_version = await get_db_version("cyberherd")
-                logger.info(f"Cyberherd: migration version: {db_version.version if db_version else 'NONE - migrations never ran!'}")
-                
-                # Wait briefly for table to be ready (max 5 seconds)
-                max_wait = 5
-                waited = 0
-                table_ready = False
-                
-                while waited < max_wait:
-                    try:
-                        await _cdb.fetchone("SELECT 1 FROM cyberherd.settings LIMIT 1")
-                        table_ready = True
-                        logger.info(f"Cyberherd: settings table ready after {waited}s")
-                        break
-                    except Exception as e:
-                        await asyncio.sleep(1)
-                        waited += 1
-                
-                if not table_ready:
-                    logger.error("=" * 70)
-                    logger.error("CYBERHERD: MIGRATIONS DID NOT RUN!")
-                    logger.error("=" * 70)
-                    logger.error("Possible causes:")
-                    logger.error("1. migrations/ directory exists (should only be migrations.py)")
-                    logger.error("2. Syntax error in migrations.py preventing import")
-                    logger.error("3. No dbversions entry (run: DELETE FROM dbversions WHERE db='cyberherd';)")
-                    logger.error(f"Current migration version: {db_version.version if db_version else 'NONE'}")
-                    logger.error("=" * 70)
-                    return
-                
-                # Wait for nostrclient to initialize relays first
-                logger.info("Cyberherd: waiting for nostrclient relay initialization...")
-                
-                # Use the proper relay readiness helper
-                from .services.relay_readiness import wait_for_relays_ready
-                relay_status = await wait_for_relays_ready(
-                    max_wait_seconds=30.0,
-                    check_interval=2.0,
-                    min_connected_relays=1
-                )
-                
-                if not relay_status['ready']:
-                    # Log detailed status but proceed anyway (non-fatal)
-                    logger.warning(
-                        f"Cyberherd: Proceeding without confirmed relay readiness | "
-                        f"Status: {relay_status['relay_count']} configured, "
-                        f"{relay_status['connected_count']} connected, waited {relay_status['waited_seconds']:.1f}s"
-                    )
-                
-                # Now start monitors (migrations already verified above)
-                from .crud import get_settings
-                rows = await _cdb.fetchall("SELECT user_id FROM cyberherd.settings WHERE zap_tracking_enabled = 1")
-                started = 0
-                for r in rows or []:
-                    uid = r.get('user_id')
-                    if not uid:
-                        continue
-                    try:
-                        s = await get_settings(uid)
-                        if not getattr(s, 'zap_tracking_enabled', False):
-                            continue
-                        from .services.zap_monitor import get_zap_monitor
-                        zm = get_zap_monitor(app=None, db=_cdb, user_id=uid)
-                        await zm.start_monitoring()
-                        started += 1
-                        logger.info(f"Cyberherd: started zap monitor user={uid[:12]} mode={zm.mode}")
-                    except Exception as ie:
-                        logger.warning(f"Cyberherd: failed starting zap monitor for user {uid}: {ie}")
-                logger.info(f"Cyberherd: zap monitor startup complete started={started}")
-            except Exception as e:  # pragma: no cover
-                logger.warning(f"Cyberherd multi zap monitoring init failed: {e}")
-        asyncio.create_task(_run_multi_start())
-    except Exception as e:  # pragma: no cover
-        logger.warning(f"Cyberherd zap monitoring scheduling failed: {e}")
-
-    # Warm start: prefetch today's notes for each user and trigger zap recovery
-    try:
-        import asyncio
-        import traceback
-        async def _run_warm():
-            try:
-                # Wait for migrations to complete
-                logger.info("=" * 50)
-                logger.info("CYBERHERD: WARM START BEGINNING")
-                logger.info("=" * 50)
-                logger.info("Cyberherd: warm start waiting for migrations...")
-                
-                # Quick check if migrations complete
-                from . import crud
-                from lnbits.core.crud import get_db_version
-                
-                db_version = await get_db_version("cyberherd")
-                logger.info(f"Cyberherd warm start: migration version: {db_version.version if db_version else 'NONE'}")
-                
-                # Wait briefly for table (max 5 seconds)
-                max_wait = 5
-                waited = 0
-                table_ready = False
-                
-                while waited < max_wait:
-                    try:
-                        await crud.db.fetchone("SELECT 1 FROM cyberherd.settings LIMIT 1")
-                        table_ready = True
-                        logger.info(f"Cyberherd warm start: table ready after {waited}s")
-                        break
-                    except Exception:
-                        await asyncio.sleep(1)
-                        waited += 1
-                
-                if not table_ready:
-                    logger.error("CYBERHERD WARM START: Migrations did not run! See zap monitor logs for details.")
-                    return
-                
-                logger.info("Cyberherd: warm start task executing...")
-                await _warm_start_today_cache_and_recovery(None)
-                logger.info("=" * 50)
-                logger.info("CYBERHERD: WARM START COMPLETED SUCCESSFULLY")
-                logger.info("=" * 50)
-            except Exception as e:  # pragma: no cover
-                logger.error("=" * 50)
-                logger.error(f"CYBERHERD: WARM START ERROR: {e}")
-                logger.error(f"CYBERHERD: WARM START TRACEBACK:\n{traceback.format_exc()}")
-                logger.error("=" * 50)
-        logger.info("Cyberherd: scheduling warm start task")
-        asyncio.create_task(_run_warm())
-        logger.info("Cyberherd: warm start task scheduled")
-    except Exception as e:
-        import traceback
-        logger.error(f"Cyberherd warm start failed to schedule: {e}")
-        logger.error(f"Cyberherd warm start schedule traceback:\n{traceback.format_exc()}")
-    
-    logger.info("=" * 50)
-    logger.info("CYBERHERD: cyberherd_start() COMPLETED")
-    logger.info("=" * 50)
-    
-    return None
+__all__ = ["cyberherd_ext", "db", "init_extension", "cyberherd_start", "cyberherd_stop"]

@@ -30,7 +30,6 @@ The full user-facing walkthrough—including daily reset behaviour, headbutt rul
 - Metadata caching can be tuned with the environment variables:
   - `CYBERHERD_METADATA_REFRESH_SECONDS` (default 3600 seconds)
   - `CYBERHERD_NIP05_REFRESH_SECONDS` (default 10800 seconds)
-- To debug subscriptions, set `CYBERHERD_DEBUG=true` before launching LNbits.
 
 ## Contributing
 

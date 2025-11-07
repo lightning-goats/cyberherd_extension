@@ -148,6 +148,27 @@ async def get_settings(user_id: str | None = None) -> CyberherdSettings:
         raise
 
 
+async def get_all_settings() -> list[CyberherdSettings]:
+    """Get settings for all users.
+    
+    Returns:
+        List of CyberherdSettings objects for all users
+    """
+    try:
+        rows = await db.fetchall(
+            f"SELECT * FROM {db.references_schema}settings"
+        )
+        return [_row_to_settings(row) for row in rows]
+    except Exception as e:
+        # Table doesn't exist - migrations haven't run yet
+        msg = str(e).lower()
+        if "undefinedtable" in msg or "no such table" in msg or "does not exist" in msg:
+            logger.warning(f"Cyberherd: settings table doesn't exist yet: {e}")
+            return []
+        # For other errors, re-raise
+        raise
+
+
 async def _bootstrap_settings_storage():
     """Idempotently create schema/table/columns/index for settings if missing.
 

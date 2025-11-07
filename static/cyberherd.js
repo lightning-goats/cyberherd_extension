@@ -653,6 +653,24 @@ window.app = Vue.createApp({
       } catch (e) {
         LNbits.utils.notifyApiError(e)
       }
+    },
+    async triggerRecovery() {
+      try {
+        const ok = confirm('Trigger manual event recovery? This will re-process missed Nostr events and zaps for the current day.')
+        if (!ok) return
+        
+        this.$q.notify({ type: 'info', message: 'Starting recovery...' })
+        
+        const res = await this._cyberherdFetch('POST', '/api/v1/recover_events', this.getAuthKey() || null, {})
+        
+        if (res && res.data) {
+          const msg = res.data.message || 'Recovery completed'
+          this.$q.notify({ type: 'positive', message: msg })
+          await this.refreshMembers()
+        }
+      } catch (e) {
+        LNbits.utils.notifyApiError(e)
+      }
     }
     ,
     // Return full websocket path clients can use to subscribe to messages for the configured herd wallet

@@ -707,12 +707,12 @@ async def api_recover_events(request: Request, wallet_info: WalletTypeInfo = Dep
 
         # Run subscriptions (reposts/likes) recovery if subscription service available
         try:
-            from .services import nostr_adapter
+            from .services.subscriptions import force_requery_for_user
 
             diagnostics["reposts_reactions"]["attempted"] = True
             try:
                 # Use force_requery_for_user which handles all event recovery (notes + engagement)
-                res = await nostr_adapter.force_requery_for_user(request.app, user_id)
+                res = await force_requery_for_user(request.app, user_id)
                 if isinstance(res, list):
                     # force_requery_for_user returns list of event ids
                     diagnostics["reposts_reactions"]["processed"] = len(res)
@@ -1344,46 +1344,11 @@ async def api_put_settings(
         except Exception as e:
             logger.warning(f"Failed to create zap monitor update task: {e}")
 
-    # Handle repost/likes recovery when toggles are newly enabled
-    repost_now_enabled = repost_tracking_enabled is True and not repost_tracking_was_enabled
-    likes_now_enabled = likes_tracking_enabled is True and not likes_tracking_was_enabled
-    zap_now_enabled = zap_tracking_enabled is True and not zap_tracking_was_enabled
-    if repost_now_enabled or likes_now_enabled or zap_now_enabled:
-        import asyncio
-        async def _bg_recover_events():
-            try:
-                await asyncio.sleep(0.2)  # Small delay after zap monitor
-                # Recover reposts and likes
-                if repost_now_enabled or likes_now_enabled:
-                    from .services import nostr_adapter
-                    await nostr_adapter.force_requery_for_user(request.app, user_id)
-                    logger.info("Recovered missed reposts/reactions from settings toggle enable via force_requery_for_user")
-
-                # Recover zaps if newly enabled
-                if zap_now_enabled:
-                    zap_monitor = get_zap_monitor(app=request.app, db=crud, user_id=user_id)
-                    # Force payment-based recovery if available
-                    try:
-                        settings_for_recovery = await crud.get_settings(user_id)
-                    except Exception:
-                        settings_for_recovery = None
-                    if settings_for_recovery and hasattr(zap_monitor, "_recover_missed_payment_zaps"):
-                        try:
-                            await zap_monitor._recover_missed_payment_zaps(settings_for_recovery)
-                            logger.info("Recovered missed zaps from settings toggle enable")
-                        except Exception:
-                            pass
-
-            except Exception as e:
-                logger.warning(f"Failed to recover events on toggle enable: {e}")
-        try:
-            # Create task but don't wait for it
-            asyncio.create_task(_bg_recover_events())
-        except Exception as e:
-            logger.warning(f"Failed to create event recovery task: {e}")
-
-    # If the effective pubkey changed (private key set/rotated), schedule a one-time
-    # recovery of missed zaps for today using payments and clear any stale cache entries
+    # When tracking settings change, subscriptions will be automatically refreshed
+    # via the subscription refresh mechanism. Recovery should only be triggered
+    # manually via the /api/v1/recover_events endpoint.
+    
+    # If the effective pubkey changed (private key set/rotated), clear stale cache entries
     try:
         eff_after = _get_cached_effective_pubkey(settings)
         if eff_after and eff_after != eff_before and getattr(settings, "zap_tracking_enabled", False):
@@ -1461,19 +1426,27 @@ async def api_put_settings(
         )
         ch_state["subscriptions_dirty"] = bool(subs_changed)
         request.app.state.cyberherd = ch_state
-        # Event-driven refresh for websocket subscriptions
+        # Trigger immediate WebSocket subscription refresh when settings change
         if subs_changed:
+            import asyncio
+            async def _bg_refresh_websocket():
+                try:
+                    await asyncio.sleep(0.1)  # Small delay to ensure settings are persisted
+                    from .services.nostr_websocket_monitor import trigger_immediate_refresh
+                    await trigger_immediate_refresh(user_id)
+                    logger.info(
+                        f"✅ WebSocket subscriptions refreshed immediately for user {user_id} "
+                        f"after settings change (pubkey, tags, or tracked_event_ids updated)"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to trigger immediate WebSocket refresh for user {user_id}: {e}. "
+                        f"Will be picked up by periodic refresh loop within 60 seconds."
+                    )
             try:
-                from .services import subscriptions as subs
-                if getattr(subs, '_refresh_event', None) is not None:
-                    try:
-                        ev = getattr(subs, '_refresh_event')
-                        if hasattr(ev, 'set'):
-                            ev.set()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                asyncio.create_task(_bg_refresh_websocket())
+            except Exception as e:
+                logger.warning(f"Failed to create WebSocket refresh task: {e}")
     except Exception as e:
         logger.warning(f"Failed to signal subscription refresh: {e}")
     # Try recomputing splits if a source wallet is configured
@@ -1670,32 +1643,7 @@ async def api_get_today_cyberherd_notes(request: Request, auth=Depends(auth_wall
             headers_repr = {k: getattr(headers_iter, k, None) for k in list(getattr(headers_iter, 'keys', lambda: [])())}  # type: ignore
         except Exception:
             headers_repr = "<unavailable>"
-    logger.info(f"today_notes API called: request.headers={headers_repr}")
 
-    # Sanitize auth object to remove sensitive wallet/key information
-    if auth:
-        sanitized_auth = auth.copy()
-        if sanitized_auth.get("type") == "wallet" and "value" in sanitized_auth:
-            wallet_info = sanitized_auth["value"]
-            if hasattr(wallet_info, 'wallet'):
-                wallet = wallet_info.wallet
-                # Create sanitized wallet representation
-                sanitized_wallet = {
-                    'id': wallet.id[:8] + "****" if len(wallet.id) > 8 else "****",
-                    'user': wallet.user[:8] + "****" if len(wallet.user) > 8 else "****",
-                    'name': wallet.name,
-                    'deleted': wallet.deleted,
-                    'created_at': wallet.created_at,
-                    'balance_msat': wallet.balance_msat
-                }
-                sanitized_auth["value"] = type('WalletTypeInfo', (), {
-                    'key_type': wallet_info.key_type,
-                    'wallet': type('Wallet', (), sanitized_wallet)()
-                })()
-        logger.info(f"today_notes API called: auth_type={sanitized_auth.get('type')}, has_wallet={sanitized_auth.get('value') is not None}")
-    else:
-        logger.info(f"today_notes API called: auth={auth}")
-    
     # Resolve user-specific settings if an API key or admin session is present
     user_id = await _resolve_user_from_api_key(request)
     if user_id is None:
@@ -1703,9 +1651,6 @@ async def api_get_today_cyberherd_notes(request: Request, auth=Depends(auth_wall
             user_id = auth["value"].wallet.user
         elif auth and auth.get("type") == "admin":
             user_id = auth["value"].id
-
-    # Log sanitized information (no sensitive headers or auth details)
-    logger.info(f"today_notes API called: method={request.method}, user_id={user_id}, has_api_key={user_id is not None}")
 
     s = await crud.get_settings(user_id)
     try:

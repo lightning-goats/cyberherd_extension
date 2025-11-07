@@ -40,9 +40,6 @@ from .time_utils import (
 from .. import crud
 from ..utils.common import parse_bool_env, parse_int_env, parse_float_env, utc_now
 
-# Enable verbose logging with: export CYBERHERD_DEBUG=true
-CYBERHERD_DEBUG = parse_bool_env("CYBERHERD_DEBUG", False)
-
 # Diagnostics for nostr_helpers interactions
 _helper_diagnostics = {
     'queries_attempted': 0,
@@ -97,12 +94,11 @@ def _record_availability_check(available: bool):
     if not available:
         _helper_diagnostics['unavailable_count'] += 1
 
-def _dbg(msg: str, *args):  # conditional debug helper with proper formatting
-    if CYBERHERD_DEBUG:
-        try:
-            logger.opt(lazy=True).debug("Cyberherd: " + msg.format(*args))
-        except Exception:
-            pass
+def _dbg(msg: str, *args):  # debug helper with proper formatting
+    try:
+        logger.opt(lazy=True).debug("Cyberherd: " + msg.format(*args))
+    except Exception:
+        pass
 
 
 def _hex_to_npub(pubkey: str) -> str | None:
@@ -404,15 +400,11 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
     # Author check
     event_pubkey = event.get("pubkey")
     if event_pubkey != eff_pub:
-        # Log at INFO level if CYBERHERD_DEBUG is enabled, otherwise DEBUG
-        if CYBERHERD_DEBUG:
-            logger.info(
-                f"📝 Skipping event {eid[:16] if eid else 'unknown'}... from pubkey {event_pubkey[:16] if event_pubkey else 'None'}... "
-                f"(not matching effective pubkey {eff_pub[:16] if eff_pub else 'None'}...) "
-                f"user_id={user_id}"
-            )
-        else:
-            _dbg(f"_append_today: author mismatch event_pubkey={event_pubkey} eff_pub={eff_pub}")
+        logger.debug(
+            f"📝 Skipping event {eid[:16] if eid else 'unknown'}... from pubkey {event_pubkey[:16] if event_pubkey else 'None'}... "
+            f"(not matching effective pubkey {eff_pub[:16] if eff_pub else 'None'}...) "
+            f"user_id={user_id}"
+        )
         return False
     
     # UTC-FIRST: Get day boundaries (primary UTC, secondary local)
@@ -429,30 +421,22 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
     
     # Check if event is from user's local "today"
     if not boundaries.is_timestamp_in_local_day(created_at):
-        if CYBERHERD_DEBUG:
-            from datetime import datetime
-            logger.info(
-                f"📅 Skipping event {eid[:16]}... from {datetime.fromtimestamp(created_at).isoformat()} "
-                f"(outside today's local window: {datetime.fromtimestamp(boundaries.local_since_ts).isoformat()} "
-                f"to {datetime.fromtimestamp(boundaries.local_until_ts).isoformat()}) user_id={user_id}"
-            )
-        else:
-            _dbg(f"_append_today: time mismatch created_at={created_at} "
-                 f"local_day=[{boundaries.local_since_ts}, {boundaries.local_until_ts}) "
-                 f"utc_date={boundaries.utc_day_str} eid={eid}")
+        from datetime import datetime
+        logger.debug(
+            f"📅 Skipping event {eid[:16]}... from {datetime.fromtimestamp(created_at).isoformat()} "
+            f"(outside today's local window: {datetime.fromtimestamp(boundaries.local_since_ts).isoformat()} "
+            f"to {datetime.fromtimestamp(boundaries.local_until_ts).isoformat()}) user_id={user_id}"
+        )
         return False
     
     # Use shared tag matching logic
     if not _event_matches_tracked_tags(event, tags_norm):
-        if CYBERHERD_DEBUG:
-            # Extract event's tags for logging
-            event_t_tags = [t[1] for t in event.get('tags', []) if isinstance(t, list) and len(t) >= 2 and t[0] == 't']
-            logger.info(
-                f"🏷️ Skipping event {eid[:16]}... with t-tags {event_t_tags} "
-                f"(not matching tracked tags {tags_norm}) user_id={user_id}"
-            )
-        else:
-            _dbg(f"_append_today: tag mismatch tags_norm={tags_norm} eid={eid}")
+        # Extract event's tags for logging
+        event_t_tags = [t[1] for t in event.get('tags', []) if isinstance(t, list) and len(t) >= 2 and t[0] == 't']
+        logger.debug(
+            f"🏷️ Skipping event {eid[:16]}... with t-tags {event_t_tags} "
+            f"(not matching tracked tags {tags_norm}) user_id={user_id}"
+        )
         return False
 
     # Auto-add detected note event IDs to tracked_event_ids for repost/reaction tracking
@@ -492,24 +476,24 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
                         try:
                             logger.info(
                                 f"🎯 Auto-added tracked event id={eid} for user={user_id} (note author={eff_pub}). "
-                                f"Total tracked events: {len(updated_tracked)}. Triggering kind 6/7 subscription refresh..."
+                                f"Total tracked events: {len(updated_tracked)}. Triggering immediate subscription refresh..."
                             )
                         except Exception:
                             pass
-                        # Refresh signaling unified via app.state flag
-                        # This will cause kind 6/7 subscriptions to be recreated with the new event ID
+                        
+                        # Trigger immediate WebSocket subscription refresh for this user
                         try:
-                            st = getattr(app, "state", app)
-                            setattr(st, "cyberherd_force_subscription_refresh", True)
-                            # Use the shared event holder for reliable cross-module signaling
-                            set_refresh_event()
+                            from .nostr_websocket_monitor import trigger_immediate_refresh
+                            await trigger_immediate_refresh(user_id)
                             logger.info(
-                                f"✅ Subscription refresh triggered for user={user_id} after adding tracked event {eid}. "
-                                f"Kind 6/7 subscriptions will be updated automatically."
+                                f"✅ WebSocket subscriptions refreshed immediately for user={user_id} "
+                                f"after adding tracked event {eid}. Kind 6/7 subscriptions updated."
                             )
-                            _dbg("Set force refresh flag after adding event {} for user {}", eid, user_id)
                         except Exception as e:
-                            logger.warning(f"Failed to set subscription refresh flag: {e}")
+                            logger.warning(
+                                f"Failed to trigger immediate WebSocket refresh for user {user_id}: {e}. "
+                                f"Will be picked up by periodic refresh loop within 60 seconds."
+                            )
         except Exception as e:
             logger.warning(f"Failed to auto-add event {eid} to tracked_event_ids: {e}")
 
@@ -533,6 +517,139 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
     return True
 
 
+async def force_requery_for_user(app, user_id: str) -> list[str]:
+    """Force recovery of missed events from today for a specific user.
+    
+    This function:
+    1. Queries notes (kind 1/30311) from midnight today matching user's tracked tags
+    2. Processes those notes to populate tracked_event_ids
+    3. Queries engagement events (kind 6/7) for tracked notes
+    4. Processes those engagement events
+    
+    Args:
+        app: FastAPI app instance (can be None)
+        user_id: User ID to recover events for
+        
+    Returns:
+        List of event IDs that were processed
+    """
+    logger.info(f"🔄 Starting forced recovery for user {user_id}")
+    processed_ids = []
+    
+    try:
+        # Get user settings
+        settings = await crud.get_settings(user_id)
+        if not settings:
+            logger.warning(f"No settings found for user {user_id}, cannot recover")
+            return []
+        
+        # Check if nostrclient is available
+        if not nostr_helpers.check_availability():
+            logger.warning("nostrclient not available, cannot recover events")
+            _record_availability_check(False)
+            return []
+        
+        _record_availability_check(True)
+        
+        # Get time boundaries for today (UTC-first approach)
+        boundaries = _get_today_boundaries_utc()
+        since_ts = int(boundaries.local_since_ts)  # Midnight today local time
+        
+        # Get tracked tags
+        tracked_tags = getattr(settings, 'tracked_tags', []) or []
+        if not tracked_tags:
+            logger.info(f"No tracked tags for user {user_id}, skipping note recovery")
+        else:
+            # Query notes (kind 1 and 30311) matching tracked tags from midnight
+            logger.debug(f"Querying notes since {since_ts} for tags: {tracked_tags}")
+            
+            filters = {
+                "kinds": [1, 30311],
+                "#t": tracked_tags,
+                "since": since_ts,
+                "limit": 500
+            }
+            
+            try:
+                notes = await nostr_helpers.query_events(filters, limit=500, timeout=10.0)
+                _record_helper_query(True)
+                
+                logger.info(f"Found {len(notes)} notes for user {user_id} recovery")
+                
+                # Process each note
+                for note in notes:
+                    try:
+                        await process_note_for_tracked_tags(
+                            user_id=user_id,
+                            event=note,
+                            app=app
+                        )
+                        note_id = note.get("id")
+                        if note_id:
+                            processed_ids.append(note_id)
+                    except Exception as e:
+                        logger.warning(f"Failed to process note {note.get('id')} during recovery: {e}")
+                        
+            except Exception as e:
+                logger.error(f"Failed to query notes for recovery: {e}")
+                _record_helper_query(False, str(e))
+        
+        # Query engagement events (reposts and reactions) for tracked notes
+        tracked_event_ids = getattr(settings, 'tracked_event_ids', []) or []
+        if not tracked_event_ids:
+            logger.info(f"No tracked events for user {user_id}, skipping engagement recovery")
+        else:
+            logger.debug(f"Querying engagement for {len(tracked_event_ids)} tracked notes")
+            
+            # Build filters for reposts and reactions
+            filters = {
+                "kinds": [6, 7],  # reposts and reactions
+                "#e": tracked_event_ids,
+                "since": since_ts,
+                "limit": 1000
+            }
+            
+            try:
+                engagement_events = await nostr_helpers.query_events(filters, limit=1000, timeout=10.0)
+                _record_helper_query(True)
+                
+                logger.info(f"Found {len(engagement_events)} engagement events for user {user_id} recovery")
+                
+                # Process each engagement event
+                for event in engagement_events:
+                    try:
+                        kind = event.get("kind")
+                        if kind == 6:
+                            await process_repost_for_tracked_notes(
+                                user_id=user_id,
+                                event=event,
+                                app=app
+                            )
+                        elif kind == 7:
+                            await process_reaction_for_tracked_notes(
+                                user_id=user_id,
+                                event=event,
+                                app=app
+                            )
+                        
+                        event_id = event.get("id")
+                        if event_id:
+                            processed_ids.append(event_id)
+                    except Exception as e:
+                        logger.warning(f"Failed to process engagement event {event.get('id')} during recovery: {e}")
+                        
+            except Exception as e:
+                logger.error(f"Failed to query engagement events for recovery: {e}")
+                _record_helper_query(False, str(e))
+        
+        logger.info(f"✅ Recovery completed for user {user_id}: {len(processed_ids)} events processed")
+        return processed_ids
+        
+    except Exception as e:
+        logger.error(f"Recovery failed for user {user_id}: {e}")
+        return processed_ids
+
+
 async def _trigger_recovery_for_all_users(app):
     """Trigger zap recovery for all users with tracking enabled after tracked_event_ids are detected.
     
@@ -541,7 +658,7 @@ async def _trigger_recovery_for_all_users(app):
     """
     try:
         from .. import crud
-        from ..utils.common import get_lnbits_users_function
+        from ..utils.common import get_lnbits_users_function, is_extension_enabled_for_user
         
         # Get all users
         get_users = get_lnbits_users_function()
@@ -554,6 +671,10 @@ async def _trigger_recovery_for_all_users(app):
         recovery_count = 0
         for user in users:
             try:
+                # Check if user has cyberherd extension enabled
+                if not await is_extension_enabled_for_user(user.id):
+                    continue
+                
                 settings = await crud.get_settings(user.id)
                 if not settings:
                     continue
@@ -586,7 +707,7 @@ async def _trigger_recovery_for_all_users(app):
                 logger.warning(f"Error processing recovery for user {user.id}: {e}")
         
         if recovery_count > 0:
-            logger.info(f"Triggered automatic zap recovery for {recovery_count} user(s)")
+            logger.info(f"Automatic zap recovery: {recovery_count} users triggered")
         else:
             logger.info("No users required automatic zap recovery")
             
@@ -619,13 +740,17 @@ async def _any_tracked_event_ids_exist(app) -> bool:
     """
     try:
         from .. import crud
-        from ..utils.common import get_lnbits_users_function
+        from ..utils.common import get_lnbits_users_function, is_extension_enabled_for_user
         
         get_users = get_lnbits_users_function()
 
         users = await get_users() if get_users and asyncio.iscoroutinefunction(get_users) else []
         for user in users:
             try:
+                # Check if user has cyberherd extension enabled
+                if not await is_extension_enabled_for_user(user.id):
+                    continue
+                
                 settings = await crud.get_settings(user.id)
                 if not settings:
                     continue
@@ -658,172 +783,63 @@ async def _wait_for_tracked_event_ids(app, timeout_seconds: float = 30.0) -> boo
     return True  # Return True to avoid breaking existing logic
 
 
-def trigger_subscription_refresh(app, reason: str | None = None):
-    """Signal the adapter manager to refresh subscriptions immediately.
-
-    This sets a flag on app.state and fires the module-level _refresh_event if present.
-    Can be called by other modules when tracked_event_ids are added/updated.
+async def cyberherd_subscription_handler():
+    """Main subscription handler that runs as a permanent background task.
+    
+    This is a minimal handler that just keeps the task alive.
+    The actual monitoring is handled by:
+    - NostrWebSocketMonitor (via handle_websocket_monitors in __init__.py)
+    - ZapMonitorService (payment listener started in __init__.py)
+    
+    This is called by create_permanent_unique_task() in __init__.py during extension startup.
     """
+    import asyncio
+    
+    logger.info("🚀 cyberherd_subscription_handler: Starting (monitoring via NostrWebSocketMonitor)...")
+    
     try:
-        st = getattr(app, 'state', app)
-        setattr(st, 'cyberherd_force_subscription_refresh', True)
-    except Exception:
-        pass
-
-    # Use the shared event holder for reliable cross-module signaling
-    set_refresh_event()
-
-    try:
-        logger.info(f"Triggered subscription refresh{f' - {reason}' if reason else ''}")
-    except Exception:
-        pass
-
-
-async def _tracked_ids_monitor(app, check_interval: float = 10.0):
-    """Background monitor that polls for the appearance of tracked_event_ids.
-
-    When a change from no tracked ids to some tracked ids is detected, this
-    triggers a subscription refresh. It runs indefinitely to pick up future
-    additions as well.
-    """
-    try:
-        prev = False
-        while True:
-            try:
-                now_has = await _any_tracked_event_ids_exist(app)
-                if not prev and now_has:
-                    trigger_subscription_refresh(app, reason="tracked_event_ids_detected")
-                prev = now_has
-            except Exception:
-                # Ignore transient errors and continue polling
-                pass
-            await asyncio.sleep(check_interval)
+        # Wait for nostrclient relays to be ready before proceeding
+        from .relay_readiness import wait_for_relays_ready
+        relay_status = await wait_for_relays_ready(max_wait_seconds=30.0, check_interval=2.0, min_connected_relays=1)
+        if not relay_status['ready']:
+            logger.warning(
+                f"⚠️ Proceeding even though nostrclient relays not confirmed ready after {relay_status['waited_seconds']}s. "
+                f"Status: {relay_status['relay_count']} relay(s) configured, {relay_status['connected_count']} connected. "
+                f"Reason: {relay_status['reason']}"
+            )
+        
+        logger.info("✅ Cyberherd subscription handler initialized (NostrWebSocketMonitor handles subscriptions)")
+        
+        # Keep the task alive forever (like nwcprovider's handle_nwc)
+        try:
+            while True:
+                await asyncio.sleep(3600)  # Sleep for 1 hour, wake up periodically to check if cancelled
+        except asyncio.CancelledError:
+            logger.info("Cyberherd subscription handler cancelled")
+            raise
+            
     except asyncio.CancelledError:
-        return
-    except Exception:
-        return
+        logger.info("Cyberherd subscription handler cancelled during startup")
+        raise
+    except Exception as e:
+        logger.error(f"❌ Cyberherd subscription handler failed: {e}", exc_info=True)
+        raise
 
-
-async def _authoritative_tag_subscription(app):  # kept for backward import paths
-    # NEW: Use callback-based monitoring system instead of adapter
-    from .nostr_event_monitor import start_monitoring_system
-    await start_monitoring_system(app)
 
 def start_subscriptions(app):
-    """Start cyberherd subscriptions.
-
-    Returns the created background task so caller (or tests) can track it.
-    Keeps a reference on app.state to avoid GC collecting the task which can
-    lead to 'coroutine was never awaited' runtime warnings if exceptions occur
-    before the event loop cycles.
+    """DEPRECATED: Legacy function kept for backward compatibility.
+    
+    The new approach uses cyberherd_subscription_handler() called by
+    create_permanent_unique_task() in __init__.py, following the nwcprovider pattern.
+    
+    This function is no longer used but kept to avoid breaking imports.
     """
-    try:
-        import asyncio
-
-        async def _kick():
-            try:
-                # Wait for nostrclient relays to be ready before starting subscriptions
-                from .relay_readiness import wait_for_relays_ready
-                relay_status = await wait_for_relays_ready(max_wait_seconds=30.0, check_interval=2.0, min_connected_relays=1)
-                if not relay_status['ready']:
-                    logger.warning(
-                        f"⚠️ Starting subscriptions even though nostrclient relays not confirmed ready after {relay_status['waited_seconds']}s. "
-                        f"Status: {relay_status['relay_count']} relay(s) configured, {relay_status['connected_count']} connected. "
-                        f"Reason: {relay_status['reason']}"
-                    )
-                
-                # OPTIMIZED STARTUP FLOW:
-                # Run force_requery for all users FIRST - this populates tracked_event_ids
-                # AND recovers missed events in a single pass (no duplicate queries)
-                logger.info("Starting event recovery and tracked_event_ids initialization")
-                
-                try:
-                    from . import nostr_adapter
-                    from ..utils.common import get_lnbits_users_function
-                    
-                    get_users = get_lnbits_users_function()
-                    users = await get_users() if asyncio.iscoroutinefunction(get_users) else []
-                    recovery_count = 0
-                    
-                    for user in users:
-                        try:
-                            settings = await crud.get_settings(user.id)
-                            # Only recover if tracking is enabled
-                            if not (getattr(settings, 'repost_tracking_enabled', False) or 
-                                   getattr(settings, 'likes_tracking_enabled', False) or
-                                   getattr(settings, 'tracked_tags', [])):
-                                continue
-                            
-                            # Run force_requery to:
-                            # 1. Query and cache notes (kind 1/30311)
-                            # 2. Auto-populate tracked_event_ids via _append_today
-                            # 3. Query and process engagement events (kind 6/7)
-                            # This replaces both _initialize_tracked_event_ids_on_startup
-                            # and the old _recover_missed_reposts_and_reactions_on_startup
-                            appended_ids = await nostr_adapter.force_requery_for_user(app, user.id)
-                            if appended_ids is not None:  # None = error, [] = no notes found
-                                recovery_count += 1
-                                logger.info(f"Completed startup recovery for user {user.id} via force_requery")
-                        except Exception as ue:
-                            logger.warning(f"Failed startup recovery for user {user.id}: {ue}")
-                    
-                    logger.info(f"Startup recovery complete: {recovery_count} users processed")
-                except Exception as e:
-                    logger.warning(f"Failed startup recovery: {e}")
-                
-                # Recover zaps (payment-based) - separate concern from Nostr events
-                try:
-                    await _trigger_recovery_for_all_users(app)
-                except Exception as e:
-                    logger.warning(f"Failed to trigger automatic zap recovery: {e}")
-
-                # Start the adapter (which creates initial subscriptions)
-                await _authoritative_tag_subscription(app)
-                
-                # CRITICAL FIX: Trigger subscription refresh IMMEDIATELY after adapter starts
-                # This ensures engagement subscriptions (kinds 6/7) are created with the
-                # tracked_event_ids that were just initialized above.
-                # Without this, the initial subscriptions are created WITHOUT engagement filters,
-                # and won't be updated until the next manager loop cycle (60 seconds by default).
-                logger.info("🔧 DIAGNOSTIC: Triggering IMMEDIATE subscription refresh for tracked_event_ids")
-                trigger_subscription_refresh(app, reason="post_initialization")
-                
-                # Give the manager loop a moment to process the refresh
-                await asyncio.sleep(1)
-                
-                logger.info("Cyberherd nostr adapter started")
-                
-                # Start background monitor to watch for tracked_event_ids added later
-                try:
-                    st = getattr(app, 'state', app)
-                    monitor_task = asyncio.create_task(_tracked_ids_monitor(app))
-                    bg = getattr(st, 'cyberherd_bg_tasks', None)
-                    if bg is None:
-                        bg = []
-                        try:
-                            setattr(st, 'cyberherd_bg_tasks', bg)
-                        except Exception:
-                            pass
-                    bg.append(monitor_task)
-                except Exception:
-                    pass
-            except Exception as e:  # pragma: no cover
-                logger.warning(f"Cyberherd adapter start failed: {e}")
-
-        task = asyncio.create_task(_kick())
-        try:  # store reference
-            st = getattr(app, "state", app)
-            bg = getattr(st, "cyberherd_bg_tasks", None)
-            if bg is None:
-                bg = []
-                setattr(st, "cyberherd_bg_tasks", bg)
-            bg.append(task)
-        except Exception:  # pragma: no cover
-            pass
-        return task
-    except Exception as e:
-        logger.error(f"Failed to start cyberherd subscriptions: {e}")
-        return None
+    logger.warning(
+        "start_subscriptions() called but is deprecated. "
+        "Subscriptions are now started via cyberherd_subscription_handler() "
+        "using create_permanent_unique_task() in __init__.py"
+    )
+    return None
 
 
 async def poll_now(*args, **kwargs):  # legacy public API kept as no-op
@@ -861,17 +877,16 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
         # kind 1: notes, kind 30311: long-form content
         # For notes, we WANT events from the effective pubkey (user's own notes)
         if kind in (1, 30311):
-            if CYBERHERD_DEBUG:
-                logger.info(
-                    f"📝 Processing kind {kind} note event {eid[:16]}... from pubkey {pubkey[:16]}... "
-                    f"(user's effective_pubkey: {eff_pub[:16] if eff_pub else 'None'}...) user_id={user_id}"
-                )
+            logger.debug(
+                f"📝 Processing kind {kind} note event {eid[:16]}... from pubkey {pubkey[:16]}... "
+                f"(user's effective_pubkey: {eff_pub[:16] if eff_pub else 'None'}...) user_id={user_id}"
+            )
             cache = _get_cache(app)
             result = await _append_today(cache, user_id, eff_pub, tags, event, app)
-            if CYBERHERD_DEBUG and result:
-                logger.info(f"✅ Successfully added event {eid[:16]}... to tracked_event_ids for user {user_id}")
-            elif CYBERHERD_DEBUG:
-                logger.info(f"⚠️ Event {eid[:16]}... was not added to tracked_event_ids (check logs above for reason)")
+            if result:
+                logger.info(f"✅ New tracked note detected: {eid[:16]}... for user {user_id}")
+            else:
+                logger.debug(f"⚠️ Event {eid[:16]}... was not added to tracked_event_ids (filtered out)")
 
         # kind 6: reposts
         elif kind == 6 and getattr(settings, "repost_tracking_enabled", False):
@@ -1265,8 +1280,7 @@ async def _is_tracked_event(user_id: str, note_event_id: str, settings, app, cac
     UTC-FIRST: Cache keys use UTC date for consistency across timezones.
     """
     try:
-        if CYBERHERD_DEBUG:
-            logger.info(f"🔍 _is_tracked_event: Checking if {note_event_id[:16]}... is tracked for user {user_id}")
+        logger.debug(f"🔍 _is_tracked_event: Checking if {note_event_id[:16]}... is tracked for user {user_id}")
         
         # First check if the event is in today's cache
         cache = cache or _get_cache(app)
@@ -1279,8 +1293,7 @@ async def _is_tracked_event(user_id: str, note_event_id: str, settings, app, cac
         tags = getattr(settings, 'tracked_tags', [])
         tagset = tuple(sorted([t.lstrip('#').lower() for t in tags if t]))
 
-        if CYBERHERD_DEBUG:
-            logger.info(f"  Cache day: {day}, eff_pub: {eff_pub[:16] if eff_pub else 'None'}..., tags: {tags}")
+        logger.debug(f"  Cache day: {day}, eff_pub: {eff_pub[:16] if eff_pub else 'None'}..., tags: {tags}")
 
         # Check both user-specific and neutral cache keys
         cache_keys = [
@@ -1295,36 +1308,31 @@ async def _is_tracked_event(user_id: str, note_event_id: str, settings, app, cac
         # wasn't seen in the in-memory cache (e.g. added manually via UI).
         try:
             explicit_tracked = getattr(settings, 'tracked_event_ids', []) or []
-            if CYBERHERD_DEBUG:
-                logger.info(f"  Explicit tracked_event_ids ({len(explicit_tracked)}): {[e[:16]+'...' for e in explicit_tracked[:5]]}")
+            logger.debug(f"  Explicit tracked_event_ids ({len(explicit_tracked)}): {[e[:16]+'...' for e in explicit_tracked[:5]]}")
             
             if note_event_id in explicit_tracked:
-                if CYBERHERD_DEBUG:
-                    logger.info(f"✅ Event {note_event_id[:16]}... found in explicit tracked_event_ids!")
+                logger.debug(f"✅ Event {note_event_id[:16]}... found in explicit tracked_event_ids!")
                 # Ensure it's present in the runtime cache for faster future checks
                 for key in cache_keys:
                     note_ids = _get_cache_note_ids(cache, key, create=True)
                     if note_event_id not in note_ids:
                         note_ids.append(note_event_id)
                 return True
-            elif CYBERHERD_DEBUG:
-                logger.info(f"  Event {note_event_id[:16]}... NOT in explicit tracked_event_ids")
+            else:
+                logger.debug(f"  Event {note_event_id[:16]}... NOT in explicit tracked_event_ids")
         except Exception as e:
             # Fall back to cache lookup below on any error
-            if CYBERHERD_DEBUG:
-                logger.warning(f"  Error checking explicit tracked_event_ids: {e}")
+            logger.debug(f"  Error checking explicit tracked_event_ids: {e}")
             pass
 
         # Check cache
         for key in cache_keys:
             event_ids = _get_cache_note_ids(cache, key)
             if note_event_id in event_ids:
-                if CYBERHERD_DEBUG:
-                    logger.info(f"✅ Event {note_event_id[:16]}... found in cache!")
+                logger.debug(f"✅ Event {note_event_id[:16]}... found in cache!")
                 return True
         
-        if CYBERHERD_DEBUG:
-            logger.info(f"  Event {note_event_id[:16]}... NOT in cache, checking via nostr_helpers...")
+        logger.debug(f"  Event {note_event_id[:16]}... NOT in cache, checking via nostr_helpers...")
         
         # If not in cache, query for the event via nostr_helpers and check if it would be tracked
         try:
@@ -1344,28 +1352,25 @@ async def _is_tracked_event(user_id: str, note_event_id: str, settings, app, cac
             
             if events:
                 event = events[0]
-                if CYBERHERD_DEBUG:
-                    logger.info(f"  Found event via nostr_helpers, checking if it would be tracked...")
+                logger.debug(f"  Found event via nostr_helpers, checking if it would be tracked...")
                 # Check if this event would be tracked
                 if _would_event_be_tracked(event, eff_pub, tags):
-                    if CYBERHERD_DEBUG:
-                        logger.info(f"✅ Event {note_event_id[:16]}... WOULD be tracked, adding to cache")
+                    logger.debug(f"✅ Event {note_event_id[:16]}... WOULD be tracked, adding to cache")
                     # Add to cache so future checks are faster
                     for key in cache_keys:
                         note_ids = _get_cache_note_ids(cache, key, create=True)
                         if note_event_id not in note_ids:
                             note_ids.append(note_event_id)
                     return True
-                elif CYBERHERD_DEBUG:
-                    logger.info(f"❌ Event {note_event_id[:16]}... would NOT be tracked (doesn't match criteria)")
-            elif CYBERHERD_DEBUG:
-                logger.info(f"❌ Event {note_event_id[:16]}... NOT found via nostr_helpers query")
+                else:
+                    logger.debug(f"❌ Event {note_event_id[:16]}... would NOT be tracked (doesn't match criteria)")
+            else:
+                logger.debug(f"❌ Event {note_event_id[:16]}... NOT found via nostr_helpers query")
         except Exception as e:
             _record_helper_query(False, str(e))
             logger.warning(f"Error querying for tracked event {note_event_id} via nostr_helpers: {e}")
         
-        if CYBERHERD_DEBUG:
-            logger.info(f"❌ Event {note_event_id[:16]}... is NOT tracked")
+        logger.debug(f"❌ Event {note_event_id[:16]}... is NOT tracked")
         return False
     except Exception as e:
         logger.error(f"Error checking if event is tracked: {e}")
@@ -1451,37 +1456,100 @@ async def _trigger_reaction_headbutt(user_id: str, reactor_pubkey: str, reacted_
         logger.error(f"Error triggering reaction headbutt: {e}")
         return None
 
-
-async def _recover_missed_reposts_and_reactions_on_startup(app):
-    """DEPRECATED: Use force_requery_for_user instead.
+async def process_note_for_tracked_tags(user_id: str, event: dict, app=None):
+    """Process a kind 1 or kind 30311 note event for tracked tags.
     
-    This function is kept for backward compatibility but should not be used.
-    Use nostr_adapter.force_requery_for_user(app, user_id) which queries both
-    notes AND engagement events (reposts/reactions) in a single comprehensive operation.
+    This is a wrapper function called by the WebSocket monitor when a note
+    event is received. It fetches the necessary context (settings, app) and
+    delegates to the main processing logic.
     
-    Original documentation:
-    Recover missed reposts and reactions on startup by querying recent kind 6 and 7 events.
-
-    Note: zap receipts (kind 9735) are intentionally excluded here — zaps are processed
-    via the invoice/listener path only.
+    Args:
+        user_id: User ID to process the note for
+        event: The kind 1 or kind 30311 note event from Nostr
+        app: Optional FastAPI app instance (required for processing)
     """
-    logger.warning(
-        "DEPRECATED: _recover_missed_reposts_and_reactions_on_startup called. "
-        "Use nostr_adapter.force_requery_for_user instead for comprehensive recovery."
-    )
-    # Function body removed - use force_requery_for_user instead
+    try:
+        # Get settings for this user
+        settings = await crud.get_settings(user_id)
+        if not settings:
+            logger.warning(f"No settings found for user {user_id}, cannot process note")
+            return
+        
+        # Check if user has tracked tags (notes are only tracked if tags are configured)
+        tracked_tags = getattr(settings, 'tracked_tags', []) or []
+        if not tracked_tags:
+            logger.debug(f"No tracked tags configured for user {user_id}")
+            return
+        
+        # Process the event using the main logic
+        # This will:
+        # 1. Check if note matches tracked tags
+        # 2. Add to tracked_event_ids via _append_today
+        # 3. Trigger immediate subscription refresh (for engagement tracking)
+        await process_event_for_user(user_id, event, settings, app, recovery_mode=False)
+        
+    except Exception as e:
+        logger.error(f"Error processing note for user {user_id}: {e}")
 
 
-async def _recover_missed_reposts_and_reactions_for_user(user_id: str, settings, app):
-    """DEPRECATED: Use force_requery_for_user instead.
+async def process_repost_for_tracked_notes(user_id: str, event: dict, app=None):
+    """Process a kind 6 repost event for tracked notes.
     
-    This function is kept for backward compatibility but should not be used.
-    Use nostr_adapter.force_requery_for_user(app, user_id) which queries both
-    notes AND engagement events in a single operation.
+    This is a wrapper function called by the WebSocket monitor when a repost
+    event is received. It fetches the necessary context (settings, app) and
+    delegates to the main processing logic.
+    
+    Args:
+        user_id: User ID to process the repost for
+        event: The kind 6 repost event from Nostr
+        app: Optional FastAPI app instance (required for processing)
     """
-    logger.warning(
-        f"DEPRECATED: _recover_missed_reposts_and_reactions_for_user called for user {user_id}. "
-        "Use nostr_adapter.force_requery_for_user instead."
-    )
-    # Function body removed - use force_requery_for_user instead
+    try:
+        # Get settings for this user
+        settings = await crud.get_settings(user_id)
+        if not settings:
+            logger.warning(f"No settings found for user {user_id}, cannot process repost")
+            return
+        
+        # Check if repost tracking is enabled
+        if not getattr(settings, "repost_tracking_enabled", False):
+            logger.debug(f"Repost tracking not enabled for user {user_id}")
+            return
+        
+        # Process the event using the main logic
+        await process_event_for_user(user_id, event, settings, app, recovery_mode=False)
+        
+    except Exception as e:
+        logger.error(f"Error processing repost for user {user_id}: {e}")
+
+
+async def process_reaction_for_tracked_notes(user_id: str, event: dict, app=None):
+    """Process a kind 7 reaction event for tracked notes.
+    
+    This is a wrapper function called by the WebSocket monitor when a reaction
+    event is received. It fetches the necessary context (settings, app) and
+    delegates to the main processing logic.
+    
+    Args:
+        user_id: User ID to process the reaction for
+        event: The kind 7 reaction event from Nostr
+        app: Optional FastAPI app instance (required for processing)
+    """
+    try:
+        # Get settings for this user
+        settings = await crud.get_settings(user_id)
+        if not settings:
+            logger.warning(f"No settings found for user {user_id}, cannot process reaction")
+            return
+        
+        # Check if reaction tracking is enabled
+        if not getattr(settings, "likes_tracking_enabled", False):
+            logger.debug(f"Reaction tracking not enabled for user {user_id}")
+            return
+        
+        # Process the event using the main logic
+        await process_event_for_user(user_id, event, settings, app, recovery_mode=False)
+        
+    except Exception as e:
+        logger.error(f"Error processing reaction for user {user_id}: {e}")
 

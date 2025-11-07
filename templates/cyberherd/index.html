@@ -104,6 +104,7 @@
             <q-btn flat color="primary" @click="openAddDialog">Add Member</q-btn>
             <q-btn flat color="teal" @click="recomputeSplits">Recompute Splits</q-btn>
             <q-btn flat color="red" @click="confirmReset">Reset Today</q-btn>
+            <q-btn flat color="blue" @click="triggerRecovery">Recover Events</q-btn>
           </div>
         </div>
         <q-table dense flat :rows="cyberherdData.members" row-key="pubkey" :columns="cyberherdData.columns">
@@ -141,7 +142,8 @@
         <h6 class="text-subtitle1 q-my-none">Help</h6>
       </q-card-section>
       <q-card-section>
-        <p class="text-caption">Configure CyberHerd payouts, max active members, and which hashtags to track from incoming events.</p>
+        <p class="text-caption"><strong>Requirements:</strong> The <code>nostrclient</code> extension is required for CyberHerd to connect to Nostr relays. The optional <code>cyberherd_messaging</code> extension provides enhanced messaging features.</p>
+        <p class="text-caption q-mt-sm">Configure CyberHerd payouts, max active members, and which hashtags to track from incoming events.</p>
         <p class="text-caption q-mt-sm">Zap monitoring uses LNbits payments to the selected Herd wallet. Enable the toggle to process qualifying zaps automatically.</p>
         <div class="text-caption q-mt-sm">
           <div>WebSocket path for messaging clients:</div>
@@ -150,6 +152,28 @@
             <q-btn dense flat icon="content_copy" @click="() => { const p = getWebsocketPath(); if (p) navigator.clipboard.writeText(p).then(()=>{this.$q.notify({type:'positive',message:'WebSocket path copied'})}).catch(()=>{this.$q.notify({type:'negative',message:'Copy failed'})}) }"></q-btn>
           </div>
         </div>
+      </q-card-section>
+    </q-card>
+
+    <q-card>
+      <q-card-section>
+        <h6 class="text-subtitle1 q-my-none">API Documentation</h6>
+      </q-card-section>
+      <q-card-section>
+        <p class="text-caption">View the complete API documentation for CyberHerd endpoints.</p>
+        <q-btn
+          flat
+          dense
+          color="primary"
+          type="a"
+          href="/docs#/cyberherd"
+          target="_blank"
+          rel="noopener noreferrer"
+          icon="code"
+          label="View API Docs"
+        >
+          <q-tooltip>View CyberHerd Swagger API documentation</q-tooltip>
+        </q-btn>
       </q-card-section>
     </q-card>
   </div>

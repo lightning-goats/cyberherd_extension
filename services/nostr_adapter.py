@@ -1,16 +1,12 @@
-"""Compatibility shim redirecting to callback-based monitoring system.
+"""Compatibility shim redirecting to current monitoring system.
 
-This module re-exports functions from nostr_event_monitor.py for backward compatibility.
-All new code should import directly from nostr_event_monitor.py instead.
+This module re-exports functions for backward compatibility.
+All new code should import directly from the appropriate modules.
 """
 
-from .nostr_event_monitor import (
-    start_monitoring_system as start_adapter,
-    force_requery_for_user,
-)
+from .subscriptions import force_requery_for_user
 
 __all__ = [
-    "start_adapter",
     "force_requery_for_user",
 ]
 

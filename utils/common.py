@@ -57,6 +57,28 @@ def get_lnbits_users_function() -> Optional[Callable]:
     return None
 
 
+async def is_extension_enabled_for_user(user_id: str, extension_id: str = 'cyberherd') -> bool:
+    """Check if an extension is enabled for a specific user.
+    
+    This is the standard LNbits way to check if a user has enabled an extension.
+    All user iteration loops should use this check to respect user preferences.
+    
+    Args:
+        user_id: The user ID to check
+        extension_id: The extension ID (defaults to 'cyberherd')
+        
+    Returns:
+        True if the extension is enabled for the user, False otherwise
+    """
+    try:
+        from lnbits.core.crud import get_user_active_extensions_ids
+        user_extensions = await get_user_active_extensions_ids(user_id)
+        return extension_id in user_extensions
+    except Exception:
+        # If we can't check, assume it's enabled (backward compatibility)
+        return True
+
+
 def get_nip19_decoder():
     """Get the nip19 decoder from lnbits.utils.nostr.
     

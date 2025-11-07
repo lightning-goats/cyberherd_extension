@@ -262,31 +262,9 @@ class ZapMonitorService:
         return None, None
 
     async def start_monitoring(self):
-        """Start monitoring Nostr events for tracked notes."""
-        # Get user settings
-        settings = await crud.get_settings(self.user_id)
-        if not getattr(settings, 'zap_tracking_enabled', False):
-            logger.info(f"Zap tracking not enabled for user {self.user_id}")
-            if self._running:
-                await self.stop_monitoring()
-            return
+        """Start monitoring for zaps via payment listener.
         
-        if self._running:
-            return
-            
-        self._running = True
-        
-        # Start payment listener for LNURLp zaps (FIRST - this is the primary zap detection mechanism)
-        self._payment_listener_task = asyncio.create_task(self.payment_listener())
-        
-        # Start Nostr event monitoring (handled by subscriptions.py, not by this class)
-        await self._start_nostr_monitoring(settings)
-
-    async def start_monitoring_with_timestamps(self, note_timestamps: dict[str, int]):
-        """Start monitoring with note timestamps for event recovery from earliest timestamp.
-        
-        Args:
-            note_timestamps: Dict mapping note_id -> created_at timestamp
+        Nostr event monitoring (reposts/reactions) is handled separately by subscriptions.py.
         """
         # Get user settings
         settings = await crud.get_settings(self.user_id)
@@ -301,11 +279,9 @@ class ZapMonitorService:
             
         self._running = True
         
-        # Start payment listener for LNURLp zaps (FIRST - this is the primary zap detection mechanism)
+        # Start payment listener for LNURLp zaps (primary zap detection mechanism)
         self._payment_listener_task = asyncio.create_task(self.payment_listener())
-        
-        # Start Nostr event monitoring with timestamps for recovery (handled by subscriptions.py)
-        await self._start_nostr_monitoring(settings, note_timestamps=note_timestamps)
+        logger.info(f"Started zap monitoring for user {self.user_id}")
 
     async def stop_monitoring(self):
         """Stop monitoring Nostr events."""
@@ -333,15 +309,17 @@ class ZapMonitorService:
                 logger.error(f"Error stopping Nostr monitor: {e}")
             self.nostr_monitor = None
     
-    async def _process_payment_for_zap(self, payment, *, allow_outside_today: bool = False):
+    async def _process_payment_for_zap(self, payment):
         """Process a payment notification to detect LNURLp zaps.
         
         This method is called by the invoice listener and parses zap requests from
         payment.extra["nostr"] (NIP-57 zap request JSON string).
         
+        IMPORTANT: Only processes zaps for TODAY's tracked notes. This enforces
+        the rule that zaps are only valid for the current day's CyberHerd notes.
+        
         Args:
             payment: Payment object with extra data containing zap request
-            allow_outside_today: When True, bypass today's note window check (used for recovery scans).
         """
         try:
             # Only process payments to the configured herd wallet
@@ -1714,14 +1692,16 @@ class ZapMonitorService:
         return status
 
     async def _recover_missed_payment_zaps(self, settings) -> dict:
-        """Recover missed LNURLp zaps by scanning recent payments to the herd wallet
+        """Recover missed LNURLp zaps by scanning recent payments to the herd wallet.
 
         This method scans payments sent to the configured herd wallet since the
         start of the current day (UTC) and invokes the standard payment handler
-        for any candidate payments that include a zap request. It is intended as
-        an administrative recovery routine and should be idempotent thanks to
-        the persisted processed_events/processed_zaps guards.
-
+        for any candidate payments that include a zap request.
+        
+        IMPORTANT: Only processes zaps for TODAY's tracked notes. This ensures
+        consistency with the rule that zaps are only valid for the current day's
+        CyberHerd notes.
+        
         Returns a diagnostic dict with counts and any errors encountered.
         """
         from ..crud import get_settings as _get_settings  # noqa: F401
@@ -1795,10 +1775,11 @@ class ZapMonitorService:
                         )
                         continue
 
-                    # Reuse existing payment processing path which includes
-                    # duplicate guards and zap parsing logic.
+                    # Process payment for zap (enforces today's note check)
+                    # Note: Recovery now enforces current day validation - zaps are only
+                    # processed for today's tracked notes
                     processed += 1
-                    res = await self._process_payment_for_zap(payment, allow_outside_today=True)
+                    res = await self._process_payment_for_zap(payment)
                     # Treat truthy result as success (some code paths may return True)
                     if res:
                         successful += 1
