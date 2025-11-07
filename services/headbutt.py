@@ -790,12 +790,20 @@ class EnhancedHeadbuttService:
                 except Exception:
                     existing_amount = 0
 
-                # If this is a repost/reaction (amount == 0), compute payout
-                # bump from existing_amount; otherwise compute from attacker.amount
+                # Calculate payout increase:
+                # - For reactions (kind 7): Fixed 1 sat increase
+                # - For reposts (kind 6): Fixed 1 sat increase (same as reactions)
+                # - For zaps (amount>0): Calculate from zap amount
                 if int(increase_amount or 0) == 0:
-                    payouts_increase = calculate_payout(float(existing_amount))
+                    # This is a repost or reaction (no zap amount)
+                    # Both get the same 1 sat payout increase
+                    payouts_increase = 1.0
+                    event_type_name = "reaction" if is_reaction_event else "repost"
+                    logger.info(f"💰 {event_type_name.capitalize()} (kind {'7' if is_reaction_event else '6'}) for existing member: fixed 1 sat payout increase")
                 else:
+                    # Zaps use their own amount for payout calculation
                     payouts_increase = calculate_payout(float(increase_amount))
+                    logger.info(f"💰 Zap for existing member: {payouts_increase} sat payout increase from {increase_amount} sat zap")
 
                 await self.db.update_and_activate_member(
                     attacker.pubkey,
@@ -1033,35 +1041,15 @@ class EnhancedHeadbuttService:
         
         if is_repost:
             # For reposts (kind 6), can replace:
-            # - Other reposts (amount=0)
-            # - Reactions that have only kind 7 events (no kind 6)
-            reposts = [m for m in active_members if m.get("amount", 0) == 0]
-            # Identify members that have amount=0 and only kind 7 recorded
-            reactions_only = []
-            for m in active_members:
-                if int(m.get("amount", 0) or 0) != 0:
-                    continue
-                kinds_raw = m.get("kinds")
-                if not kinds_raw:
-                    continue
-                # parse into ints
-                kinds_set = set()
-                try:
-                    for part in [p.strip() for p in str(kinds_raw).split(',') if p.strip()]:
-                        try:
-                            kinds_set.add(int(part))
-                        except Exception:
-                            pass
-                except Exception:
-                    kinds_set = set()
-                # Only kind 7 present (no 6)
-                if kinds_set and 7 in kinds_set and 6 not in kinds_set:
-                    reactions_only.append(m)
-            replaceable = reposts + reactions_only
+            # - Other reposts (has kind 6)
+            # - Reactions (has only kind 7, no kind 6)
+            # Essentially: any member with amount=0 (no zaps)
+            replaceable = [m for m in active_members if m.get("amount", 0) == 0]
             if not replaceable:
-                logger.info("No reposts or reactions-only to replace — repost headbutt skipped")
+                logger.info("No amount=0 members (reposts/reactions) to replace — repost headbutt skipped")
                 return None
             lowest = self._get_lowest_member(replaceable)
+            logger.info(f"Repost (kind 6) can replace any amount=0 member: {len(replaceable)} candidates")
         elif is_reaction:
             # For reactions (kind 7), can only replace reactions that have only kind 7 events
             reactions_only = []
@@ -1151,7 +1139,22 @@ class EnhancedHeadbuttService:
 
             # Add or update attacker as active (reuse existing handler where possible)
             existing = await self.db.get_cyberherd_member_by_pubkey(attacker.pubkey, user_id=self.user_id)
-            payouts = calculate_payout(float(getattr(attacker, "amount", 0) or 0))
+            
+            # Calculate payouts based on event type
+            # Reactions (kind 7) and Reposts (kind 6) both get fixed 1 sat
+            # Zaps use amount-based calculation
+            attacker_kinds = getattr(attacker, 'kinds', []) or []
+            is_reaction = 7 in attacker_kinds
+            is_repost = 6 in attacker_kinds
+            
+            if is_reaction or is_repost:
+                payouts = 1.0  # Fixed 1 sat for reactions and reposts
+                event_type = "reaction" if is_reaction else "repost"
+                logger.info(f"💰 Headbutt via {event_type} (kind {'7' if is_reaction else '6'}): fixed 1 sat payout")
+            else:
+                payouts = calculate_payout(float(getattr(attacker, "amount", 0) or 0))
+                logger.info(f"💰 Headbutt via zap: {payouts} sat payout from amount {getattr(attacker, 'amount', 0)}")
+            
             if existing:
                 await self.db.update_and_activate_member(
                     attacker.pubkey,
@@ -1547,7 +1550,22 @@ class EnhancedHeadbuttService:
 
     async def _handle_attacker_admission(self, attacker: Any) -> str:
         existing = await self.db.get_cyberherd_member_by_pubkey(attacker.pubkey, user_id=self.user_id)
-        payouts = calculate_payout(float(attacker.amount))
+        
+        # Calculate payouts based on event type
+        # Reactions (kind 7) and Reposts (kind 6) both get fixed 1 sat
+        # Zaps use amount-based calculation
+        attacker_kinds = getattr(attacker, 'kinds', []) or []
+        is_reaction = 7 in attacker_kinds
+        is_repost = 6 in attacker_kinds
+        
+        if is_reaction or is_repost:
+            payouts = 1.0  # Fixed 1 sat for reactions and reposts
+            event_type = "reaction" if is_reaction else "repost"
+            logger.info(f"💰 New member via {event_type} (kind {'7' if is_reaction else '6'}): fixed 1 sat payout")
+        else:
+            payouts = calculate_payout(float(attacker.amount))
+            logger.info(f"💰 New member via zap: {payouts} sat payout from amount {attacker.amount}")
+        
         if existing:
             if not getattr(attacker, "nip05", None):
                 attacker.nip05 = (existing or {}).get("nip05")
