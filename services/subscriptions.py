@@ -399,6 +399,13 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
     
     # Author check
     event_pubkey = event.get("pubkey")
+    if not eff_pub:
+        logger.warning(
+            f"📝 Cannot validate event {eid[:16] if eid else 'unknown'}... - "
+            f"no effective pubkey configured for user {user_id}. "
+            f"Check nostr_pubkey_override or nostr_private_key settings."
+        )
+        return False
     if event_pubkey != eff_pub:
         logger.debug(
             f"📝 Skipping event {eid[:16] if eid else 'unknown'}... from pubkey {event_pubkey[:16] if event_pubkey else 'None'}... "
@@ -422,7 +429,7 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
     # Check if event is from user's local "today"
     if not boundaries.is_timestamp_in_local_day(created_at):
         from datetime import datetime
-        logger.debug(
+        logger.warning(
             f"📅 Skipping event {eid[:16]}... from {datetime.fromtimestamp(created_at).isoformat()} "
             f"(outside today's local window: {datetime.fromtimestamp(boundaries.local_since_ts).isoformat()} "
             f"to {datetime.fromtimestamp(boundaries.local_until_ts).isoformat()}) user_id={user_id}"
@@ -433,8 +440,9 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
     if not _event_matches_tracked_tags(event, tags_norm):
         # Extract event's tags for logging
         event_t_tags = [t[1] for t in event.get('tags', []) if isinstance(t, list) and len(t) >= 2 and t[0] == 't']
-        logger.debug(
-            f"🏷️ Skipping event {eid[:16]}... with t-tags {event_t_tags} "
+        content_preview = (event.get('content', '') or '')[:100]
+        logger.warning(
+            f"🏷️ Skipping event {eid[:16]}... with t-tags {event_t_tags} content_preview='{content_preview}' "
             f"(not matching tracked tags {tags_norm}) user_id={user_id}"
         )
         return False
@@ -555,17 +563,31 @@ async def force_requery_for_user(app, user_id: str) -> list[str]:
         boundaries = _get_today_boundaries_utc()
         since_ts = int(boundaries.local_since_ts)  # Midnight today local time
         
-        # Get tracked tags
+        # Get tracked tags and effective pubkey
         tracked_tags = getattr(settings, 'tracked_tags', []) or []
+        effective_pubkey = get_effective_pubkey(settings)
+        
         if not tracked_tags:
             logger.info(f"No tracked tags for user {user_id}, skipping note recovery")
+        elif not effective_pubkey:
+            logger.warning(f"No effective pubkey for user {user_id}, cannot recover notes")
         else:
+            # Normalize tags for Nostr query (remove # prefix)
+            # Nostr "#t" filter expects tag values without the # prefix
+            # Note: Tag matching is case-sensitive in Nostr, so preserve case
+            query_tags = [t.lstrip('#') for t in tracked_tags if t]
+            
             # Query notes (kind 1 and 30311) matching tracked tags from midnight
-            logger.debug(f"Querying notes since {since_ts} for tags: {tracked_tags}")
+            # IMPORTANT: Must filter by author (effective_pubkey) to only get user's own notes
+            logger.debug(
+                f"Querying notes since {since_ts} for author {effective_pubkey[:16]}... "
+                f"with tags: {tracked_tags} (normalized to {query_tags})"
+            )
             
             filters = {
                 "kinds": [1, 30311],
-                "#t": tracked_tags,
+                "authors": [effective_pubkey],  # Only notes from this user
+                "#t": query_tags,
                 "since": since_ts,
                 "limit": 500
             }
@@ -877,16 +899,17 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
         # kind 1: notes, kind 30311: long-form content
         # For notes, we WANT events from the effective pubkey (user's own notes)
         if kind in (1, 30311):
-            logger.debug(
+            logger.info(
                 f"📝 Processing kind {kind} note event {eid[:16]}... from pubkey {pubkey[:16]}... "
-                f"(user's effective_pubkey: {eff_pub[:16] if eff_pub else 'None'}...) user_id={user_id}"
+                f"(user's effective_pubkey: {eff_pub[:16] if eff_pub else 'None'}...) "
+                f"tracked_tags: {tags} user_id={user_id}"
             )
             cache = _get_cache(app)
             result = await _append_today(cache, user_id, eff_pub, tags, event, app)
             if result:
                 logger.info(f"✅ New tracked note detected: {eid[:16]}... for user {user_id}")
             else:
-                logger.debug(f"⚠️ Event {eid[:16]}... was not added to tracked_event_ids (filtered out)")
+                logger.warning(f"⚠️ Event {eid[:16]}... was not added to tracked_event_ids (filtered out) user_id={user_id}")
 
         # kind 6: reposts
         elif kind == 6 and getattr(settings, "repost_tracking_enabled", False):
@@ -1480,6 +1503,23 @@ async def process_note_for_tracked_tags(user_id: str, event: dict, app=None):
         if not tracked_tags:
             logger.debug(f"No tracked tags configured for user {user_id}")
             return
+        
+        # Debug: Check if effective pubkey is available
+        eff_pub = get_effective_pubkey(settings)
+        if not eff_pub:
+            logger.warning(
+                f"No effective pubkey available for user {user_id}. "
+                f"Cannot track notes. Check nostr_pubkey_override or nostr_private_key settings."
+            )
+            return
+        
+        logger.info(
+            f"Processing note for user {user_id}: "
+            f"event_id={event.get('id', 'unknown')[:16]}..., "
+            f"event_pubkey={event.get('pubkey', 'unknown')[:16]}..., "
+            f"effective_pubkey={eff_pub[:16]}..., "
+            f"tracked_tags={tracked_tags}"
+        )
         
         # Process the event using the main logic
         # This will:

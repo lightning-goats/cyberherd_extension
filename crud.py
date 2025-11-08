@@ -91,11 +91,12 @@ def get_local_date_key(days_ago: int = 0) -> str:
     """Get local date key for caching.
     
     Returns the local date in ISO format for cache keys.
-    This ensures cache keys are based on local date, not UTC date.
+    This ensures cache keys are based on system's local date, not UTC date.
     """
     from datetime import timedelta
     
-    now_local = datetime.now()
+    # Use system's local timezone
+    now_local = datetime.now().astimezone()
     target_date = now_local.date() - timedelta(days=days_ago)
     return target_date.isoformat()
 

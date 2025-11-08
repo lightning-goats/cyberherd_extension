@@ -11,14 +11,16 @@ DESIGN PHILOSOPHY - UTC-First:
    - "Today's notes" filtering (user's local day)
 3. Cache keys, database timestamps, and Nostr filters always use UTC values
 4. Local times are derived from UTC, never the source of truth
+5. System's local timezone is used (consistent with nightly reset behavior)
 
 RATIONALE:
 ==========
 - Nostr events use UTC timestamps (created_at field)
 - Database stores UTC timestamps
-- Multiple users may have different local timezones
+- System's configured timezone determines "local day" concept
 - DST transitions are handled correctly when converting FROM UTC
 - Eliminates ambiguity in "what is today?"
+- Consistent with nightly reset scheduling (uses system timezone)
 
 MIGRATION PATH:
 ===============
@@ -125,16 +127,13 @@ def get_day_boundaries_utc(days_ago: int = 0) -> DayBoundaries:
     utc_day_str = target_date.isoformat()
     
     # Local midnight for user-facing "today" concept
-    # Use configured local timezone (default: America/Denver) rather than system local
-    local_tz_name = os.getenv("CYBERHERD_LOCAL_TZ", "America/Denver")
+    # Use system's local timezone for consistency with nightly reset
     try:
-        if ZoneInfo is not None:
-            local_tz = ZoneInfo(local_tz_name)
-        else:
-            # Fallback to system local timezone if zoneinfo not available
-            local_tz = datetime.now().astimezone().tzinfo
-    except Exception:
+        # Get system local timezone
         local_tz = datetime.now().astimezone().tzinfo
+    except Exception:
+        # Fallback to UTC if local timezone detection fails
+        local_tz = timezone.utc
 
     now_local = datetime.now(local_tz)
     local_target_date = now_local.date() - timedelta(days=days_ago)
@@ -198,18 +197,14 @@ def format_timestamp_local(timestamp: int, fmt: str = "%Y-%m-%d %H:%M:%S %Z") ->
         fmt: strftime format string
         
     Returns:
-        Formatted string in user's local timezone
+        Formatted string in system's local timezone
     """
     dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-    # Use configured local timezone (default: America/Denver)
-    local_tz_name = os.getenv("CYBERHERD_LOCAL_TZ", "America/Denver")
+    # Use system's local timezone
     try:
-        if ZoneInfo is not None:
-            local_tz = ZoneInfo(local_tz_name)
-        else:
-            local_tz = datetime.now().astimezone().tzinfo
-    except Exception:
         local_tz = datetime.now().astimezone().tzinfo
+    except Exception:
+        local_tz = timezone.utc
 
     local_dt = dt.astimezone(local_tz)
     return local_dt.strftime(fmt)

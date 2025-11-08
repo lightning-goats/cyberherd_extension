@@ -161,22 +161,10 @@ class NostrWebSocketMonitor:
             
             tracked_note_ids = user_settings.tracked_event_ids or []
             tracked_tags = getattr(user_settings, 'tracked_tags', []) or []
-            effective_pubkey = getattr(user_settings, 'nostr_pubkey_override', None) or \
-                              getattr(user_settings, 'nostr_private_key', None)
             
-            # Convert private key to pubkey if needed
-            if effective_pubkey and len(effective_pubkey) == 64:
-                try:
-                    # Check if it's a private key (try to derive pubkey)
-                    import secp256k1
-                    try:
-                        priv = secp256k1.PrivateKey(bytes.fromhex(effective_pubkey))
-                        pub = priv.pubkey
-                        effective_pubkey = pub.serialize().hex()[2:]  # Remove '02' prefix
-                    except:
-                        pass  # Already a pubkey
-                except ImportError:
-                    pass
+            # Use proper effective pubkey resolution
+            from .subscriptions import get_effective_pubkey
+            effective_pubkey = get_effective_pubkey(user_settings)
             
             # Clear old subscriptions (we'll recreate them)
             old_subs = list(self.subscriptions.keys())
@@ -195,29 +183,54 @@ class NostrWebSocketMonitor:
             )
             
             # SUBSCRIPTION 1: Reposts and reactions for tracked notes (kind 6, 7)
-            # Only create if we have tracked notes
+            # Only create if we have tracked notes AND at least one engagement type is enabled
             if tracked_note_ids:
-                sub_id = self._get_new_subid()
+                # Check which engagement types are enabled
+                repost_enabled = getattr(user_settings, 'repost_tracking_enabled', False)
+                reaction_enabled = getattr(user_settings, 'likes_tracking_enabled', False)
                 
-                filter_dict = {
-                    "kinds": [6, 7],  # Reposts and reactions
-                    "#e": tracked_note_ids,  # Match events referencing ANY tracked note
-                    "since": int(time.time()),  # Only new events (real-time)
-                }
+                # Build kinds list based on enabled tracking
+                engagement_kinds = []
+                if repost_enabled:
+                    engagement_kinds.append(6)
+                if reaction_enabled:
+                    engagement_kinds.append(7)
                 
-                # Send REQ message
-                await self._send(["REQ", sub_id, filter_dict])
-                
-                # Track subscription
-                self.subscriptions[sub_id] = {
-                    "type": "engagement",  # reposts/reactions
-                    "filter": filter_dict,
-                }
-                
-                logger.info(
-                    f"✅ User {self.user_id}: Created engagement subscription (kind 6/7) for "
-                    f"{len(tracked_note_ids)} tracked note(s) (sub_id: {sub_id})"
-                )
+                # Only create subscription if at least one engagement type is enabled
+                if engagement_kinds:
+                    sub_id = self._get_new_subid()
+                    
+                    filter_dict = {
+                        "kinds": engagement_kinds,  # Only enabled types
+                        "#e": tracked_note_ids,  # Match events referencing ANY tracked note
+                        "since": int(time.time()),  # Only new events (real-time)
+                    }
+                    
+                    # Send REQ message
+                    await self._send(["REQ", sub_id, filter_dict])
+                    
+                    # Track subscription
+                    self.subscriptions[sub_id] = {
+                        "type": "engagement",  # reposts/reactions
+                        "filter": filter_dict,
+                    }
+                    
+                    engagement_types = []
+                    if repost_enabled:
+                        engagement_types.append("reposts")
+                    if reaction_enabled:
+                        engagement_types.append("reactions")
+                    
+                    logger.info(
+                        f"✅ User {self.user_id}: Created engagement subscription "
+                        f"({'/'.join(engagement_types)}) for {len(tracked_note_ids)} tracked note(s) "
+                        f"(sub_id: {sub_id})"
+                    )
+                else:
+                    logger.info(
+                        f"⏭️  User {self.user_id}: Has {len(tracked_note_ids)} tracked notes but "
+                        f"both repost and reaction tracking are disabled - skipping engagement subscription"
+                    )
             else:
                 logger.info(f"⏭️  User {self.user_id}: No tracked notes yet - skipping engagement subscription (will be created when notes are detected)")
             
@@ -235,8 +248,9 @@ class NostrWebSocketMonitor:
                 
                 # Add tag filter if user is tracking specific hashtags
                 if tracked_tags:
-                    # Normalize tags (remove # prefix, lowercase)
-                    normalized_tags = [tag.lstrip('#').lower() for tag in tracked_tags]
+                    # Normalize tags (remove # prefix)
+                    # Note: Tag matching is case-sensitive in Nostr, so preserve case
+                    normalized_tags = [tag.lstrip('#') for tag in tracked_tags]
                     filter_dict["#t"] = normalized_tags
                     
                     logger.debug(

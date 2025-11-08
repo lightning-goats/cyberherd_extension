@@ -1739,7 +1739,12 @@ async def api_get_today_cyberherd_notes(request: Request, auth=Depends(auth_wall
         pass
 
     from datetime import datetime, timezone
-    day_key = crud.get_local_date_key()  # Use authoritative local date calculation
+    
+    # Use UTC date for cache key consistency (matches _append_today in subscriptions.py)
+    # This ensures cache keys don't change during DST transitions
+    utc_now = datetime.now(timezone.utc)
+    day_key = utc_now.date().isoformat()  # UTC date string (e.g., "2025-11-08")
+    
     cache_key = (day_key, user_id, eff_pub, tuple(sorted(tags_lower)))
     debug_mode = request.query_params.get("debug") is not None
     # Fast-path cache hit (unless debug requested)
