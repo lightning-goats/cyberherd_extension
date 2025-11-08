@@ -512,31 +512,52 @@ async def api_get_source_wallet(
 async def api_manual_reset(
     request: Request, wallet_info: WalletTypeInfo = Depends(require_admin_key)
 ):
-    """Manually reset: deactivate all members and set SplitPayments to predefined wallet at 100%."""
-    await crud.deactivate_all_cyberherd_members(user_id=wallet_info.wallet.user)
-    # Also clear processed zap history for the requesting user so warm-start can re-run
+    """Manually reset: deactivate all members, clear tracked events, and reset splits to predefined wallet.
+    
+    Mirrors the nightly midnight_reset_job behavior to provide consistent reset functionality.
+    """
+    user_id = wallet_info.wallet.user
+    
+    # 1. Deactivate all members
+    await crud.deactivate_all_cyberherd_members(user_id=user_id)
+    
+    # 2. Clear processed zap history for fresh reprocessing
     try:
-        await clear_processed_zaps_for_user(wallet_info.wallet.user)
-    except Exception:
-        # Non-fatal, continue with split reset even if clearing fails
-        pass
-    # Note: we intentionally do NOT clear persisted processed-event markers here.
-    # Reposts and reactions (kind 6 and 7) are persisted when processed so they
-    # must not be eligible for reprocessing after a manual reset. We still clear
-    # the cached notes used for tracking to avoid stale in-memory state, but the
-    # persisted markers remain authoritative.
+        await clear_processed_zaps_for_user(user_id)
+    except Exception as e:
+        logger.warning(f"Manual reset: failed to clear processed zaps: {e}")
+    
+    # 3. Clear processed event history (reposts/reactions)
     try:
-        # Clear today's cached notes for this user (removes cache entries used by repost tracking)
-        try:
-            _clear_cached_notes_for_user(request.app, user_id=wallet_info.wallet.user)
-        except Exception:
-            pass
-    except Exception:
-        pass
-    # Use user-scoped settings only
-    settings = await crud.get_settings(wallet_info.wallet.user)
-    if settings and settings.source_wallet:
-        await reset_splits_to_predefined_wallet(settings.source_wallet, user_id=wallet_info.wallet.user)
+        await clear_processed_events_for_user(user_id)
+    except Exception as e:
+        logger.warning(f"Manual reset: failed to clear processed events: {e}")
+    
+    # 4. Reset tracked event IDs (clear today's note tracking)
+    try:
+        settings = await crud.get_settings(user_id)
+        if settings:
+            setattr(settings, "tracked_event_ids", [])
+            setattr(settings, "tracked_event_timestamps", {})
+            setattr(settings, "tracked_event_addresses", {})
+            await crud.upsert_settings(settings, user_id)
+    except Exception as e:
+        logger.warning(f"Manual reset: failed to reset tracked events: {e}")
+    
+    # 5. Clear cached notes for this user
+    try:
+        _clear_cached_notes_for_user(request.app, user_id=user_id)
+    except Exception as e:
+        logger.debug(f"Manual reset: note cache clear skipped: {e}")
+    
+    # 6. Reset splits to predefined wallet at 100%
+    try:
+        settings = await crud.get_settings(user_id)
+        if settings and settings.source_wallet:
+            await reset_splits_to_predefined_wallet(settings.source_wallet, user_id=user_id)
+    except Exception as e:
+        logger.warning(f"Manual reset: failed to reset splits: {e}")
+    
     return {"ok": True}
 
 

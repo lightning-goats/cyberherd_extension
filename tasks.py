@@ -323,58 +323,40 @@ async def midnight_reset_job(app: Any | None = None):
 
 
 async def wait_for_midnight():
-    """Sleep until the next midnight in the America/Denver timezone.
+    """Sleep until the next midnight in the system's local timezone.
 
-    The user requested the daily reset to occur at midnight America/Denver
-    (which is the common representation for UTC-6/UTC-7 depending on DST).
-    We compute the next local midnight in America/Denver and convert that
-    moment to UTC to sleep the appropriate number of seconds.
+    Uses the system's local timezone to calculate the next midnight.
+    This ensures the reset occurs at midnight according to the server's
+    configured timezone, automatically handling DST transitions.
     """
     from datetime import timedelta
-    try:
-        # Use zoneinfo (Python 3.9+) to handle daylight saving transitions.
-        from zoneinfo import ZoneInfo
-    except Exception:  # pragma: no cover - zoneinfo should exist on supported Python
-        ZoneInfo = None
-
-    # If ZoneInfo not available, fall back to UTC behavior
-    if ZoneInfo is None:
-        logger.warning(
-            "CyberHerd: zoneinfo not available, falling back to UTC midnight for reset scheduling"
-        )
-        now_utc = utc_now()
-        tomorrow_midnight_utc = datetime.combine(now_utc.date(), time(0, 0)).replace(tzinfo=timezone.utc)
-        if now_utc.time() >= time(0, 0):
-            tomorrow_midnight_utc = tomorrow_midnight_utc + timedelta(days=1)
-        sleep_seconds = (tomorrow_midnight_utc - now_utc).total_seconds()
-        if sleep_seconds < 0:
-            sleep_seconds = 0
-        logger.info(
-            f"CyberHerd: waiting {sleep_seconds:.2f} seconds until next UTC midnight reset (target={tomorrow_midnight_utc.isoformat()})"
-        )
-        await asyncio.sleep(sleep_seconds)
-        return
-
-    denver = ZoneInfo("America/Denver")
+    
     now_utc = utc_now()
-    # current time in Denver
-    now_denver = now_utc.astimezone(denver)
-
-    # build local midnight for the next day in Denver
-    local_midnight = datetime.combine(now_denver.date(), time(0, 0))
-    local_midnight = local_midnight.replace(tzinfo=denver)
-    if now_denver.time() >= time(0, 0):
+    
+    # Get system local time using datetime.now() without timezone
+    # Then make it timezone-aware using astimezone()
+    now_local = datetime.now().astimezone()
+    local_tz = now_local.tzinfo
+    local_tz_name = now_local.tzname() or "Local"
+    
+    # Build next midnight in local timezone
+    # Start with today's midnight
+    local_midnight = datetime.combine(now_local.date(), time(0, 0))
+    local_midnight = local_midnight.replace(tzinfo=local_tz)
+    
+    # If we're already past midnight today, schedule for tomorrow's midnight
+    if now_local >= local_midnight:
         local_midnight = local_midnight + timedelta(days=1)
-
-    # convert that Denver-local midnight to UTC
+    
+    # Convert local midnight to UTC for sleep calculation
     target_utc = local_midnight.astimezone(timezone.utc)
     sleep_seconds = (target_utc - now_utc).total_seconds()
     if sleep_seconds < 0:
         sleep_seconds = 0
-
+    
     logger.info(
-        f"CyberHerd: waiting {sleep_seconds:.2f} seconds until next America/Denver midnight reset "
-        f"(target Denver={local_midnight.isoformat()} target UTC={target_utc.isoformat()})"
+        f"CyberHerd: waiting {sleep_seconds:.2f} seconds until next midnight reset "
+        f"(target local={local_midnight.isoformat()} [{local_tz_name}] | target UTC={target_utc.isoformat()})"
     )
     await asyncio.sleep(sleep_seconds)
 
@@ -402,16 +384,25 @@ def cyberherd_tasks(app: Any | None = None):
         create_permanent_unique_task("cyberherd_midnight_reset", schedule_midnight_reset)
         logger.success("✅ CyberHerd: Midnight reset task created successfully (task_id='cyberherd_midnight_reset')")
         
-        # Log next scheduled run time
-        now_utc = utc_now()
+        # Log next scheduled run time using system local timezone
+        now_local = datetime.now().astimezone()
+        local_tz_name = now_local.tzname() or "Local"
         from datetime import timedelta
-        tomorrow_midnight = datetime.combine(now_utc.date(), datetime.min.time()).replace(tzinfo=timezone.utc)
-        if now_utc.time() >= datetime.min.time():
-            tomorrow_midnight = tomorrow_midnight + timedelta(days=1)
-        seconds_until = (tomorrow_midnight - now_utc).total_seconds()
+        
+        # Calculate next midnight in local time
+        next_midnight_local = datetime.combine(now_local.date(), time(0, 0))
+        next_midnight_local = next_midnight_local.replace(tzinfo=now_local.tzinfo)
+        if now_local >= next_midnight_local:
+            next_midnight_local = next_midnight_local + timedelta(days=1)
+        
+        # Convert to UTC for accurate time calculation
+        now_utc = utc_now()
+        next_midnight_utc = next_midnight_local.astimezone(timezone.utc)
+        seconds_until = (next_midnight_utc - now_utc).total_seconds()
+        
         logger.info(
             f"⏰ CyberHerd: Next midnight reset scheduled in {seconds_until/3600:.1f} hours "
-            f"(at {tomorrow_midnight.isoformat()})"
+            f"(local: {next_midnight_local.isoformat()} [{local_tz_name}])"
         )
     except Exception as e:
         logger.error(f"❌ CyberHerd: Failed to create midnight reset task: {e}")

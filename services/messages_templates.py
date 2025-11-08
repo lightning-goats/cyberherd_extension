@@ -26,6 +26,16 @@ member_increase = {
     0: "{member_name} increased contribution by {increase_amount} to {new_total} sats."
 }
 
+kind_6_repost = {
+    0: "{member_name} reposted! Contribution increased by {increase_amount} to {new_total} sats. ⚡"
+}
+
+kind_7_reaction = {
+    0: "{member_name} reacted! Contribution increased by {increase_amount} to {new_total} sats. ⚡"
+}
+
 # Maintain backward compatibility aliases (old variable names referenced elsewhere)
 cyber_herd_dict = cyber_herd_join  # legacy alias
 member_increase_dict = member_increase
+kind_6_repost_dict = kind_6_repost
+kind_7_reaction_dict = kind_7_reaction
