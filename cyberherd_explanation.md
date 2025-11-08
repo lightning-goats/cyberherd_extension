@@ -37,13 +37,15 @@ Members can join the CyberHerd without zapping by reposting or reacting to TODAY
 - **Bonus for zappers**: Members who have zaps AND kind 6/7 events receive their proportional zap share PLUS their share of the 1% bonus
 - **Valid requirements**: NIP-05 identifier (configurable, can be disabled) and Lightning address required
 - **Vulnerable to displacement**: Any zap (even 1 sat) will displace repost/reaction-only members first
-- **Cannot headbutt**: Reposts and reactions cannot displace existing members
+- **Repost headbutting (kind 6)**: Reposts CAN headbutt other repost-only or reaction-only members (amount=0) when the herd is full
+- **Reaction no headbutting (kind 7)**: Reactions CANNOT headbutt anyone - can only join when slots are available
 - **Can upgrade to zapper**: Existing repost/reaction members can zap ANY Lightning Goats note to increase their amount and secure a larger payout share
 
 ### Priority Hierarchy:
-When a zapper joins a full herd:
-1. **First priority**: Displace repost/reaction members (amount = 0 sats)
-2. **Second priority**: Compete with other zappers based on amount
+When the herd is full:
+1. **Zaps**: Displace repost/reaction members first (amount = 0 sats), then compete with other zappers based on amount
+2. **Reposts (kind 6)**: Can displace other repost-only or reaction-only members (amount = 0 sats)
+3. **Reactions (kind 7)**: Cannot headbutt - must wait for open slots or can zap or repost to increase headbutting abilities.
 
 ### Why Join via Repost/Reaction:
 - **Risk-free participation**: Join without financial commitment
@@ -203,6 +205,24 @@ When the CyberHerd reaches maximum capacity, new members can still join by "head
 - New herd: [Zap (500 sats), Repost (0 sats), empty]
 - Reposts and reactions can join when slots are available without paying
 
+**Scenario 7 - Repost headbutts reaction member:**
+- Current herd: [Reaction (0 sats), Zap (100 sats), Zap (200 sats)]
+- You repost TODAY'S #CyberHerd note → You replace the reaction member
+- New herd: [Repost (0 sats), Zap (100 sats), Zap (200 sats)]
+- Reposts can headbutt repost-only or reaction-only members when the herd is full
+
+**Scenario 8 - Repost headbutts another repost member:**
+- Current herd: [Repost (0 sats), Zap (100 sats), Zap (200 sats)]
+- You repost TODAY'S #CyberHerd note → You replace the existing repost member
+- New herd: [Repost (0 sats - you), Zap (100 sats), Zap (200 sats)]
+- Reposts can replace other repost members (most recent repost wins)
+
+**Scenario 9 - Reaction cannot headbutt:**
+- Current herd: [Repost (0 sats), Zap (100 sats), Zap (200 sats)]
+- You react to TODAY'S #CyberHerd note → Headbutt fails (reactions cannot headbutt)
+- Herd unchanged: [Repost (0 sats), Zap (100 sats), Zap (200 sats)]
+- Reactions can only join when there are open slots available
+
 ### Protection Strategy:
 - **Build your total**: Multiple zaps accumulate, making you harder to headbutt
 - **Monitor the herd**: Check current members' contributions before zapping
@@ -210,14 +230,16 @@ When the CyberHerd reaches maximum capacity, new members can still join by "head
 - **Risk awareness**: Getting headbutted means losing ALL accumulated sats - they don't carry over if you rejoin
 
 ### Headbutting Rules:
-- **New members only**: Only new members can attempt headbutting by zapping TODAY'S #CyberHerd note
+- **New members only**: Only new members can attempt headbutting by zapping TODAY'S #CyberHerd note or reposting it
 - **Daily note requirement**: Must use the current day's #CyberHerd note (older notes invalid due to daily reset)
 - **Existing member flexibility**: Current members can increase payouts by zapping ANY Lightning Goats note
 - **Minimum zap for headbutting**: 10 sats required to headbutt via zap
-- **Repost/reaction bypass**: Reposts (kind 6) and reactions (kind 7) can join when herd has open slots without headbutting
+- **Repost headbutting (kind 6)**: Reposts can join and headbutt repost-only or reaction-only members when herd is full
+- **Reaction bypass (kind 7)**: Reactions can only join when herd has open slots (cannot headbutt)
 - **Zap priority**: Zaps always displace repost/reaction members first before competing with other zaps
+- **Repost targets**: Reposts can only displace members with amount=0 (other reposts or reactions)
 - **Amount reset**: When headbutted out, your accumulated amount is completely reset to zero
-- **Fresh start**: To rejoin after being headbutted, you start with zero sats and must zap TODAY'S #CyberHerd note again
+- **Fresh start**: To rejoin after being headbutted, you start with zero sats and must zap or repost TODAY'S #CyberHerd note again
 - **Public notifications**: Both parties receive public reply notifications about headbutts
 - **Instant processing**: Headbutt attempts are processed immediately when the herd is full
 
@@ -236,10 +258,12 @@ The CyberHerd works automatically behind the scenes:
 2. **Find TODAY'S CyberHerd note**: Look for the current day's #CyberHerd tagged note by the Lightning Goats project (older #CyberHerd notes won't work due to daily reset)
 3. **Choose your entry method**:
    - **Zap to join**: Send 10+ sats to join with payout eligibility
-   - **Repost or react to join**: Free entry with 0 sats (no payout until you zap)
+   - **Repost to join**: Free entry with 0 sats, can headbutt other repost/reaction members when herd is full
+   - **React to join**: Free entry with 0 sats, can only join when slots are available (cannot headbutt)
 4. **Handle full herd**: If the herd is full (3 members):
    - **Zaps**: Will displace repost/reaction members first, then compete with other zappers by amount
-   - **Reposts/reactions**: Cannot join when herd is full (cannot headbutt)
+   - **Reposts (kind 6)**: Can headbutt other repost-only or reaction-only members (amount=0)
+   - **Reactions (kind 7)**: Cannot join when herd is full (cannot headbutt)
 5. **Explore flexible zapping**: Once a member, zap ANY Lightning Goats note to increase your payout share and headbutt protection
 6. **Monitor the herd**: Check current members to plan your strategy
 7. **Stay active**: Regular zaps to Lightning Goats content build up your total contribution and payout share
@@ -252,10 +276,13 @@ The CyberHerd works automatically behind the scenes:
 - **Requirements**: NIP-05 identifier (configurable, can be disabled) and working Lightning address required
 - **Content scope**: Only zaps to Lightning Goats authored notes qualify for membership and payouts
 - **New members via zap**: Must zap TODAY'S #CyberHerd tagged note to join (minimum sats configurable, typically 10+)
-- **New members via repost/reaction**: Can repost or react to TODAY'S #CyberHerd note to join with 0 sats (receives share of 1% pool)
+- **New members via repost**: Can repost TODAY'S #CyberHerd note to join with 0 sats (can headbutt other repost/reaction members)
+- **New members via reaction**: Can react to TODAY'S #CyberHerd note to join with 0 sats (only when slots available, cannot headbutt)
 - **Existing members**: Can zap ANY Lightning Goats note to increase payouts (minimum sats configurable, typically 10+)
-- **Maximum members**: Configurable (typically 3) - full herd requires headbutting out lowest member to join (or displacing repost/reaction members)
+- **Maximum members**: Configurable (typically 3) - full herd requires headbutting out lowest member to join
 - **Zap priority**: Zaps always displace repost/reaction-only members first before competing with other zaps
+- **Repost headbutting**: Reposts (kind 6) can displace repost-only or reaction-only members (amount=0)
+- **Reaction limitation**: Reactions (kind 7) cannot headbutt - can only join when open slots available
 - **Kind 6/7 allocation**: The 1% bonus pool is split evenly among all members with kind 6 or 7 events (or both)
 - **Zapper bonus**: Members with zaps AND kind 6/7 events receive proportional zap share PLUS their share of 1% bonus
 - **Headbutt consequences**: Getting headbutted resets your accumulated payout score to zero

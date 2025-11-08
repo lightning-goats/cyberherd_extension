@@ -649,13 +649,32 @@ class EnhancedHeadbuttService:
     async def process_headbutting_attempts(
         self, attempts: list[Any]
     ) -> list[dict[str, Any]]:
-        headbutt_attempts = [
-            item for item in attempts if getattr(item, "amount", 0) and item.amount > 0
-        ]
+        # Include attempts that can headbutt:
+        # 1. Zaps (amount > 0)
+        # 2. Reposts (kind 6) - can headbutt amount=0 members
+        # 3. Exclude reactions (kind 7 only) - should never headbutt
+        headbutt_attempts = []
+        for item in attempts:
+            # Check if it's a zap (has amount)
+            if getattr(item, "amount", 0) and item.amount > 0:
+                headbutt_attempts.append(item)
+                continue
+            
+            # Check if it's a repost (kind 6) - allow headbutting
+            kinds = getattr(item, "kinds", [])
+            if 6 in kinds:
+                # Repost can headbutt
+                headbutt_attempts.append(item)
+                continue
+            
+            # Kind 7 only (reactions) - skip, should never headbutt
+            # (implicitly excluded by not adding to headbutt_attempts)
+        
         if not headbutt_attempts:
             return []
 
-        headbutt_attempts.sort(key=lambda x: x.amount, reverse=True)
+        # Sort by amount (zaps first by amount, then reposts with amount=0)
+        headbutt_attempts.sort(key=lambda x: getattr(x, "amount", 0), reverse=True)
         successful = []
 
         for attempt in headbutt_attempts:
@@ -1038,6 +1057,17 @@ class EnhancedHeadbuttService:
         is_reaction = getattr(attacker, "is_reaction", False) or (
             getattr(attacker, "kinds", None) and 7 in getattr(attacker, "kinds", [])
         )
+        
+        # Kind 7 (reactions) should NEVER headbutt
+        if is_reaction and not is_repost:
+            kinds = getattr(attacker, "kinds", [])
+            # Only block if it's kind 7 without kind 6
+            if 7 in kinds and 6 not in kinds:
+                logger.info(
+                    f"AdmissionGuard reaction_no_headbutt: Kind 7 (reaction) cannot headbutt when herd is full "
+                    f"(pubkey={attacker.pubkey[:8]}...)"
+                )
+                return None
         
         if is_repost:
             # For reposts (kind 6), can replace:
