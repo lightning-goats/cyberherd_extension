@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from datetime import datetime, time, timezone
 from typing import Any
@@ -16,11 +17,10 @@ from .crud import (
     upsert_settings,
 )
 from .services.splits import reset_splits_to_predefined_wallet
+from .services.zap_monitor import get_zap_monitor
 from . import crud as crud_module
 from .views_api import _clear_cached_notes_for_user
 from .utils.common import parse_bool_env, utc_now
-from .utils.zap_requests import extract_zap_request
-from .services.zap_monitor import get_zap_monitor
 
 # Conditional import for cyberherd_messaging
 try:
@@ -42,6 +42,101 @@ def parse_bool(value: str | bool | None, default: bool = False) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return default
+
+
+def _coerce_extra_dict(payment: Any) -> dict[str, Any]:
+    """Ensure payment.extra is a dict for downstream processing."""
+    extra = getattr(payment, "extra", None)
+    if extra is None:
+        extra = {}
+    elif isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except Exception:
+            extra = {}
+    elif not isinstance(extra, dict):
+        try:
+            extra = dict(extra)
+        except Exception:
+            extra = {}
+    setattr(payment, "extra", extra)
+    return extra
+
+
+def _normalize_zap_request(payment: Any) -> dict[str, Any] | None:
+    """
+    Normalize zap request payload into payment.extra['nostr'].
+
+    Accepts zap requests provided via:
+    - payment.extra['nostr'] (dict or JSON string)
+    - payment.extra['zap_request'] / ['zapRequest']
+    - payment.extra['comment'] JSON payload (legacy)
+    - payment.memo containing JSON zap request
+    """
+    extra = _coerce_extra_dict(payment)
+
+    zap_request: dict[str, Any] | None = None
+    zap_request_source: str | None = None
+
+    nostr_value = extra.get("nostr")
+    if nostr_value:
+        if isinstance(nostr_value, dict):
+            zap_request = nostr_value
+        else:
+            try:
+                zap_request = json.loads(nostr_value)
+            except Exception:
+                zap_request = None
+        zap_request_source = "nostr"
+
+    if not zap_request:
+        for key in ("zap_request", "zapRequest"):
+            candidate = extra.get(key)
+            if not candidate:
+                continue
+            if isinstance(candidate, dict):
+                zap_request = candidate
+            else:
+                try:
+                    zap_request = json.loads(candidate)
+                except Exception:
+                    zap_request = None
+            if zap_request:
+                zap_request_source = key
+                break
+
+    if not zap_request and isinstance(extra.get("comment"), str):
+        comment = extra["comment"].strip()
+        if comment.startswith("{"):
+            try:
+                zap_request = json.loads(comment)
+                zap_request_source = "comment"
+            except json.JSONDecodeError:
+                zap_request = None
+
+    if not zap_request and isinstance(getattr(payment, "memo", None), str):
+        memo = payment.memo.strip()
+        if memo.startswith("{"):
+            try:
+                zap_request = json.loads(memo)
+                zap_request_source = "memo"
+            except json.JSONDecodeError:
+                zap_request = None
+
+    if zap_request:
+        extra["nostr"] = zap_request
+        logger.debug(
+            "CyberHerd: normalized zap request from %s field for payment %s",
+            zap_request_source or "unknown",
+            getattr(payment, "checking_id", None) or getattr(payment, "payment_hash", None),
+        )
+    else:
+        logger.debug(
+            "CyberHerd: payment %s missing zap request payload",
+            getattr(payment, "checking_id", None) or getattr(payment, "payment_hash", None),
+        )
+
+    return zap_request
 
 
 async def process_incoming_payment(payment: Any, app: Any | None = None) -> None:
@@ -67,8 +162,8 @@ async def process_incoming_payment(payment: Any, app: Any | None = None) -> None
             logger.debug("CyberHerd: wallet %s has no user, skipping payment", wallet_id)
             return
 
-        zap_info = extract_zap_request(payment)
-        if not zap_info:
+        zap_request = _normalize_zap_request(payment)
+        if not zap_request:
             return
 
         monitor = get_zap_monitor(app=app, db=crud_module, user_id=user_id)
