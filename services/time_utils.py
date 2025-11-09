@@ -154,6 +154,27 @@ def get_day_boundaries_utc(days_ago: int = 0) -> DayBoundaries:
     )
 
 
+def get_day_boundaries_local(days_ago: int = 0) -> DayBoundaries:
+    """LEGACY: Get day boundaries with local-first calculation.
+    
+    DEPRECATED: This function exists only for backward compatibility.
+    New code should use get_day_boundaries_utc() instead.
+    
+    This calculates the user's local day boundaries and converts to UTC.
+    While functionally equivalent to get_day_boundaries_utc(), it's less
+    clear about the intent and can be confusing.
+    
+    Args:
+        days_ago: How many days back to calculate (0 = today, 1 = yesterday, etc.)
+    
+    Returns:
+        DayBoundaries object (same as get_day_boundaries_utc)
+    """
+    # For backward compatibility, delegate to UTC-first function
+    # The results are the same, but the calculation order differs
+    return get_day_boundaries_utc(days_ago)
+
+
 def format_timestamp_utc(timestamp: int, fmt: str = "%Y-%m-%d %H:%M:%S UTC") -> str:
     """Format a UTC timestamp for display.
     
@@ -243,6 +264,7 @@ def get_yesterday_boundaries() -> DayBoundaries:
 __all__ = [
     "DayBoundaries",
     "get_day_boundaries_utc",
+    "get_day_boundaries_local",
     "format_timestamp_utc",
     "format_timestamp_local",
     "get_cache_key_prefix_utc",
