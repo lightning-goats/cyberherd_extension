@@ -604,9 +604,9 @@ class EnhancedHeadbuttService:
         metadata: dict[str, Any] | None = None
         if needs_refresh:
             try:
-                from .nostr_lookup import lookup_metadata  # type: ignore
+                from .nostr_helpers import fetch_profile_metadata  # type: ignore
 
-                metadata = await lookup_metadata(pubkey)
+                metadata = await fetch_profile_metadata(pubkey)
             except Exception as exc:  # pragma: no cover - network dependent
                 logger.debug(f"cyberherd: metadata lookup failed for {pubkey[:8]}...: {exc}")
 

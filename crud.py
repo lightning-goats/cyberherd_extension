@@ -15,6 +15,7 @@ from lnbits.helpers import decrypt_internal_message, encrypt_internal_message # 
 from .models import CyberherdSettings, LegacyCyberherdMember
 from .services.shares import compute_member_share_percentages
 from .utils.common import extract_t_tags_from_event, utc_now
+from .services.time_utils import get_day_boundaries_utc
 
 db = Database("ext_cyberherd")
 # Serialize critical write operations in this module to reduce sqlite locking
@@ -41,50 +42,6 @@ def _sanitize_private_key(raw_value) -> tuple[str | None, int]:
         return cleaned[:64], len(cleaned)
 
     return None, len(cleaned)
-
-
-def get_utc_day_boundaries(days_ago: int = 0) -> tuple[datetime, datetime, int, int]:
-    """Get UTC day boundaries for cyberherd calculations (UTC-first approach).
-    
-    DEPRECATED: Use services.time_utils.get_day_boundaries_utc() instead.
-    This wrapper exists for backward compatibility only.
-    
-    All new code should import from time_utils:
-        from .services.time_utils import get_day_boundaries_utc
-        boundaries = get_day_boundaries_utc(days_ago=0)
-    
-    Args:
-        days_ago: How many days back to calculate (0 = today, 1 = yesterday, etc.)
-    
-    Returns:
-        Tuple of (midnight_utc, midnight_local, since_timestamp, until_timestamp)
-        - midnight_utc: UTC midnight datetime (timezone-aware) - PRIMARY
-        - midnight_local: Local midnight datetime (timezone-aware) - for display only
-        - since_timestamp: Unix timestamp for start of day in UTC
-        - until_timestamp: Unix timestamp for end of day in UTC
-    """
-    # Delegate to shared time_utils module
-    from .services.time_utils import get_day_boundaries_utc as get_boundaries
-    boundaries = get_boundaries(days_ago)
-    
-    # Return in legacy tuple format for backward compatibility
-    return (
-        boundaries.utc_midnight,
-        boundaries.local_midnight,
-        boundaries.utc_since_ts,
-        boundaries.utc_until_ts
-    )
-
-
-def get_local_day_boundaries(days_ago: int = 0) -> tuple[datetime, datetime, int, int]:
-    """DEPRECATED: Use get_utc_day_boundaries() instead.
-    
-    Legacy wrapper that returns values in old order for backward compatibility.
-    Will be removed in future version.
-    """
-    midnight_utc, midnight_local, since_timestamp, until_timestamp = get_utc_day_boundaries(days_ago)
-    # Return in old order: (midnight_local, midnight_utc, ...)
-    return midnight_local, midnight_utc, since_timestamp, until_timestamp
 
 
 def get_local_date_key(days_ago: int = 0) -> str:
@@ -2835,7 +2792,11 @@ async def _get_detected_cyberherd_notes_for_settings(settings, since_days_ago: i
         return []
 
     # Use UTC-first time calculation (authoritative)
-    midnight_utc, midnight_local, since_timestamp, until_timestamp = get_utc_day_boundaries(since_days_ago)
+    boundaries = get_day_boundaries_utc(since_days_ago)
+    midnight_utc = boundaries.utc_midnight
+    midnight_local = boundaries.local_midnight
+    since_timestamp = boundaries.utc_since_ts
+    until_timestamp = boundaries.utc_until_ts
     
     # CRITICAL: Query strategy for note detection
     # We query by author + time + kind, then filter locally by hashtags
