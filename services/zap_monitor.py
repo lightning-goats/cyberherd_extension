@@ -23,7 +23,6 @@ is handled by the subscriptions system instead.
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional, cast
@@ -36,6 +35,7 @@ from .subscriptions import get_subscription_status
 from .pubkey import resolve_effective_pubkey
 from .note_metadata import apply_event_address
 from ..utils.common import utc_now_timestamp  # Centralized UTC timestamp function
+from ..utils.zap_requests import extract_zap_request
 
 # NostrEventMonitor was planned but not implemented - monitoring happens via subscriptions.py
 _monitoring_available = False
@@ -329,7 +329,7 @@ class ZapMonitorService:
         """Process a payment notification to detect LNURLp zaps.
         
         This method is called by the invoice listener and parses zap requests from
-        payment.extra["nostr"] (NIP-57 zap request JSON string).
+        payment.extra["nostr"] (NIP-57 zap request payload).
         
         IMPORTANT: Only processes zaps for TODAY's tracked notes. This enforces
         the rule that zaps are only valid for the current day's CyberHerd notes.
@@ -363,103 +363,8 @@ class ZapMonitorService:
                     # Payment is not to the herd wallet, ignore
                     return
             
-            # Extract zap request from payment.extra["nostr"] (preferred) or comment (fallback)
-            zap_request = None
-            zap_request_source = None
-
-            # Support payment.extra being either a JSON string or a dict
-            extra_obj = None
-            if payment.extra:
-                if isinstance(payment.extra, str):
-                    try:
-                        extra_obj = json.loads(payment.extra)
-                    except Exception:
-                        extra_obj = None
-                elif isinstance(payment.extra, dict):
-                    extra_obj = payment.extra
-                else:
-                    # Try best-effort attribute access
-                    try:
-                        extra_obj = dict(payment.extra)
-                    except Exception:
-                        extra_obj = None
-
-            if extra_obj:
-                # Prefer nostr field (LNURLp standard)
-                nostr_json = extra_obj.get("nostr")
-                if nostr_json:
-                    # zap_request may already be a dict or a JSON string
-                    if isinstance(nostr_json, dict):
-                        zap_request = nostr_json
-                        zap_request_source = "nostr"
-                        logger.debug(f"Parsed zap request from payment.extra['nostr'] (dict)")
-                    else:
-                        try:
-                            zap_request = json.loads(nostr_json)
-                            zap_request_source = "nostr"
-                            logger.debug(f"Parsed zap request from payment.extra['nostr']")
-                        except Exception as e:
-                            logger.warning(f"Failed to parse zap request from nostr field: {e}")
-
-                # Check for new-style fields used by process_incoming_payment fallback
-                if not zap_request:
-                    for key in ("zap_request", "zapRequest"):
-                        candidate = extra_obj.get(key)
-                        if not candidate:
-                            continue
-                        if isinstance(candidate, dict):
-                            zap_request = candidate
-                        else:
-                            try:
-                                zap_request = json.loads(candidate)
-                            except Exception:
-                                zap_request = None
-                        if zap_request:
-                            zap_request_source = key
-                            logger.debug(f"Parsed zap request from payment.extra['{key}']")
-                            break
-
-                # Fallback to comment field (legacy)
-                if not zap_request:
-                    comment = extra_obj.get("comment")
-                    if comment and isinstance(comment, str) and comment.strip().startswith("{"):
-                        try:
-                            zap_request = json.loads(comment)
-                            zap_request_source = "comment"
-                            logger.debug(f"Parsed zap request from payment.extra['comment'] (legacy)")
-                        except json.JSONDecodeError:
-                            pass  # Not a JSON comment, ignore
-
-            # Fallback: allow memo to carry zap request JSON (legacy clients)
-            if not zap_request:
-                memo_field = getattr(payment, "memo", None)
-                if isinstance(memo_field, str) and memo_field.strip().startswith("{"):
-                    try:
-                        zap_request = json.loads(memo_field)
-                        zap_request_source = "memo"
-                        logger.debug("Parsed zap request from payment.memo field")
-                        extra_obj = extra_obj or {}
-                    except json.JSONDecodeError:
-                        pass
-
-            # Ensure normalized storage back into payment.extra for future calls
-            # IMPORTANT: Do not store a dict under the "nostr" key because other
-            # parts of the system (e.g. lnbits lnurlp.send_zap) expect a JSON
-            # string and will call json.loads() on it. Store a JSON string to
-            # remain compatible and avoid TypeError: json.loads(dict).
-            if zap_request:
-                try:
-                    nostr_str = json.dumps(zap_request)
-                    if isinstance(extra_obj, dict):
-                        extra_obj["nostr"] = nostr_str
-                        payment.extra = extra_obj
-                    else:
-                        payment.extra = {"nostr": nostr_str}
-                except Exception:
-                    # Best-effort; do not fail if assignment fails
-                    pass
-            
-            if not zap_request:
+            zap_info = extract_zap_request(payment)
+            if not zap_info:
                 payment_hash_preview = None
                 try:
                     payment_hash = getattr(payment, 'payment_hash', None) or getattr(payment, 'checking_id', None)
@@ -469,7 +374,10 @@ class ZapMonitorService:
                 logger.debug(f"No zap request found in payment {payment_hash_preview}...")
                 self.last_error = "payment_missing_nostr_field"
                 return False
-            
+
+            zap_request = zap_info.payload
+            zap_request_source = zap_info.source or "nostr"
+
             # Extract zapper pubkey
             zapper_pubkey = zap_request.get("pubkey")
             if not zapper_pubkey:
