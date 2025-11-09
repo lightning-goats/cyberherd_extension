@@ -722,8 +722,70 @@ async def query_user_relays(pubkey: str) -> list[str]:
     for tag in events[0].get("tags", []):
         if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "r":
             relays.append(tag[1])
-    
+
     return relays
+
+
+async def fetch_user_relays(pubkey: str) -> list[str]:
+    """Return a sanitized relay list for *pubkey*.
+
+    This thin wrapper ensures callers always receive a list even if the
+    underlying query fails or returns malformed entries.
+    """
+
+    try:
+        relays = await query_user_relays(pubkey)
+    except Exception as exc:  # pragma: no cover - depends on nostrclient
+        logger.debug(f"fetch_user_relays failed for {pubkey[:8]}...: {exc}")
+        return []
+
+    return [url for url in relays if isinstance(url, str) and url]
+
+
+async def fetch_profile_metadata(pubkey: str) -> dict[str, Any] | None:
+    """Return display metadata for *pubkey* using nostr relays."""
+
+    if not isinstance(pubkey, str) or not pubkey:
+        return None
+
+    pubkey = pubkey.strip()
+    if not pubkey:
+        return None
+
+    relays: list[str] = []
+    try:
+        relays = await query_user_relays(pubkey)
+    except Exception as exc:  # pragma: no cover - depends on nostrclient
+        logger.debug(f"fetch_profile_metadata relay discovery failed: {exc}")
+
+    metadata = await query_kind_0_metadata(pubkey, extra_relays=relays or None)
+    if not isinstance(metadata, dict):
+        logger.debug(f"fetch_profile_metadata: no metadata for {pubkey[:8]}...")
+        return None
+
+    display_name = metadata.get("display_name") or metadata.get("name")
+    if not display_name:
+        nip05 = metadata.get("nip05")
+        if isinstance(nip05, str) and "@" in nip05:
+            display_name = nip05.split("@", 1)[0]
+
+    result = {
+        "display_name": display_name or "Anon",
+        "lud16": metadata.get("lud16"),
+        "picture": metadata.get("picture"),
+        "nip05": metadata.get("nip05"),
+    }
+
+    logger.info(
+        "cyberherd: metadata for %s display_name=%s lud16=%s nip05=%s picture=%s",
+        pubkey[:12],
+        result["display_name"] or "",
+        result["lud16"] or "",
+        result["nip05"] or "",
+        "yes" if result["picture"] else "no",
+    )
+
+    return result
 
 
 # ============================================================================

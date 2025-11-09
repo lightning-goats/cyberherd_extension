@@ -737,23 +737,6 @@ async def _trigger_recovery_for_all_users(app):
         logger.error(f"Error in _trigger_recovery_for_all_users: {e}")
 
 
-async def _initialize_tracked_event_ids_on_startup(app):
-    """DEPRECATED: Replaced by force_requery_for_user in startup flow.
-    
-    This function is no longer needed because force_requery_for_user does everything
-    this function did PLUS more, eliminating duplicate queries during startup.
-    
-    Original purpose: Initialize tracked_event_ids with recent notes on startup.
-    New approach: force_requery_for_user queries notes and auto-populates tracked_event_ids
-    via _append_today, while also handling engagement event recovery in one pass.
-    """
-    logger.warning(
-        "DEPRECATED: _initialize_tracked_event_ids_on_startup called. "
-        "This is now handled by force_requery_for_user in the startup flow."
-    )
-    # Function body removed - use force_requery_for_user instead
-
-
 async def _any_tracked_event_ids_exist(app) -> bool:
     """Return True if any user with tracking enabled already has tracked_event_ids.
 
@@ -786,23 +769,6 @@ async def _any_tracked_event_ids_exist(app) -> bool:
     except Exception:
         return False
     return False
-
-
-async def _wait_for_tracked_event_ids(app, timeout_seconds: float = 30.0) -> bool:
-    """DEPRECATED: No longer needed with optimized startup flow.
-    
-    This function is no longer needed because force_requery_for_user runs first
-    during startup and immediately populates tracked_event_ids, eliminating the
-    need to wait/poll for them to be ready.
-    
-    Original purpose: Wait for any user to have tracked_event_ids populated.
-    New approach: force_requery_for_user populates them synchronously during startup.
-    """
-    logger.warning(
-        "DEPRECATED: _wait_for_tracked_event_ids called. "
-        "No longer needed - force_requery_for_user populates tracked_event_ids synchronously."
-    )
-    return True  # Return True to avoid breaking existing logic
 
 
 async def cyberherd_subscription_handler():
@@ -848,36 +814,6 @@ async def cyberherd_subscription_handler():
         raise
 
 
-def start_subscriptions(app):
-    """DEPRECATED: Legacy function kept for backward compatibility.
-    
-    The new approach uses cyberherd_subscription_handler() called by
-    create_permanent_unique_task() in __init__.py, following the nwcprovider pattern.
-    
-    This function is no longer used but kept to avoid breaking imports.
-    """
-    logger.warning(
-        "start_subscriptions() called but is deprecated. "
-        "Subscriptions are now started via cyberherd_subscription_handler() "
-        "using create_permanent_unique_task() in __init__.py"
-    )
-    return None
-
-
-async def poll_now(*args, **kwargs):  # legacy public API kept as no-op
-    """Deprecated: previously triggered an immediate poll.
-
-    Now returns current subscription status only; retained for backward
-    compatibility with admin tooling.
-    """
-    try:
-        app = args[0] if args else None
-        if app is not None:
-            st = getattr(app, "state", app)
-            status = getattr(st, "cyberherd_subscription_status", {}) or {}
-            return {"status": status, "note": "poll deprecated"}
-    except Exception:
-        pass
 
  
 

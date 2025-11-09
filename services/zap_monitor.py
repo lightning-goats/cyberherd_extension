@@ -23,7 +23,6 @@ is handled by the subscriptions system instead.
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional, cast
@@ -36,6 +35,7 @@ from .subscriptions import get_subscription_status
 from .pubkey import resolve_effective_pubkey
 from .note_metadata import apply_event_address
 from ..utils.common import utc_now_timestamp  # Centralized UTC timestamp function
+from ..utils.zap_requests import extract_zap_request
 
 # NostrEventMonitor was planned but not implemented - monitoring happens via subscriptions.py
 _monitoring_available = False
@@ -47,11 +47,6 @@ except Exception:  # pragma: no cover
     _register_invoice_listener = None  # type: ignore
 else:  # pragma: no cover
     _monitoring_available = True
-
-try:  # pragma: no cover
-    from . import nostr_lookup as nl  # type: ignore
-except Exception:  # pragma: no cover
-    nl = None  # type: ignore
 
 try:  # pragma: no cover
     from . import nostr_helpers  # type: ignore
@@ -329,7 +324,7 @@ class ZapMonitorService:
         """Process a payment notification to detect LNURLp zaps.
         
         This method is called by the invoice listener and parses zap requests from
-        payment.extra["nostr"] (NIP-57 zap request JSON string).
+        payment.extra["nostr"] (NIP-57 zap request payload).
         
         IMPORTANT: Only processes zaps for TODAY's tracked notes. This enforces
         the rule that zaps are only valid for the current day's CyberHerd notes.
@@ -363,103 +358,8 @@ class ZapMonitorService:
                     # Payment is not to the herd wallet, ignore
                     return
             
-            # Extract zap request from payment.extra["nostr"] (preferred) or comment (fallback)
-            zap_request = None
-            zap_request_source = None
-
-            # Support payment.extra being either a JSON string or a dict
-            extra_obj = None
-            if payment.extra:
-                if isinstance(payment.extra, str):
-                    try:
-                        extra_obj = json.loads(payment.extra)
-                    except Exception:
-                        extra_obj = None
-                elif isinstance(payment.extra, dict):
-                    extra_obj = payment.extra
-                else:
-                    # Try best-effort attribute access
-                    try:
-                        extra_obj = dict(payment.extra)
-                    except Exception:
-                        extra_obj = None
-
-            if extra_obj:
-                # Prefer nostr field (LNURLp standard)
-                nostr_json = extra_obj.get("nostr")
-                if nostr_json:
-                    # zap_request may already be a dict or a JSON string
-                    if isinstance(nostr_json, dict):
-                        zap_request = nostr_json
-                        zap_request_source = "nostr"
-                        logger.debug(f"Parsed zap request from payment.extra['nostr'] (dict)")
-                    else:
-                        try:
-                            zap_request = json.loads(nostr_json)
-                            zap_request_source = "nostr"
-                            logger.debug(f"Parsed zap request from payment.extra['nostr']")
-                        except Exception as e:
-                            logger.warning(f"Failed to parse zap request from nostr field: {e}")
-
-                # Check for new-style fields used by process_incoming_payment fallback
-                if not zap_request:
-                    for key in ("zap_request", "zapRequest"):
-                        candidate = extra_obj.get(key)
-                        if not candidate:
-                            continue
-                        if isinstance(candidate, dict):
-                            zap_request = candidate
-                        else:
-                            try:
-                                zap_request = json.loads(candidate)
-                            except Exception:
-                                zap_request = None
-                        if zap_request:
-                            zap_request_source = key
-                            logger.debug(f"Parsed zap request from payment.extra['{key}']")
-                            break
-
-                # Fallback to comment field (legacy)
-                if not zap_request:
-                    comment = extra_obj.get("comment")
-                    if comment and isinstance(comment, str) and comment.strip().startswith("{"):
-                        try:
-                            zap_request = json.loads(comment)
-                            zap_request_source = "comment"
-                            logger.debug(f"Parsed zap request from payment.extra['comment'] (legacy)")
-                        except json.JSONDecodeError:
-                            pass  # Not a JSON comment, ignore
-
-            # Fallback: allow memo to carry zap request JSON (legacy clients)
-            if not zap_request:
-                memo_field = getattr(payment, "memo", None)
-                if isinstance(memo_field, str) and memo_field.strip().startswith("{"):
-                    try:
-                        zap_request = json.loads(memo_field)
-                        zap_request_source = "memo"
-                        logger.debug("Parsed zap request from payment.memo field")
-                        extra_obj = extra_obj or {}
-                    except json.JSONDecodeError:
-                        pass
-
-            # Ensure normalized storage back into payment.extra for future calls
-            # IMPORTANT: Do not store a dict under the "nostr" key because other
-            # parts of the system (e.g. lnbits lnurlp.send_zap) expect a JSON
-            # string and will call json.loads() on it. Store a JSON string to
-            # remain compatible and avoid TypeError: json.loads(dict).
-            if zap_request:
-                try:
-                    nostr_str = json.dumps(zap_request)
-                    if isinstance(extra_obj, dict):
-                        extra_obj["nostr"] = nostr_str
-                        payment.extra = extra_obj
-                    else:
-                        payment.extra = {"nostr": nostr_str}
-                except Exception:
-                    # Best-effort; do not fail if assignment fails
-                    pass
-            
-            if not zap_request:
+            zap_info = extract_zap_request(payment)
+            if not zap_info:
                 payment_hash_preview = None
                 try:
                     payment_hash = getattr(payment, 'payment_hash', None) or getattr(payment, 'checking_id', None)
@@ -469,7 +369,10 @@ class ZapMonitorService:
                 logger.debug(f"No zap request found in payment {payment_hash_preview}...")
                 self.last_error = "payment_missing_nostr_field"
                 return False
-            
+
+            zap_request = zap_info.payload
+            zap_request_source = zap_info.source or "nostr"
+
             # Extract zapper pubkey
             zapper_pubkey = zap_request.get("pubkey")
             if not zapper_pubkey:
@@ -1188,30 +1091,6 @@ class ZapMonitorService:
         )
         return True
     
-    async def recover_events_since_midnight(self):
-        """DEPRECATED: This method is no longer used and should not be called.
-        
-        Original purpose: Recover events since midnight by updating Nostr subscriptions.
-        
-        Why deprecated:
-        - NostrEventMonitor (self.nostr_monitor) was never implemented
-        - Event monitoring is handled by subscriptions.py WebSocket system
-        - Recovery is now handled by force_requery_for_user() in subscriptions.py
-        - This method references non-existent self.nostr_monitor.update_subscriptions()
-        
-        Migration:
-        - Use force_requery_for_user(app, user_id) from subscriptions.py instead
-        - That function properly queries and processes events from today
-        
-        This method will be removed in a future version.
-        """
-        logger.warning(
-            f"DEPRECATED: recover_events_since_midnight() called for user {self.user_id}. "
-            f"Use force_requery_for_user() from subscriptions.py instead. "
-            f"This method will be removed in a future version."
-        )
-        return False
-    
     async def _start_nostr_monitoring(self, settings, note_timestamps: dict[str, int] | None = None):
         """Start Nostr event monitoring for tracked notes.
         
@@ -1259,89 +1138,6 @@ class ZapMonitorService:
             logger.debug(f"Pruned {num_to_remove} old entries from processed events cache")
         
         return False
-    
-    async def _handle_nostr_zap(self, zapper_pubkey: str, zapped_note_id: str, 
-                                 amount_sats: int, event_id: str, event: dict):
-        """Handle zap receipt detected from Nostr.
-        
-        NOTE: This method is DEPRECATED and should not be called.
-        Zap detection now happens exclusively via the payment listener system,
-        which processes LNURLp payment.extra["nostr"] data. Nostr-based zap
-        detection (kinds 9734/9735) has been removed to avoid duplicate processing
-        and ensure accurate tracking via invoice settlements.
-        
-        This method is kept for backwards compatibility but will log a warning
-        and skip processing.
-        
-        Args:
-            zapper_pubkey: Pubkey of the zapper
-            zapped_note_id: Note ID that was zapped
-            amount_sats: Amount in sats
-            event_id: Zap receipt event ID
-            event: Full event dict
-        """
-        logger.warning(
-            f"⚠️  Nostr-based zap detection called but is deprecated. "
-            f"Zaps are now detected via payment listener only. "
-            f"Ignoring Nostr zap event {event_id[:16]}..."
-        )
-        return
-        
-        # DEPRECATED CODE BELOW - Not executed
-        try:
-            # Check for duplicate processing
-            if self._mark_event_processed('zap', event_id, zapped_note_id, zapper_pubkey):
-                return  # Already processed
-            
-            logger.info(
-                f"🔄 Processing Nostr zap: {amount_sats} sats from {zapper_pubkey[:8]}... "
-                f"to note {zapped_note_id[:8]}... (event: {event_id[:16]}...)"
-            )
-            
-            # Get settings to check if this is a valid zap for our system
-            settings = await crud.get_settings(self.user_id)
-            if not settings:
-                logger.warning(f"No settings found for user {self.user_id}, cannot process Nostr zap")
-                return
-            
-            # Verify the zapped note is one we're tracking
-            tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
-            if zapped_note_id not in tracked_notes:
-                logger.debug(
-                    f"❌ Zapped note {zapped_note_id[:16]}... not in tracked notes "
-                    f"(tracking {len(tracked_notes)} notes). Ignoring."
-                )
-                return
-            
-            logger.debug(
-                f"✅ Zapped note {zapped_note_id[:16]}... IS in tracked notes. "
-                f"Proceeding with headbutt processing..."
-            )
-            
-            # Trigger headbutt processing
-            # Import here to avoid circular dependency
-            from .headbutt import trigger_headbutt_from_zap
-            
-            result = await trigger_headbutt_from_zap(
-                user_id=self.user_id,
-                pubkey=zapper_pubkey,
-                amount_sats=amount_sats,
-                note_id=zapped_note_id,
-                event_id=event_id,
-                app=self.app
-            )
-            
-            if result:
-                self.total_zaps_processed += 1
-                self.last_zap_at = utc_now_timestamp()
-                self.last_message_at = utc_now_timestamp()
-                logger.info(f"Successfully processed Nostr zap from {zapper_pubkey[:8]}...")
-            else:
-                logger.warning(f"Failed to process Nostr zap from {zapper_pubkey[:8]}...")
-            
-        except Exception as e:
-            logger.error(f"Error handling Nostr zap: {e}")
-            self.last_error = str(e)
     
     async def _handle_nostr_repost(self, reposter_pubkey: str, reposted_note_id: str,
                                     event_id: str, event: dict):
