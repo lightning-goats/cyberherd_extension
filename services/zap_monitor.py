@@ -49,6 +49,11 @@ else:  # pragma: no cover
     _monitoring_available = True
 
 try:  # pragma: no cover
+    from . import nostr_lookup as nl  # type: ignore
+except Exception:  # pragma: no cover
+    nl = None  # type: ignore
+
+try:  # pragma: no cover
     from . import nostr_helpers  # type: ignore
 except Exception:  # pragma: no cover
     nostr_helpers = None  # type: ignore
@@ -1091,6 +1096,30 @@ class ZapMonitorService:
         )
         return True
     
+    async def recover_events_since_midnight(self):
+        """DEPRECATED: This method is no longer used and should not be called.
+        
+        Original purpose: Recover events since midnight by updating Nostr subscriptions.
+        
+        Why deprecated:
+        - NostrEventMonitor (self.nostr_monitor) was never implemented
+        - Event monitoring is handled by subscriptions.py WebSocket system
+        - Recovery is now handled by force_requery_for_user() in subscriptions.py
+        - This method references non-existent self.nostr_monitor.update_subscriptions()
+        
+        Migration:
+        - Use force_requery_for_user(app, user_id) from subscriptions.py instead
+        - That function properly queries and processes events from today
+        
+        This method will be removed in a future version.
+        """
+        logger.warning(
+            f"DEPRECATED: recover_events_since_midnight() called for user {self.user_id}. "
+            f"Use force_requery_for_user() from subscriptions.py instead. "
+            f"This method will be removed in a future version."
+        )
+        return False
+    
     async def _start_nostr_monitoring(self, settings, note_timestamps: dict[str, int] | None = None):
         """Start Nostr event monitoring for tracked notes.
         
@@ -1138,6 +1167,89 @@ class ZapMonitorService:
             logger.debug(f"Pruned {num_to_remove} old entries from processed events cache")
         
         return False
+    
+    async def _handle_nostr_zap(self, zapper_pubkey: str, zapped_note_id: str, 
+                                 amount_sats: int, event_id: str, event: dict):
+        """Handle zap receipt detected from Nostr.
+        
+        NOTE: This method is DEPRECATED and should not be called.
+        Zap detection now happens exclusively via the payment listener system,
+        which processes LNURLp payment.extra["nostr"] data. Nostr-based zap
+        detection (kinds 9734/9735) has been removed to avoid duplicate processing
+        and ensure accurate tracking via invoice settlements.
+        
+        This method is kept for backwards compatibility but will log a warning
+        and skip processing.
+        
+        Args:
+            zapper_pubkey: Pubkey of the zapper
+            zapped_note_id: Note ID that was zapped
+            amount_sats: Amount in sats
+            event_id: Zap receipt event ID
+            event: Full event dict
+        """
+        logger.warning(
+            f"⚠️  Nostr-based zap detection called but is deprecated. "
+            f"Zaps are now detected via payment listener only. "
+            f"Ignoring Nostr zap event {event_id[:16]}..."
+        )
+        return
+        
+        # DEPRECATED CODE BELOW - Not executed
+        try:
+            # Check for duplicate processing
+            if self._mark_event_processed('zap', event_id, zapped_note_id, zapper_pubkey):
+                return  # Already processed
+            
+            logger.info(
+                f"🔄 Processing Nostr zap: {amount_sats} sats from {zapper_pubkey[:8]}... "
+                f"to note {zapped_note_id[:8]}... (event: {event_id[:16]}...)"
+            )
+            
+            # Get settings to check if this is a valid zap for our system
+            settings = await crud.get_settings(self.user_id)
+            if not settings:
+                logger.warning(f"No settings found for user {self.user_id}, cannot process Nostr zap")
+                return
+            
+            # Verify the zapped note is one we're tracking
+            tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
+            if zapped_note_id not in tracked_notes:
+                logger.debug(
+                    f"❌ Zapped note {zapped_note_id[:16]}... not in tracked notes "
+                    f"(tracking {len(tracked_notes)} notes). Ignoring."
+                )
+                return
+            
+            logger.debug(
+                f"✅ Zapped note {zapped_note_id[:16]}... IS in tracked notes. "
+                f"Proceeding with headbutt processing..."
+            )
+            
+            # Trigger headbutt processing
+            # Import here to avoid circular dependency
+            from .headbutt import trigger_headbutt_from_zap
+            
+            result = await trigger_headbutt_from_zap(
+                user_id=self.user_id,
+                pubkey=zapper_pubkey,
+                amount_sats=amount_sats,
+                note_id=zapped_note_id,
+                event_id=event_id,
+                app=self.app
+            )
+            
+            if result:
+                self.total_zaps_processed += 1
+                self.last_zap_at = utc_now_timestamp()
+                self.last_message_at = utc_now_timestamp()
+                logger.info(f"Successfully processed Nostr zap from {zapper_pubkey[:8]}...")
+            else:
+                logger.warning(f"Failed to process Nostr zap from {zapper_pubkey[:8]}...")
+            
+        except Exception as e:
+            logger.error(f"Error handling Nostr zap: {e}")
+            self.last_error = str(e)
     
     async def _handle_nostr_repost(self, reposter_pubkey: str, reposted_note_id: str,
                                     event_id: str, event: dict):

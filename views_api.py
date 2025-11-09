@@ -29,10 +29,7 @@ from lnbits.extensions.cyberherd.services.pubkey import (
 )
 from lnbits.extensions.cyberherd.services.nostr_helpers import (
     reconnect_nostrclient_ws,
-    fetch_profile_metadata,
-    fetch_user_relays,
 )
-from lnbits.extensions.cyberherd.services.time_utils import get_day_boundaries_utc
 from lnbits.extensions.cyberherd.services.headbutt import (
     _normalize_event_id as normalize_event_id,
 )
@@ -40,6 +37,10 @@ from lnbits.extensions.cyberherd.services.note_metadata import (
     refresh_tracked_event_addresses,
 )
 from lnbits.core.crud import get_wallet
+from lnbits.extensions.cyberherd.services.nostr_lookup import (
+    lookup_metadata,
+    lookup_relays,
+)
 from lnbits.extensions.cyberherd.services.zap_totals import (
     get_zap_totals_for_zapper,
     ZapTotalsError,
@@ -1778,11 +1779,7 @@ async def api_get_today_cyberherd_notes(request: Request, auth=Depends(auth_wall
             # For debugging: also try broader queries to diagnose the issue
             from .services import nostr_helpers  # type: ignore
             # Use UTC-first time calculation (authoritative)
-            boundaries = get_day_boundaries_utc()
-            midnight_utc = boundaries.utc_midnight
-            midnight_local = boundaries.local_midnight
-            midnight_timestamp = boundaries.utc_since_ts
-            until_timestamp = boundaries.utc_until_ts
+            midnight_utc, midnight_local, midnight_timestamp, until_timestamp = crud.get_utc_day_boundaries()
             
             # Build expanded tag list (original + lowercase) mirroring crud logic
             expanded_filter_tags = []
@@ -2038,12 +2035,12 @@ async def api_post_member(
     relays = None
     nprofile = None
     try:
-        md = await fetch_profile_metadata(pubkey)
+        md = await lookup_metadata(pubkey)
         if md:
             display_name = md.get("display_name") or display_name
             lud16 = md.get("lud16")
             picture = md.get("picture")
-        relays = await fetch_user_relays(pubkey)
+        relays = await lookup_relays(pubkey)
         try:
             nprofile = hex_to_nprofile(pubkey, relays=relays if isinstance(relays, list) else None)
         except Exception:
