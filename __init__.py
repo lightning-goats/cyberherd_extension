@@ -371,8 +371,9 @@ async def _warm_start_today_cache_and_recovery(app):
     try:
         from datetime import datetime, timezone
         from . import crud
-        from .views_api import _get_cached_effective_pubkey, _utc_midnight_timestamp, _cache_notes
+        from .views_api import _get_cached_effective_pubkey, _cache_notes
         from .services import nostr_helpers
+        from .services.time_utils import get_day_boundaries_utc
         from .utils.common import is_extension_enabled_for_user
 
         logger.info("Cyberherd warm start: begin prefetch")
@@ -384,10 +385,12 @@ async def _warm_start_today_cache_and_recovery(app):
             rows = []
         logger.info(f"Cyberherd warm start: found {len(rows)} settings rows")
 
-        # Use UTC for day boundaries - cache key uses UTC date
-        day_key = utc_now().strftime("%Y-%m-%d")
-        since = _utc_midnight_timestamp()
-        until = since + 86400
+        # Get day boundaries using UTC-first approach for consistency
+        # Cache key uses UTC date, but 'since' filter uses local_since_ts for user's "today"
+        boundaries = get_day_boundaries_utc()
+        day_key = boundaries.utc_day_str
+        since = int(boundaries.local_since_ts)  # Use local midnight for user's "today"
+        until = int(boundaries.local_until_ts)
 
         try:
             from .services import nostr_helpers

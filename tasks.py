@@ -365,9 +365,10 @@ async def schedule_midnight_reset():
     """
     Schedules the midnight reset job to run daily.
     """
+    global _APP_REF
     while True:
         await wait_for_midnight()
-        await midnight_reset_job()
+        await midnight_reset_job(app=_APP_REF)
 
 
 def cyberherd_tasks(app: Any | None = None):

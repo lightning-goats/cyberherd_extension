@@ -522,6 +522,7 @@ class EnhancedHeadbuttService:
         try:
             # This logic is duplicated from views_api.py for service-layer use
             from ..views_api import _cache_notes, _get_cached_notes, _get_effective_pubkey, _get_user_private_key
+            from .time_utils import get_day_boundaries_utc
 
             s = await self.db.get_settings(self.user_id)
             tags = [t.lstrip("#").lower() for t in (s.tracked_tags or [])]
@@ -531,8 +532,10 @@ class EnhancedHeadbuttService:
             if not eff_pub:
                 return []
 
-            # Use UTC for cache keys - consistent with Nostr event timestamps
-            day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            # Get day boundaries using UTC-first approach (consistent with subscriptions.py)
+            boundaries = get_day_boundaries_utc()
+            # Use UTC date for cache key (consistent with rest of codebase)
+            day_key = boundaries.utc_day_str
             # Use neutral cache key shape consistent with views_api/subscriptions
             cache_key = (day_key, None, eff_pub, tuple(sorted(tags)))
 
@@ -540,15 +543,9 @@ class EnhancedHeadbuttService:
             if cached_notes is not None:
                 return cached_notes
 
-            # Use UTC midnight - Nostr events use UTC timestamps
-            since = int(
-                datetime.combine(
-                    datetime.now(timezone.utc).date(), datetime.min.time()
-                )
-                .replace(tzinfo=timezone.utc)
-                .timestamp()
-            )
-            until = since + 86400
+            # Use local midnight for user's "today" (consistent with subscriptions.py)
+            since = int(boundaries.local_since_ts)
+            until = int(boundaries.local_until_ts)
             # Query events using configured relays - include kind 1 (notes) and kind 30311 (long-form content)
             logger.info(f"🔍 Querying Nostr for today's notes: kinds=[1,30311], author={eff_pub[:16]}..., since={since}, until={until}")
             events = await nostr_helpers.query_events({"kinds": [1, 30311], "authors": [eff_pub], "since": since, "until": until}, limit=100, timeout=8.0)

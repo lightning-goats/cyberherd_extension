@@ -35,6 +35,7 @@ from .. import crud
 from .subscriptions import get_subscription_status
 from .pubkey import resolve_effective_pubkey
 from .note_metadata import apply_event_address
+from ..utils.common import utc_now_timestamp  # Centralized UTC timestamp function
 
 # NostrEventMonitor was planned but not implemented - monitoring happens via subscriptions.py
 _monitoring_available = False
@@ -716,7 +717,7 @@ class ZapMonitorService:
             
             if result:
                 self.total_zaps_processed += 1
-                self.last_zap_at = int(datetime.now(timezone.utc).timestamp())
+                self.last_zap_at = utc_now_timestamp()
                 self.last_message_at = self.last_zap_at
                 self.last_error = None
                 logger.info(
@@ -733,7 +734,7 @@ class ZapMonitorService:
                                 "note_id": target_note_id,
                                 "zapper_pubkey": zapper_pubkey,
                                 "amount": int(amount_sats),
-                                "processed_at": int(datetime.now(timezone.utc).timestamp()),
+                                "processed_at": utc_now_timestamp(),
                             }
                         )
                 except Exception as exc:
@@ -904,7 +905,7 @@ class ZapMonitorService:
                 if created_at and created_at > 0:
                     timestamps[note_id] = created_at
                 else:
-                    timestamps[note_id] = int(datetime.now(timezone.utc).timestamp())
+                    timestamps[note_id] = utc_now_timestamp()
                 settings.tracked_event_timestamps = timestamps
 
             # Update tracked event addresses with any metadata derived from the event
@@ -1246,7 +1247,7 @@ class ZapMonitorService:
             return True
         
         # Mark as processed
-        self._processed_events[cache_key] = int(datetime.now(timezone.utc).timestamp())
+        self._processed_events[cache_key] = utc_now_timestamp()
         
         # Prevent unbounded growth - remove oldest entries if too large
         if len(self._processed_events) > self._processed_events_max_size:
@@ -1332,8 +1333,8 @@ class ZapMonitorService:
             
             if result:
                 self.total_zaps_processed += 1
-                self.last_zap_at = int(datetime.now(timezone.utc).timestamp())
-                self.last_message_at = int(datetime.now(timezone.utc).timestamp())
+                self.last_zap_at = utc_now_timestamp()
+                self.last_message_at = utc_now_timestamp()
                 logger.info(f"Successfully processed Nostr zap from {zapper_pubkey[:8]}...")
             else:
                 logger.warning(f"Failed to process Nostr zap from {zapper_pubkey[:8]}...")
@@ -1401,7 +1402,7 @@ class ZapMonitorService:
             
             if result:
                 self.total_reposts_processed += 1
-                self.last_message_at = int(datetime.now(timezone.utc).timestamp())
+                self.last_message_at = utc_now_timestamp()
                 logger.info(f"Successfully processed Nostr repost from {reposter_pubkey[:8]}...")
                 # Persist processed status so reposts are never reprocessed across restarts
                 try:
@@ -1515,7 +1516,7 @@ class ZapMonitorService:
             
             if result:
                 self.total_reactions_processed += 1
-                self.last_message_at = int(datetime.now(timezone.utc).timestamp())
+                self.last_message_at = utc_now_timestamp()
                 logger.info(f"Successfully processed Nostr reaction from {reactor_pubkey[:8]}...")
                 # Persist processed status to avoid reprocessing after restarts
                 try:
@@ -1641,14 +1642,16 @@ class ZapMonitorService:
                 logger.info(msg)
                 return {"scanned": 0, "processed": 0, "error": msg}
 
-            # Use UTC midnight as conservative since timestamp for recovery
+            # Use LOCAL midnight to match the boundary used for validating tracked_event_ids
+            # This prevents timezone mismatches that could cause duplicate processing
             try:
                 from .time_utils import get_day_boundaries_utc
                 boundaries = get_day_boundaries_utc(days_ago=0)
-                since_ts = int(boundaries.utc_since_ts)
+                since_ts = int(boundaries.local_since_ts)  # Use local day boundary for consistency
             except Exception:
-                import time
-                since_ts = int(time.time()) - 24 * 3600
+                # Fallback to 24 hours ago if boundaries unavailable
+                from ..utils.common import utc_now_timestamp
+                since_ts = utc_now_timestamp() - 86400
 
             # Lazy import of payments helper to avoid circular imports at module load
             try:
