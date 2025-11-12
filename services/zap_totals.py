@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from loguru import logger
@@ -12,6 +13,9 @@ from lnbits.utils.nostr import validate_pub_key
 from .. import crud
 from .nostr_helpers import query_events
 from .pubkey import resolve_effective_pubkey
+from lnbits.db import Filters
+from lnbits.core.models.payments import PaymentFilters
+from lnbits.core.services.payments import get_payments
 
 try:  # Optional dependency used for bolt11 fallback parsing
     from bolt11 import decode as bolt11_decode  # type: ignore
@@ -88,6 +92,93 @@ def _extract_amount_msat(tags: Iterable[Any]) -> Optional[int]:
     except Exception:
         logger.debug("zap_totals: failed to decode bolt11 tag", exc_info=True)
     return None
+
+
+def _coerce_extra_dict(extra: Any) -> dict | None:
+    if not extra:
+        return None
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except Exception:
+            return None
+    if isinstance(extra, dict):
+        return extra
+    return None
+
+
+def _extract_zap_from_payment(payment: Any) -> dict | None:
+    """Return zap metadata (zapper, amount, timestamp, ids) from LNbits payment row."""
+    try:
+        amount_msat = int(getattr(payment, "amount", 0) or 0)
+    except Exception:
+        amount_msat = 0
+    if amount_msat <= 0:
+        return None
+
+    extra = _coerce_extra_dict(getattr(payment, "extra", None))
+    if not extra:
+        return None
+
+    nostr_payload = extra.get("nostr")
+    if not nostr_payload:
+        return None
+    if isinstance(nostr_payload, str):
+        try:
+            nostr_payload = json.loads(nostr_payload)
+        except Exception:
+            return None
+    if not isinstance(nostr_payload, dict):
+        return None
+
+    try:
+        kind = int(nostr_payload.get("kind"))
+    except Exception:
+        kind = None
+    if kind != 9734:
+        return None
+
+    zapper = nostr_payload.get("pubkey")
+    if not isinstance(zapper, str):
+        return None
+    try:
+        zapper = _normalise_pubkey(zapper)
+    except ZapTotalsError:
+        return None
+
+    tags = nostr_payload.get("tags") or []
+    target_pubkey = None
+    for tag in tags:
+        if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "p":
+            candidate = tag[1]
+            if isinstance(candidate, str):
+                try:
+                    target_pubkey = _normalise_pubkey(candidate)
+                except ZapTotalsError:
+                    target_pubkey = None
+            break
+
+    created_at = None
+    try:
+        ts = getattr(payment, "time", None)
+        if isinstance(ts, datetime):
+            created_at = int(ts.timestamp())
+    except Exception:
+        created_at = None
+
+    event_id = getattr(payment, "payment_hash", None)
+    if not isinstance(event_id, str):
+        event_id = getattr(payment, "checking_id", None)
+        if not isinstance(event_id, str):
+            event_id = None
+
+    return {
+        "zapper": zapper,
+        "target_pubkey": target_pubkey,
+        "amount_sats": amount_msat // 1000,
+        "created_at": created_at,
+        "event_id": event_id,
+    }
 
 
 def _entry_to_result(
@@ -336,6 +427,7 @@ async def record_incremental_zap_total(
     amount_sats: int,
     event_timestamp: Optional[int] = None,
     event_id: Optional[str] = None,
+    skip_member_check: bool = False,
 ) -> None:
     """Incrementally update zap totals when a zap is processed via payments."""
     if not user_id or amount_sats <= 0:
@@ -344,6 +436,17 @@ async def record_incremental_zap_total(
     zapper = _normalise_pubkey(zapper_pubkey)
     target = _normalise_pubkey(target_pubkey)
     event_ts = int(event_timestamp or time.time())
+
+    if not skip_member_check:
+        try:
+            member = await crud.get_cyberherd_member_by_pubkey(zapper, user_id)
+        except Exception:
+            member = None
+        if not member:
+            logger.debug(
+                f"Zap totals: skipping incremental update — zapper {zapper[:8]}... not in cyberherd for user {user_id}"
+            )
+            return
 
     key = (user_id, zapper)
     lock = await _get_key_lock(key)
@@ -391,4 +494,141 @@ async def record_incremental_zap_total(
         )
 
 
-__all__ = ["get_zap_totals_for_zapper", "record_incremental_zap_total", "ZapTotalsError"]
+async def rebuild_zap_totals_from_payments(
+    *,
+    user_id: str,
+    zapper_pubkey: str | None = None,
+    batch_size: int = 250,
+) -> dict:
+    """Scan LNbits payments for the herd wallet and rebuild zap totals.
+
+    Args:
+        user_id: CyberHerd owner ID.
+        zapper_pubkey: Optional specific zapper to restrict processing.
+        batch_size: Pagination size when querying payments.
+    """
+    if batch_size <= 0:
+        batch_size = 250
+
+    settings = await crud.get_settings(user_id)
+    herd_wallet = getattr(settings, "herd_wallet", None)
+    if not herd_wallet:
+        raise ZapTotalsError("herd wallet not configured")
+    watch_pubkey = resolve_effective_pubkey(settings)
+    if not watch_pubkey:
+        raise ZapTotalsError("Effective watch pubkey is not configured")
+    watch_pubkey = _normalise_pubkey(watch_pubkey)
+
+    zapper_filter = None
+    if zapper_pubkey:
+        zapper_filter = _normalise_pubkey(zapper_pubkey)
+
+    members = await crud.get_all_cyberherd_members(user_id)
+    member_pks = {
+        str(m.get("pubkey")).strip().lower()
+        for m in members
+        if isinstance(m.get("pubkey"), str)
+    }
+    if zapper_filter and zapper_filter not in member_pks:
+        raise ZapTotalsError("zapper is not a cyberherd member")
+
+    aggregates: dict[str, dict[str, Any]] = {}
+    payments_scanned = 0
+    zap_candidates = 0
+    offset = 0
+
+    while True:
+        filters = Filters(
+            model=PaymentFilters,
+            sortby="time",
+            direction="asc",
+            limit=batch_size,
+            offset=offset,
+        )
+        batch = await get_payments(
+            wallet_id=herd_wallet,
+            incoming=True,
+            filters=filters,
+        )
+        if not batch:
+            break
+        offset += len(batch)
+        for payment in batch:
+            payments_scanned += 1
+            zap = _extract_zap_from_payment(payment)
+            if not zap:
+                continue
+            zapper = zap["zapper"]
+            if zapper_filter and zapper != zapper_filter:
+                continue
+            if zapper not in member_pks:
+                continue
+            amount_sats = int(zap.get("amount_sats") or 0)
+            if amount_sats <= 0:
+                continue
+            zap_candidates += 1
+            aggregate = aggregates.setdefault(
+                zapper,
+                {
+                    "total_sats": 0,
+                    "event_count": 0,
+                    "first_event_at": None,
+                    "last_event_at": None,
+                    "last_event_ids": [],
+                },
+            )
+            aggregate["total_sats"] += amount_sats
+            aggregate["event_count"] += 1
+            created_at = zap.get("created_at")
+            if created_at is not None:
+                if aggregate["first_event_at"] is None or created_at < aggregate["first_event_at"]:
+                    aggregate["first_event_at"] = created_at
+                if aggregate["last_event_at"] is None or created_at > aggregate["last_event_at"]:
+                    aggregate["last_event_at"] = created_at
+                    aggregate["last_event_ids"] = [
+                        zap.get("event_id")
+                    ] if zap.get("event_id") else []
+                elif created_at == aggregate["last_event_at"]:
+                    event_id = zap.get("event_id")
+                    if event_id and event_id not in aggregate["last_event_ids"]:
+                        aggregate["last_event_ids"].append(event_id)
+
+    if zapper_filter and zapper_filter not in aggregates:
+        raise ZapTotalsError("no matching zaps found in payment history")
+
+    updated_rows: list[dict[str, Any]] = []
+    for zapper, data in aggregates.items():
+        await crud.upsert_zap_totals_row(
+            user_id=user_id,
+            zapper_pubkey=zapper,
+            total_sats=int(data["total_sats"]),
+            event_count=int(data["event_count"]),
+            first_event_at=data["first_event_at"],
+            last_event_at=data["last_event_at"],
+            last_event_ids=[eid for eid in data["last_event_ids"] if eid],
+            last_updated_at=time.time(),
+            target_pubkey=watch_pubkey,
+        )
+        updated_rows.append(
+            {
+                "zapper_pubkey": zapper,
+                "total_sats": int(data["total_sats"]),
+                "event_count": int(data["event_count"]),
+            }
+        )
+
+    return {
+        "payments_scanned": payments_scanned,
+        "zap_candidates": zap_candidates,
+        "zappers_updated": len(updated_rows),
+        "updated": updated_rows,
+        "filtered_zapper": zapper_filter,
+    }
+
+
+__all__ = [
+    "get_zap_totals_for_zapper",
+    "record_incremental_zap_total",
+    "rebuild_zap_totals_from_payments",
+    "ZapTotalsError",
+]

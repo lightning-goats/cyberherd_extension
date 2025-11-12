@@ -41,6 +41,7 @@ from lnbits.extensions.cyberherd.services.note_metadata import (
 from lnbits.core.crud import get_wallet
 from lnbits.extensions.cyberherd.services.zap_totals import (
     get_zap_totals_for_zapper,
+    rebuild_zap_totals_from_payments,
     ZapTotalsError,
 )
 from lnbits.extensions.cyberherd.services.splits import (
@@ -1971,6 +1972,42 @@ async def api_get_zap_totals(
     except Exception as exc:  # pragma: no cover - defensive
         logger.error(f"Cyberherd: zap totals query failed: {exc}")
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="failed to fetch zap totals")
+
+
+@cyberherd_api_router.post("/api/v1/zap_totals/backfill_payments")
+async def api_backfill_zap_totals_from_payments(
+    request: Request,
+    payload: dict | None = None,
+    auth=Depends(auth_wallet_or_admin_dep),
+):
+    if not auth or auth.get("type") != "wallet":
+        raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED, detail="wallet key required")
+
+    user_id = auth["value"].wallet.user  # type: ignore[union-attr]
+    payload = payload or {}
+    zapper_pubkey = payload.get("zapper_pubkey")
+    batch_size = payload.get("batch_size")
+    if batch_size is not None:
+        try:
+            batch_size = int(batch_size)
+        except Exception:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="batch_size must be an integer")
+        if batch_size <= 0:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="batch_size must be positive")
+    try:
+        stats = await rebuild_zap_totals_from_payments(
+            user_id=user_id,
+            zapper_pubkey=zapper_pubkey,
+            batch_size=batch_size or 250,
+        )
+        return {"rebuild": stats}
+    except ZapTotalsError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Cyberherd: zap totals payment rebuild failed: {exc}")
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="failed to rebuild zap totals")
 
 
 @cyberherd_api_router.post("/api/v1/members")

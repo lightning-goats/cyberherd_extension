@@ -163,6 +163,14 @@ Get zap totals for a specific zapper (contributor).
 **Path:** `zapper_pubkey` - Hex pubkey of the zapper  
 **Returns:** Zap totals object with amounts and counts
 
+#### `POST /api/v1/zap_totals/backfill_payments`
+
+Rebuild zap totals by scanning the herd wallet's LNbits payments (instead of relay data).
+
+**Auth:** Wallet or admin key  
+**Body (optional):** `{"zapper_pubkey": "<hex>", "batch_size": 250}`  
+**Returns:** Rebuild statistics (`payments_scanned`, `zap_candidates`, `zappers_updated`, etc.)
+
 ### Operations
 
 #### `POST /api/v1/recover_events`
