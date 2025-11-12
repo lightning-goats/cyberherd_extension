@@ -35,6 +35,7 @@ from .. import crud
 from .subscriptions import get_subscription_status
 from .pubkey import resolve_effective_pubkey
 from .note_metadata import apply_event_address
+from .zap_totals import record_incremental_zap_total
 from ..utils.common import utc_now_timestamp  # Centralized UTC timestamp function
 
 # NostrEventMonitor was planned but not implemented - monitoring happens via subscriptions.py
@@ -174,6 +175,48 @@ class ZapMonitorService:
         if identifier == "":
             identifier = None
         return kind, pubkey, identifier
+
+    @staticmethod
+    def _coerce_timestamp(value: Any) -> int | None:
+        """Best-effort conversion of payment timestamp fields to epoch seconds."""
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                return int(value)
+            except Exception:
+                return None
+        if isinstance(value, str):
+            candidate = value.strip()
+            if not candidate:
+                return None
+            try:
+                return int(float(candidate))
+            except Exception:
+                try:
+                    iso = candidate
+                    if iso.endswith("Z"):
+                        iso = iso[:-1] + "+00:00"
+                    dt = datetime.fromisoformat(iso)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return int(dt.timestamp())
+                except Exception:
+                    return None
+        return None
+
+    @classmethod
+    def _extract_payment_timestamp(cls, payment: Any) -> int | None:
+        """Extract an approximate timestamp from LN payment records."""
+        for attr in ("time", "created_at", "updated_at"):
+            try:
+                value = getattr(payment, attr, None)
+            except Exception:
+                value = None
+            ts = cls._coerce_timestamp(value)
+            if ts is not None:
+                return ts
+        return None
 
     async def _resolve_note_from_addresses(
         self,
@@ -736,6 +779,30 @@ class ZapMonitorService:
                     logger.debug(
                         f"Zap monitor: failed to persist processed zap for user {self.user_id}: {exc}"
                     )
+
+                # Increment zap totals cache for API consumers
+                if self.user_id:
+                    try:
+                        target_pubkey = resolve_effective_pubkey(settings)
+                    except Exception as exc:
+                        logger.debug(f"Zap monitor: failed to resolve effective pubkey: {exc}")
+                        target_pubkey = None
+
+                    if target_pubkey:
+                        payment_ts = self._extract_payment_timestamp(payment) or utc_now_timestamp()
+                        try:
+                            await record_incremental_zap_total(
+                                user_id=cast(str, self.user_id),
+                                zapper_pubkey=zapper_pubkey,
+                                target_pubkey=target_pubkey,
+                                amount_sats=amount_sats,
+                                event_timestamp=payment_ts,
+                                event_id=event_id,
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                f"Zap monitor: failed to update zap totals for {zapper_pubkey[:8]}...: {exc}"
+                            )
                 
                 # Note: Opportunistic registry update removed - we now enforce that notes
                 # must be in today's tracked_event_ids before processing zaps

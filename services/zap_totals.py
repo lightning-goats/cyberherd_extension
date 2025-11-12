@@ -328,4 +328,67 @@ async def get_zap_totals_for_zapper(
         )
 
 
-__all__ = ["get_zap_totals_for_zapper", "ZapTotalsError"]
+async def record_incremental_zap_total(
+    *,
+    user_id: str,
+    zapper_pubkey: str,
+    target_pubkey: str,
+    amount_sats: int,
+    event_timestamp: Optional[int] = None,
+    event_id: Optional[str] = None,
+) -> None:
+    """Incrementally update zap totals when a zap is processed via payments."""
+    if not user_id or amount_sats <= 0:
+        return
+
+    zapper = _normalise_pubkey(zapper_pubkey)
+    target = _normalise_pubkey(target_pubkey)
+    event_ts = int(event_timestamp or time.time())
+
+    key = (user_id, zapper)
+    lock = await _get_key_lock(key)
+    async with lock:
+        row = await crud.get_zap_totals_row(user_id, zapper)
+        existing_target = (row or {}).get("target_pubkey")
+        if existing_target:
+            existing_target = existing_target.lower()
+
+        total_sats = int((row or {}).get("total_sats") or 0)
+        event_count = int((row or {}).get("event_count") or 0)
+        first_event_at = row.get("first_event_at") if row else None
+        last_event_at = row.get("last_event_at") if row else None
+        last_event_ids = list(_deserialize_last_event_ids((row or {}).get("last_event_ids")))
+
+        if row and existing_target != target:
+            total_sats = 0
+            event_count = 0
+            first_event_at = None
+            last_event_at = None
+            last_event_ids = []
+
+        total_sats += amount_sats
+        event_count += 1
+        if first_event_at is None or event_ts < first_event_at:
+            first_event_at = event_ts
+
+        if last_event_at is None or event_ts > last_event_at:
+            last_event_at = event_ts
+            last_event_ids = [event_id] if event_id else []
+        elif event_ts == last_event_at:
+            if event_id and event_id not in last_event_ids:
+                last_event_ids.append(event_id)
+
+        await crud.upsert_zap_totals_row(
+            user_id=user_id,
+            zapper_pubkey=zapper,
+            total_sats=total_sats,
+            event_count=event_count,
+            first_event_at=first_event_at,
+            last_event_at=last_event_at,
+            last_event_ids=last_event_ids,
+            last_updated_at=time.time(),
+            target_pubkey=target,
+        )
+
+
+__all__ = ["get_zap_totals_for_zapper", "record_incremental_zap_total", "ZapTotalsError"]
