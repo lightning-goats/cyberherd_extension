@@ -19,6 +19,8 @@ import json
 import secrets
 from typing import Any, Callable, Iterable
 
+import httpx
+
 from loguru import logger
 from datetime import datetime, timezone
 
@@ -726,6 +728,152 @@ async def query_user_relays(pubkey: str) -> list[str]:
     return relays
 
 
+async def lookup_metadata(pubkey: str, api_key: str | None = None) -> dict[str, str | None] | None:
+    """Return display metadata for a pubkey (backward-compatible signature)."""
+
+    def _extract_best(ev_list: list[dict]) -> dict[str, Any] | None:
+        best = None
+        best_created = 0
+        for ev in ev_list or []:
+            try:
+                created = int(ev.get("created_at") or 0)
+                if created >= best_created:
+                    content = ev.get("content")
+                    if isinstance(content, str):
+                        content = json.loads(content)
+                    if isinstance(content, dict) and (
+                        content.get("lud16")
+                        or content.get("name")
+                        or content.get("display_name")
+                        or content.get("nip05")
+                    ):
+                        best = content
+                        best_created = created
+            except Exception as exc:
+                logger.warning(exc)
+                continue
+        return best
+
+    try:
+        rels = await query_user_relays(pubkey)
+    except Exception as exc:
+        logger.debug(f"lookup_metadata: relays fetch failed: {exc}")
+        rels = []
+
+    events = await query_events(
+        {"kinds": [0], "authors": [pubkey]},
+        limit=3,
+        timeout=8.0,
+        extra_relays=rels or None,
+    )
+
+    best = _extract_best(events)
+    if best:
+        dn = best.get("display_name") or best.get("name")
+        if not dn:
+            nip = best.get("nip05")
+            if isinstance(nip, str) and "@" in nip:
+                dn = nip.split("@", 1)[0]
+        logger.info(
+            "cyberherd: metadata for %s display_name=%s lud16=%s nip05=%s picture=%s",
+            pubkey,
+            dn or "",
+            best.get("lud16") or "",
+            best.get("nip05") or "",
+            "yes" if best.get("picture") else "no",
+        )
+        return {
+            "display_name": dn or "Anon",
+            "lud16": best.get("lud16"),
+            "picture": best.get("picture"),
+            "nip05": best.get("nip05"),
+        }
+
+    logger.info("cyberherd: no metadata found for %s", pubkey[:8] + "...")
+    return None
+
+
+async def lookup_relays(pubkey: str, api_key: str | None = None) -> list[str]:
+    """Backward-compatible wrapper around query_user_relays."""
+    try:
+        return await query_user_relays(pubkey)
+    except Exception as exc:
+        logger.warning(f"lookup_relays: error via nostr_helpers: {exc}")
+        return []
+
+
+async def verify_nip05(pubkey_hex: str, nip05: str) -> bool:
+    """Validate that nip05 identifier resolves to the given pubkey."""
+
+    def _normalize_candidate(value: str | None) -> str | None:
+        if not value or not isinstance(value, str):
+            return None
+        candidate = value.strip()
+        if not candidate:
+            return None
+        try:
+            from lnbits.utils.nostr import normalize_public_key  # type: ignore
+
+            normalized = normalize_public_key(candidate)  # type: ignore[assignment]
+        except Exception:
+            normalized = candidate.strip().lower()
+        else:
+            normalized = normalized.strip().lower()
+        return normalized
+
+    pubkey = (pubkey_hex or "").strip().lower()
+    identity = (nip05 or "").strip()
+    if not pubkey or len(pubkey) != 64:
+        logger.debug("verify_nip05: invalid pubkey '%s'", pubkey_hex)
+        return False
+    if "@" not in identity:
+        logger.debug("verify_nip05: invalid nip05 '%s'", nip05)
+        return False
+
+    try:
+        username, domain = identity.split("@", 1)
+        username = username.strip().lower()
+        domain = domain.strip()
+        if not username or not domain:
+            return False
+
+        url = f"https://{domain}/.well-known/nostr.json?name={username}"
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=10)
+            resp.raise_for_status()
+            payload = resp.json()
+
+        mapped = None
+        try:
+            mapped = payload.get("names", {}).get(username)
+        except Exception:
+            mapped = None
+
+        mapped_norm = _normalize_candidate(mapped)
+        if mapped_norm and mapped_norm == pubkey:
+            return True
+        logger.info(
+            "verify_nip05: mapping mismatch for %s -> %s (expected %s)",
+            identity,
+            mapped,
+            pubkey,
+        )
+    except Exception as exc:
+        logger.debug("verify_nip05 direct fetch failed: %s", exc)
+
+    try:
+        from lnbits.core.services.nostr import fetch_nip5_details  # type: ignore
+
+        resolved_pubkey, _ = await fetch_nip5_details(identity)
+        resolved_norm = _normalize_candidate(resolved_pubkey)
+        if resolved_norm:
+            return resolved_norm == pubkey
+        return False
+    except Exception as exc:
+        logger.debug("verify_nip05 core fallback failed: %s", exc)
+        return False
+
+
 # ============================================================================
 # Subscription Management Helpers
 # ============================================================================
@@ -790,3 +938,116 @@ def create_subscription_manager() -> SubscriptionManager:
         SubscriptionManager instance
     """
     return SubscriptionManager()
+
+
+# ============================================================================
+# NIP-57 Validation Helpers
+# ============================================================================
+
+def validate_nip57_zap_receipt(event: dict[str, Any], *, require_preimage: bool = False) -> tuple[bool, str]:
+    """Validate a NIP-57 zap receipt (kind 9735)."""
+    if not isinstance(event, dict):
+        return False, "Event is not a dictionary"
+
+    kind = event.get("kind")
+    if kind != 9735:
+        return False, f"Invalid kind: {kind} (expected 9735 for zap receipt)"
+
+    tags = event.get("tags", [])
+    if not isinstance(tags, list):
+        return False, "Tags field is not a list"
+
+    tags_dict: dict[str, list[str]] = {}
+    for tag in tags:
+        if isinstance(tag, list) and len(tag) >= 2:
+            tags_dict.setdefault(tag[0], []).append(tag[1])
+
+    missing = [name for name in ("bolt11", "description", "p") if name not in tags_dict]
+    if missing:
+        return False, f"Missing required tags: {', '.join(missing)}"
+
+    bolt11_values = tags_dict.get("bolt11", [])
+    if not bolt11_values or not isinstance(bolt11_values[0], str) or not bolt11_values[0].lower().startswith("ln"):
+        return False, "Invalid bolt11 format"
+
+    description_values = tags_dict.get("description", [])
+    if not description_values or not isinstance(description_values[0], str):
+        return False, "description tag is not a string"
+
+    try:
+        zap_request = json.loads(description_values[0])
+    except json.JSONDecodeError as exc:
+        return False, f"description tag is not valid JSON: {exc}"
+
+    if not isinstance(zap_request, dict) or zap_request.get("kind") != 9734:
+        return False, f"Invalid zap request kind: {zap_request.get('kind')} (expected 9734)"
+
+    p_values = tags_dict.get("p", [])
+    recipient = p_values[0] if p_values else ""
+    if not isinstance(recipient, str) or len(recipient) != 64:
+        return False, "Invalid recipient pubkey length (expected 64 hex chars)"
+
+    preimage_values = tags_dict.get("preimage", [])
+    if require_preimage:
+        if not preimage_values or not isinstance(preimage_values[0], str) or len(preimage_values[0]) != 64:
+            return False, "preimage tag is required but missing/invalid"
+    elif preimage_values:
+        if not isinstance(preimage_values[0], str) or len(preimage_values[0]) != 64:
+            return False, "Invalid preimage format"
+
+    return True, ""
+
+
+def validate_nip57_payment_zap(payment_data: dict[str, Any], *, require_bolt11: bool = True) -> tuple[bool, str]:
+    """Validate zap metadata extracted from invoice payment payloads."""
+    if not isinstance(payment_data, dict):
+        return False, "Payment data is not a dictionary"
+
+    nostr_data = payment_data.get("nostr")
+    if not nostr_data:
+        return False, "Missing 'nostr' field in payment data"
+
+    if isinstance(nostr_data, str):
+        try:
+            nostr_data = json.loads(nostr_data)
+        except json.JSONDecodeError as exc:
+            return False, f"nostr field is not valid JSON: {exc}"
+
+    if not isinstance(nostr_data, dict):
+        return False, "nostr field is not a dict"
+
+    tags = nostr_data.get("tags")
+    if not isinstance(tags, list):
+        return False, "nostr tags missing or invalid"
+
+    tags_dict: dict[str, list[str]] = {}
+    for tag in tags:
+        if isinstance(tag, list) and len(tag) >= 2:
+            tags_dict.setdefault(tag[0], []).append(tag[1])
+
+    if require_bolt11 and "bolt11" not in tags_dict:
+        return False, "Missing bolt11 tag"
+
+    if "description" not in tags_dict:
+        return False, "Missing description tag"
+
+    description_values = tags_dict.get("description", [])
+    if not description_values or not isinstance(description_values[0], str):
+        return False, "Description tag invalid"
+
+    try:
+        zap_request = json.loads(description_values[0])
+    except json.JSONDecodeError as exc:
+        return False, f"Description tag invalid JSON: {exc}"
+
+    if zap_request.get("kind") != 9734:
+        return False, "Zap request kind is not 9734"
+
+    if "p" not in tags_dict:
+        return False, "Missing recipient pubkey tag"
+
+    recipient = tags_dict["p"][0]
+    if not isinstance(recipient, str) or len(recipient) != 64:
+        return False, "Recipient pubkey invalid"
+
+    return True, ""

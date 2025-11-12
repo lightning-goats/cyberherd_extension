@@ -1,7 +1,8 @@
 """Cyberherd tagged note subscription management.
 
-This module now delegates real Nostr relay connectivity to the shared
-`nostrclient` extension via the adapter in `nostr_adapter.py`.
+This module delegates all Nostr relay connectivity to the shared
+`nostr_helpers` wrapper around the nostrclient extension, avoiding any
+direct coupling to adapter shims.
 
 All Nostr interactions (queries, subscriptions) are routed through
 `nostr_helpers` for stable API access. Legacy direct nostrclient access
@@ -14,8 +15,8 @@ Key changes:
 - Diagnostics report helper failures
 
 Legacy per-relay websocket code has been removed in favour of pooled
-subscriptions managed via nostr_adapter. In-memory cache handling and
-status remain here for reuse by the adapter.
+subscriptions managed entirely via this module. In-memory cache handling and
+status remain here for reuse by callers.
 """
 
 from __future__ import annotations
@@ -1592,4 +1593,3 @@ async def process_reaction_for_tracked_notes(user_id: str, event: dict, app=None
         
     except Exception as e:
         logger.error(f"Error processing reaction for user {user_id}: {e}")
-

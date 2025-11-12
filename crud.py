@@ -14,7 +14,7 @@ from lnbits.helpers import decrypt_internal_message, encrypt_internal_message # 
 
 from .models import CyberherdSettings, LegacyCyberherdMember
 from .services.shares import compute_member_share_percentages
-from .utils.common import extract_t_tags_from_event, utc_now
+from .utils.common import extract_t_tags_from_event, utc_now, coerce_bool
 
 db = Database("ext_cyberherd")
 # Serialize critical write operations in this module to reduce sqlite locking
@@ -556,16 +556,16 @@ def _row_to_settings(row) -> CyberherdSettings:
         nostr_private_key=nostr_key,
         nostr_pubkey_override=row.get("nostr_pubkey_override"),
         computed_effective_pubkey=row.get("computed_effective_pubkey"),
-        zap_tracking_enabled=bool(row.get("zap_tracking_enabled", True)),  # Default to True
+        zap_tracking_enabled=coerce_bool(row.get("zap_tracking_enabled"), True),
         zap_monitor_mode=row.get("zap_monitor_mode", "websocket"),
         templates_owner_user=row.get("templates_owner_user"),  # legacy read-only; no longer set via API
-        repost_tracking_enabled=bool(row.get("repost_tracking_enabled", False)),
-        likes_tracking_enabled=bool(row.get("likes_tracking_enabled", False)),
-        midnight_reset_enabled=bool(row.get("midnight_reset_enabled", True)),
+        repost_tracking_enabled=coerce_bool(row.get("repost_tracking_enabled"), False),
+        likes_tracking_enabled=coerce_bool(row.get("likes_tracking_enabled"), False),
+        midnight_reset_enabled=coerce_bool(row.get("midnight_reset_enabled"), True),
         minimum_sats=row.get("minimum_sats") or 10,
-        nip05_verification_enabled=bool(row.get("nip05_verification_enabled", True)),
+        nip05_verification_enabled=coerce_bool(row.get("nip05_verification_enabled"), True),
         feeder_trigger_sats=row.get("feeder_trigger_sats"),
-        send_splits_enabled=bool(row.get("send_splits_enabled", False)),
+        send_splits_enabled=coerce_bool(row.get("send_splits_enabled"), False),
         user_id=row.get("user_id"),
     )
 

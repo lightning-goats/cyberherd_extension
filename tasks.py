@@ -18,6 +18,10 @@ from .crud import (
 )
 from .services.splits import reset_splits_to_predefined_wallet
 from .services.zap_monitor import get_zap_monitor
+from .services.nostr_websocket_monitor import (
+    start_monitor_for_user,
+    trigger_immediate_refresh,
+)
 from . import crud as crud_module
 from .views_api import _clear_cached_notes_for_user
 from .utils.common import parse_bool_env, utc_now
@@ -198,6 +202,38 @@ def get_invoice_listener_status() -> dict[str, Any]:
         "name": INVOICE_LISTENER_NAME,
     }
 
+
+async def _restart_kind1_subscriptions_for_user(
+    user_id: str | None, app: Any | None
+) -> bool:
+    """Ensure monitors refresh their kind 1/30311 subscriptions after reset."""
+    if not user_id:
+        return False
+
+    uid_short = f"{user_id[:12]}..." if len(user_id) > 12 else user_id
+    restarted = False
+
+    try:
+        await start_monitor_for_user(user_id, app=app)
+    except Exception as exc:
+        logger.warning(
+            f"CyberHerd midnight reset: failed to ensure monitor for user {uid_short}: {exc}"
+        )
+
+    try:
+        await trigger_immediate_refresh(user_id)
+        restarted = True
+        logger.info(
+            f"CyberHerd midnight reset: restarted kind 1/30311 subscriptions for user {uid_short}"
+        )
+    except Exception as exc:
+        logger.warning(
+            f"CyberHerd midnight reset: failed to refresh kind 1/30311 subscriptions for user {uid_short}: {exc}"
+        )
+
+    return restarted
+
+
 async def midnight_reset_job(app: Any | None = None):
     global _APP_REF
     if app is None:
@@ -218,6 +254,7 @@ async def midnight_reset_job(app: Any | None = None):
     total_wallets_reset = 0
     total_processed_cleared = 0
     total_tracked_reset = 0
+    total_subscriptions_restarted = 0
     errors = []
     
     try:
@@ -278,6 +315,19 @@ async def midnight_reset_job(app: Any | None = None):
                         _clear_cached_notes_for_user(app, user_id=user_id)
                     except Exception as e:
                         logger.debug(f"CyberHerd midnight reset: note cache clear skipped for user {user_id[:12]}...: {e}")
+                # Restart kind 1/30311 note subscriptions so the new day begins fresh
+                try:
+                    restarted = await _restart_kind1_subscriptions_for_user(user_id, app)
+                    if restarted:
+                        total_subscriptions_restarted += 1
+                    else:
+                        error_msg = f"Note subscriptions not restarted for user {user_id[:12]}..."
+                        logger.warning(f"CyberHerd midnight reset: {error_msg}")
+                        errors.append(error_msg)
+                except Exception as e:
+                    error_msg = f"Failed to restart note subscriptions for user {user_id[:12]}...: {e}"
+                    logger.warning(f"CyberHerd midnight reset: {error_msg}")
+                    errors.append(error_msg)
         
         # Reset splits for each source wallet (only for settings that opted in)
         for s in settings_rows:
@@ -315,7 +365,8 @@ async def midnight_reset_job(app: Any | None = None):
         f"✅ CyberHerd midnight reset completed in {duration:.2f}s | "
         f"Users: {total_users} | Members deactivated: {total_members_deactivated} | "
         f"Wallets reset: {total_wallets_reset} | Processed clears: {total_processed_cleared} | "
-        f"Tracked resets: {total_tracked_reset} | Errors: {len(errors)}"
+        f"Tracked resets: {total_tracked_reset} | Subscriptions restarted: {total_subscriptions_restarted} | "
+        f"Errors: {len(errors)}"
     )
     
     if errors:

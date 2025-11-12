@@ -104,11 +104,13 @@ async def _verify_nip05_relaxed(pubkey: str, nip05: str) -> tuple[Optional[bool]
     username_raw = username_raw.strip()
     domain = domain.strip()
     username_lower = username_raw.lower()
+    identity_lower = identity.lower()
     if not username_raw or not domain:
         return False, "invalid_format"
 
     errors: list[str] = []
     last_reason: str | None = None
+    fallback_result: tuple[Optional[bool], str] | None = None
 
     def _normalize_candidate(value: str | None) -> Optional[str]:
         if not value or not isinstance(value, str):
@@ -126,6 +128,41 @@ async def _verify_nip05_relaxed(pubkey: str, nip05: str) -> tuple[Optional[bool]
             normalized = normalized.strip().lower()
         return normalized
 
+    def _extract_pubkey_candidate(raw_value):
+        if isinstance(raw_value, str):
+            return raw_value
+        if isinstance(raw_value, dict):
+            for key in ("pubkey", "npub", "npub1", "value", "key"):
+                val = raw_value.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val
+        return None
+
+    candidate_keys: list[str] = []
+
+    def _add_candidate(value: str | None):
+        if not value:
+            return
+        candidate = value.strip().lower()
+        if not candidate:
+            return
+        if candidate not in candidate_keys:
+            candidate_keys.append(candidate)
+
+    _add_candidate(username_lower)
+    if username_raw and username_raw.lower() != username_lower:
+        _add_candidate(username_raw)
+    _add_candidate(identity_lower)
+    sanitized = re.sub(r"[^a-z0-9._-]", "", username_lower)
+    if sanitized:
+        _add_candidate(sanitized)
+    compact = username_lower.replace(".", "")
+    if compact:
+        _add_candidate(compact)
+    dashed = username_lower.replace(".", "-")
+    if dashed:
+        _add_candidate(dashed)
+
     # Prefer LNbits helper for canonical mapping
     try:
         from lnbits.core.services.nostr import fetch_nip5_details  # type: ignore
@@ -135,13 +172,14 @@ async def _verify_nip05_relaxed(pubkey: str, nip05: str) -> tuple[Optional[bool]
         if fetched_norm and fetched_norm == pubkey_norm:
             return True, "fallback_match"
         if fetched_norm:
-            last_reason = "fallback_mismatch"
+            fallback_result = (False, "fallback_mismatch")
             errors.append(f"fallback_mismatch:{fetched_norm}")
         else:
-            last_reason = "fallback_missing"
+            fallback_result = (None, "fallback_missing")
             errors.append("fallback_missing")
     except Exception as exc:
         errors.append(f"fallback:{exc}")
+        fallback_result = (None, f"fallback:{exc}")
 
     # First attempt: direct ?name= lookup
     async def _try_lookup(query_name: str | None, label: str) -> tuple[Optional[bool], Optional[str]]:
@@ -166,19 +204,24 @@ async def _verify_nip05_relaxed(pubkey: str, nip05: str) -> tuple[Optional[bool]
             names = parsed.get("names")
             if isinstance(names, dict):
                 for key, value in names.items():
-                    if isinstance(key, str) and key.strip().lower() == username_lower:
-                        candidate_raw = value
-                        break
+                    if (
+                        isinstance(key, str)
+                        and key.strip().lower() in candidate_keys
+                    ):
+                        candidate_raw = _extract_pubkey_candidate(value)
+                        if candidate_raw:
+                            break
             if candidate_raw is None:
                 profiles = parsed.get("profiles")
                 if isinstance(profiles, dict):
                     for key, value in profiles.items():
-                        if isinstance(key, str) and key.strip().lower() == username_lower:
-                            if isinstance(value, dict):
-                                candidate_raw = value.get("pubkey")
-                            elif isinstance(value, str):
-                                candidate_raw = value
-                            break
+                        if (
+                            isinstance(key, str)
+                            and key.strip().lower() in candidate_keys
+                        ):
+                            candidate_raw = _extract_pubkey_candidate(value)
+                            if candidate_raw:
+                                break
         except Exception:
             candidate_raw = None
 
@@ -192,11 +235,32 @@ async def _verify_nip05_relaxed(pubkey: str, nip05: str) -> tuple[Optional[bool]
         return False, "mapping_missing"
 
     lookup_attempts: list[tuple[Optional[str], str]] = []
-    if username_lower:
-        lookup_attempts.append((username_lower, "direct_lower"))
-    if username_raw and username_raw != username_lower:
-        lookup_attempts.append((username_raw, "direct_case"))
-    lookup_attempts.append((None, "direct_full"))
+    seen_queries: set[str] = set()
+
+    def _add_lookup(value: Optional[str], label: str):
+        if value is None:
+            if not any(q is None for q, _ in lookup_attempts):
+                lookup_attempts.append((None, label))
+            return
+        candidate = value.strip()
+        if not candidate:
+            return
+        lowered = candidate.lower()
+        if lowered in seen_queries:
+            return
+        seen_queries.add(lowered)
+        lookup_attempts.append((candidate, label))
+
+    _add_lookup(username_lower, "direct_lower")
+    if username_raw and username_raw.lower() != username_lower:
+        _add_lookup(username_raw, "direct_case")
+    if sanitized and sanitized != username_lower:
+        _add_lookup(sanitized, "direct_sanitized")
+    if compact and compact not in {username_lower, sanitized}:
+        _add_lookup(compact, "direct_compact")
+    if identity_lower not in {username_lower, sanitized, compact}:
+        _add_lookup(identity_lower, "direct_identity")
+    _add_lookup(None, "direct_full")
 
     for query_name, label in lookup_attempts:
         result, reason = await _try_lookup(query_name, label)
@@ -206,13 +270,17 @@ async def _verify_nip05_relaxed(pubkey: str, nip05: str) -> tuple[Optional[bool]
             last_reason = reason
             if reason != "mapping_missing":
                 return False, reason
-            # mapping missing - try next variant
             continue
-        # result is None - keep trying other strategies
         continue
 
     if last_reason:
         return False, last_reason
+    if fallback_result:
+        result, reason = fallback_result
+        if result is False:
+            return None, reason
+        if result is not None:
+            return result, reason
     if errors:
         return None, "; ".join(errors)
     return None, "unknown"
@@ -604,9 +672,7 @@ class EnhancedHeadbuttService:
         metadata: dict[str, Any] | None = None
         if needs_refresh:
             try:
-                from .nostr_lookup import lookup_metadata  # type: ignore
-
-                metadata = await lookup_metadata(pubkey)
+                metadata = await nostr_helpers.lookup_metadata(pubkey)
             except Exception as exc:  # pragma: no cover - network dependent
                 logger.debug(f"cyberherd: metadata lookup failed for {pubkey[:8]}...: {exc}")
 

@@ -49,11 +49,6 @@ else:  # pragma: no cover
     _monitoring_available = True
 
 try:  # pragma: no cover
-    from . import nostr_lookup as nl  # type: ignore
-except Exception:  # pragma: no cover
-    nl = None  # type: ignore
-
-try:  # pragma: no cover
     from . import nostr_helpers  # type: ignore
 except Exception:  # pragma: no cover
     nostr_helpers = None  # type: ignore

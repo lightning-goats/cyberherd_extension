@@ -29,6 +29,8 @@ from lnbits.extensions.cyberherd.services.pubkey import (
 )
 from lnbits.extensions.cyberherd.services.nostr_helpers import (
     reconnect_nostrclient_ws,
+    lookup_metadata,
+    lookup_relays,
 )
 from lnbits.extensions.cyberherd.services.headbutt import (
     _normalize_event_id as normalize_event_id,
@@ -37,10 +39,6 @@ from lnbits.extensions.cyberherd.services.note_metadata import (
     refresh_tracked_event_addresses,
 )
 from lnbits.core.crud import get_wallet
-from lnbits.extensions.cyberherd.services.nostr_lookup import (
-    lookup_metadata,
-    lookup_relays,
-)
 from lnbits.extensions.cyberherd.services.zap_totals import (
     get_zap_totals_for_zapper,
     ZapTotalsError,
@@ -48,6 +46,7 @@ from lnbits.extensions.cyberherd.services.zap_totals import (
 from lnbits.extensions.cyberherd.services.splits import (
     update_split_targets_proportional,
 )
+from .utils.common import coerce_bool
 
 # Legacy underscore-prefixed helpers expected by this module
 _normalize_event_id = normalize_event_id
@@ -1253,27 +1252,38 @@ async def api_put_settings(
     # Handle zap tracking toggle
     zap_tracking_enabled = payload.get("zap_tracking_enabled")
     if zap_tracking_enabled is not None:
-        settings.zap_tracking_enabled = bool(zap_tracking_enabled)
+        settings.zap_tracking_enabled = coerce_bool(
+            zap_tracking_enabled, getattr(settings, "zap_tracking_enabled", True)
+        )
 
     # Handle repost tracking toggle
     repost_tracking_enabled = payload.get("repost_tracking_enabled")
     if repost_tracking_enabled is not None:
-        settings.repost_tracking_enabled = bool(repost_tracking_enabled)
+        settings.repost_tracking_enabled = coerce_bool(
+            repost_tracking_enabled, getattr(settings, "repost_tracking_enabled", False)
+        )
 
     # Handle likes tracking toggle
     likes_tracking_enabled = payload.get("likes_tracking_enabled")
     if likes_tracking_enabled is not None:
-        settings.likes_tracking_enabled = bool(likes_tracking_enabled)
+        settings.likes_tracking_enabled = coerce_bool(
+            likes_tracking_enabled, getattr(settings, "likes_tracking_enabled", False)
+        )
 
     # Handle midnight reset opt-in toggle
     midnight_reset_enabled = payload.get("midnight_reset_enabled")
     if midnight_reset_enabled is not None:
-        settings.midnight_reset_enabled = bool(midnight_reset_enabled)
+        settings.midnight_reset_enabled = coerce_bool(
+            midnight_reset_enabled, getattr(settings, "midnight_reset_enabled", True)
+        )
 
     # Handle NIP-05 verification toggle
     nip05_verification_enabled = payload.get("nip05_verification_enabled")
     if nip05_verification_enabled is not None:
-        settings.nip05_verification_enabled = bool(nip05_verification_enabled)
+        settings.nip05_verification_enabled = coerce_bool(
+            nip05_verification_enabled,
+            getattr(settings, "nip05_verification_enabled", True),
+        )
 
     # Handle minimum sats
     minimum_sats = payload.get("minimum_sats")
@@ -1301,7 +1311,9 @@ async def api_put_settings(
     # Handle send_splits_enabled toggle
     send_splits_enabled = payload.get("send_splits_enabled")
     if send_splits_enabled is not None:
-        settings.send_splits_enabled = bool(send_splits_enabled)
+        settings.send_splits_enabled = coerce_bool(
+            send_splits_enabled, getattr(settings, "send_splits_enabled", False)
+        )
 
     # Pre-compute effective pubkey before the upsert to avoid recomputation later.
     try:

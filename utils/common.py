@@ -110,6 +110,31 @@ def parse_bool_env(env_var: str, default: bool = False) -> bool:
     return value in ("1", "true", "yes", "y")
 
 
+def coerce_bool(value: Any, default: bool = False) -> bool:
+    """Convert loose user/db input into a strict boolean.
+    
+    Accepts actual booleans, ints, and common string representations while
+    falling back to *default* when the value is None or empty.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    try:
+        text = str(value).strip().lower()
+    except Exception:
+        return default
+    if text in {"", "unset"}:
+        return default
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    return default
+
+
 def parse_int_env(env_var: str, default: int) -> int:
     """Parse an integer environment variable with fallback.
     
