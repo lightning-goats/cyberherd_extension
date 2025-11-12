@@ -2010,6 +2010,66 @@ async def api_backfill_zap_totals_from_payments(
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="failed to rebuild zap totals")
 
 
+@cyberherd_api_router.get("/api/v1/leaderboard")
+async def api_get_leaderboard(
+    user_id: str = Query(..., min_length=1),
+):
+    """Public leaderboard data for the specified CyberHerd user."""
+    try:
+        members = await crud.get_all_cyberherd_members(user_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Cyberherd: failed to fetch leaderboard members for {user_id}: {exc}")
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="failed to fetch leaderboard data")
+
+    leaderboard: list[dict[str, Any]] = []
+    for member in members or []:
+        amount = 0
+        try:
+            amount = int(member.get("amount", 0) or 0)
+        except Exception:
+            amount = 0
+        pubkey = member.get("pubkey")
+        if not isinstance(pubkey, str):
+            continue
+        pubkey = pubkey.strip().lower()
+        zap_totals = await crud.get_zap_totals_row(user_id, pubkey)
+        historical_sats = 0
+        historical_events = 0
+        if zap_totals:
+            try:
+                historical_sats = int(zap_totals.get("total_sats") or 0)
+            except Exception:
+                historical_sats = 0
+            try:
+                historical_events = int(zap_totals.get("event_count") or 0)
+            except Exception:
+                historical_events = 0
+        leaderboard.append(
+            {
+                "pubkey": pubkey,
+                "display_name": member.get("display_name") or member.get("alias") or "Anon",
+                "picture": member.get("picture"),
+                "amount": amount,
+                "is_active": bool(member.get("is_active")),
+                "historical_sats": historical_sats,
+                "historical_events": historical_events,
+            }
+        )
+
+    leaderboard.sort(
+        key=lambda item: (item.get("historical_sats", 0), item.get("amount", 0)),
+        reverse=True,
+    )
+    leaderboard = leaderboard[:10]
+    return {
+        "user_id": user_id,
+        "count": len(leaderboard),
+        "leaderboard": leaderboard,
+    }
+
+
 @cyberherd_api_router.post("/api/v1/members")
 async def api_post_member(
     request: Request,

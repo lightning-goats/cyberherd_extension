@@ -171,6 +171,15 @@ Rebuild zap totals by scanning the herd wallet's LNbits payments (instead of rel
 **Body (optional):** `{"zapper_pubkey": "<hex>", "batch_size": 250}`  
 **Returns:** Rebuild statistics (`payments_scanned`, `zap_candidates`, `zappers_updated`, etc.)
 
+#### `GET /api/v1/leaderboard`
+
+Public leaderboard data for a CyberHerd user.
+
+**Query params:** `user_id` (required) — LNbits user ID that owns the herd  
+**Returns:** Array of members with `display_name`, `picture`, `amount`, and `is_active` sorted by sats
+
+> Tip: A static leaderboard page is available at `/cyberherd/static/leaderboard.html?user_id=<LNbitsUserId>`.
+
 ### Operations
 
 #### `POST /api/v1/recover_events`

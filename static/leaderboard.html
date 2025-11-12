@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CyberHerd Leaderboard</title>
+    <style>
+        :root {
+            color-scheme: light dark;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        body {
+            margin: 0;
+            padding: 2rem;
+            background: #0f1115;
+            color: #f5f5f5;
+        }
+
+        a,
+        a:visited {
+            color: #7dd3fc;
+        }
+
+        .container {
+            max-width: 960px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            margin-bottom: 0.5rem;
+            font-size: clamp(1.8rem, 4vw, 2.6rem);
+            text-align: center;
+        }
+
+        p.description {
+            text-align: center;
+            margin-top: 0;
+            margin-bottom: 1.5rem;
+            color: #cbd5f5;
+        }
+
+        #status {
+            text-align: center;
+            margin: 1rem 0;
+            font-style: italic;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: rgba(255, 255, 255, 0.04);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        thead {
+            background: rgba(255, 255, 255, 0.08);
+        }
+
+        th, td {
+            padding: 0.85rem;
+            text-align: left;
+        }
+
+        th {
+            font-size: 0.9rem;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            color: #a5b4fc;
+        }
+
+        tbody tr:nth-child(odd) {
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        tbody tr:hover {
+            background: rgba(125, 211, 252, 0.12);
+        }
+
+        .member-info {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .member-info img {
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            object-fit: cover;
+            border: 2px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.2rem 0.65rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .badge.active {
+            background: rgba(74, 222, 128, 0.2);
+            color: #4ade80;
+        }
+
+        .badge.inactive {
+            background: rgba(248, 113, 113, 0.2);
+            color: #f87171;
+        }
+
+        @media (max-width: 640px) {
+            body {
+                padding: 1rem;
+            }
+
+            table, thead, tbody, th, td, tr {
+                display: block;
+            }
+
+            thead {
+                display: none;
+            }
+
+            tr {
+                margin-bottom: 1rem;
+                border-radius: 8px;
+                border: 1px solid rgba(255, 255, 255, 0.05);
+                padding: 0.75rem;
+            }
+
+            td {
+                padding: 0.4rem 0;
+            }
+
+            td::before {
+                content: attr(data-label);
+                display: block;
+                font-size: 0.75rem;
+                letter-spacing: 0.05em;
+                text-transform: uppercase;
+                color: #a5b4fc;
+                margin-bottom: 0.25rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>CyberHerd Leaderboard</h1>
+        <div id="status">Loading leaderboard...</div>
+        <table hidden id="leaderboard-table">
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Member</th>
+                    <th>Zap Amount (sats)</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody id="leaderboard-body"></tbody>
+        </table>
+    </div>
+
+    <script>
+        const statusEl = document.getElementById('status');
+        const tableEl = document.getElementById('leaderboard-table');
+        const tbodyEl = document.getElementById('leaderboard-body');
+
+        function formatAmount(value) {
+            return Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 0 });
+        }
+
+        function getUserId() {
+            const params = new URLSearchParams(window.location.search);
+            return params.get('user_id') || '';
+        }
+
+        function renderLeaderboard(entries) {
+            tbodyEl.innerHTML = '';
+            if (!entries.length) {
+                statusEl.textContent = 'No members found for this CyberHerd.';
+                tableEl.hidden = true;
+                return;
+            }
+
+            tableEl.hidden = false;
+            statusEl.textContent = '';
+
+            entries.forEach((entry, index) => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td data-label="Rank">${index + 1}</td>
+                    <td data-label="Member">
+                        <div class="member-info">
+                            ${entry.picture ? `<img src="${entry.picture}" alt="${entry.display_name}"/>` : `<div style="width:48px;height:48px;border-radius:50%;background:#1f2937;display:flex;align-items:center;justify-content:center;">🟣</div>`}
+                            <div>
+                                <div>${entry.display_name || 'Anon'}</div>
+                                <div style="font-size:0.8rem;color:#94a3b8;">${entry.pubkey ? entry.pubkey.slice(0, 8) + '…' : ''}</div>
+                            </div>
+                        </div>
+                    </td>
+                    <td data-label="Zap Amount">
+                        <div>
+                            <div style="font-weight:600;">${formatAmount(entry.historical_sats || 0)}</div>
+                            <div style="font-size:0.8rem;color:#a5b4fc;">${formatAmount(entry.amount || 0)} today</div>
+                        </div>
+                    </td>
+                    <td data-label="Status">
+                        <span class="badge ${entry.is_active ? 'active' : 'inactive'}">
+                            ${entry.is_active ? 'Active' : 'Inactive'}
+                        </span>
+                    </td>
+                `;
+                tbodyEl.appendChild(tr);
+            });
+        }
+
+        async function loadLeaderboard() {
+            const userId = getUserId();
+            if (!userId) {
+                statusEl.innerHTML = 'Please provide a <code>user_id</code> query parameter.';
+                tableEl.hidden = true;
+                return;
+            }
+
+            try {
+                statusEl.textContent = 'Loading leaderboard...';
+                const resp = await fetch(`../api/v1/leaderboard?user_id=${encodeURIComponent(userId)}`);
+                if (!resp.ok) {
+                    throw new Error(`Request failed: ${resp.status}`);
+                }
+                const data = await resp.json();
+                renderLeaderboard(data.leaderboard || []);
+            } catch (err) {
+                console.error(err);
+                statusEl.textContent = 'Failed to load leaderboard. Please try again later.';
+                tableEl.hidden = true;
+            }
+        }
+
+        loadLeaderboard();
+    </script>
+</body>
+</html>
