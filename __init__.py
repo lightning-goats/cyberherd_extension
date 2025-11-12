@@ -25,7 +25,7 @@ from . import db as _db
 from .crud import db
 from . import crud
 from .setup import register_services
-from .tasks import cyberherd_tasks
+from .tasks import cyberherd_tasks, start_invoice_listener
 from .services.subscriptions import cyberherd_subscription_handler
 from .services.note_metadata import apply_event_address
 from .utils.common import extract_t_tags_from_event, utc_now
@@ -79,6 +79,13 @@ def cyberherd_start():
     except Exception as e:
         logger.error(f"Cyberherd: Failed to create WebSocket monitor task: {e}", exc_info=True)
 
+    # Ensure the invoice listener is active so realtime payments feed zap processing
+    try:
+        start_invoice_listener()
+        logger.info("✅ Cyberherd: Invoice listener task registered")
+    except Exception as e:
+        logger.error(f"Cyberherd: Failed to start invoice listener: {e}", exc_info=True)
+
 
 # Match standard pattern (splitpayments): directly include routers without alias.
 try:  # web UI router
@@ -120,6 +127,21 @@ cyberherd_static_files = [
     {"path": "/cyberherd/static", "name": "cyberherd_static"},
 ]
 
+
+class CyberHerdStaticFiles(StaticFiles):
+    """Static file handler that special-cases leaderboard deep links."""
+
+    def __init__(self, directory: str):
+        super().__init__(directory=directory, check_dir=True)
+        self._leaderboard_file = os.path.join(directory, "leaderboard.html")
+
+    async def get_response(self, path, scope):
+        normalized = (path or "").strip("/")
+        if normalized in {"leaderboard", "leaderboard.html"} or normalized.startswith("leaderboard/"):
+            if self._leaderboard_file and os.path.exists(self._leaderboard_file):
+                return FileResponse(self._leaderboard_file)
+        return await super().get_response(path, scope)
+
 # Export an APIRouter named <ext_id>_ext so the LNbits core loader can find it
 # (register_ext_routes looks for a symbol named f"{ext.code}_ext").
 
@@ -146,6 +168,13 @@ def init_extension(app):
         cyberherd_tasks(app)
     except Exception as e:
         logger.warning(f"Cyberherd tasks init failed: {e}")
+    
+    # Register invoice listener so realtime zap detection starts immediately
+    try:
+        start_invoice_listener(app)
+        logger.info("Cyberherd: invoice listener registered during init")
+    except Exception as e:
+        logger.warning(f"Cyberherd: failed to register invoice listener: {e}")
     
     # WebSocket-based event monitoring is started via cyberherd_start() using create_permanent_unique_task
     # (see cyberherd_start() function above)
@@ -297,7 +326,7 @@ def _mount_ui(app):
         try:
             app.mount(
                 "/cyberherd/static",
-                StaticFiles(directory=static_path),
+                CyberHerdStaticFiles(directory=static_path),
                 name="cyberherd_static",
             )
         except Exception as se:  # pragma: no cover

@@ -64,6 +64,26 @@ _zap_monitor_instances = _instances
 _ZAP_MONITOR_LAST_ACCESS = _last_access
 
 
+def payment_listener_required(settings) -> bool:
+    """Return True when settings require the LNbits payment listener.
+
+    The listener is only useful when we have a herd wallet configured because all
+    realtime zap detection and automatic split triggers operate on that wallet.
+    """
+    if not settings:
+        return False
+
+    herd_wallet = getattr(settings, "herd_wallet", None)
+    has_herd_wallet = isinstance(herd_wallet, str) and herd_wallet.strip() != ""
+
+    if not has_herd_wallet:
+        return False
+
+    zap_tracking = bool(getattr(settings, "zap_tracking_enabled", False))
+    auto_splits = bool(getattr(settings, "send_splits_enabled", False))
+    return zap_tracking or auto_splits
+
+
 async def cleanup_stale_monitors(max_age: int | None = None) -> dict[str, int]:
     """Clean up monitors that haven't been accessed in a while."""
     age = max_age or _TTL
@@ -313,17 +333,17 @@ class ZapMonitorService:
         # Get user settings
         settings = await crud.get_settings(self.user_id)
         
-        # Start payment listener if either zap tracking OR automatic splits are enabled
-        zap_tracking = getattr(settings, 'zap_tracking_enabled', False)
-        auto_splits = getattr(settings, 'send_splits_enabled', False)
-        
-        if not zap_tracking and not auto_splits:
+        herd_wallet = getattr(settings, 'herd_wallet', None)
+        zap_tracking = bool(getattr(settings, 'zap_tracking_enabled', False))
+        auto_splits = bool(getattr(settings, 'send_splits_enabled', False))
+        needs_listener = payment_listener_required(settings)
+
+        if not needs_listener:
             logger.info(
-                f"Payment listener not needed for user {self.user_id}: "
+                f"Payment listener not started for user {self.user_id}: "
+                f"herd_wallet={'set' if herd_wallet else 'missing'}, "
                 f"zap_tracking_enabled={zap_tracking}, send_splits_enabled={auto_splits}"
             )
-            if self._running:
-                await self.stop_monitoring()
             return
         
         if self._running:

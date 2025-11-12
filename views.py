@@ -46,9 +46,10 @@ async def index(request: Request, user: User = Depends(check_user_exists)):
         )
 
 
-@router.get("/static/leaderboard/{pubkey}", response_class=FileResponse)
-async def leaderboard_static(pubkey: str):
-    """Serve the leaderboard HTML while encoding pubkey in the path."""
+@router.get("/static/leaderboard", response_class=FileResponse)
+@router.get("/static/leaderboard/{pubkey:path}", response_class=FileResponse)
+async def leaderboard_static(pubkey: str | None = None):
+    """Serve the leaderboard standalone page for direct/static links."""
     leaderboard_path = os.path.join(_static_dir(), "leaderboard.html")
     if not os.path.exists(leaderboard_path):
         return HTMLResponse("Leaderboard file missing", status_code=404)

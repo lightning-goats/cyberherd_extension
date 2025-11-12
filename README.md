@@ -179,8 +179,8 @@ Public leaderboard data for a CyberHerd user.
 **Returns:** Array of members with `display_name`, `picture`, `amount`, and `is_active` sorted by sats
 
 > Tip: A static leaderboard page is available at `/cyberherd/static/leaderboard/<EffectivePubkey>`.  
-> It automatically resolves the herd wallet’s read key and connects to the LNbits websocket feed.  
-> You can still override the target via `wallet_key`, `lnbits_host`, `lnbits_port`, or `lnbits_scheme` query params (e.g., `/cyberherd/static/leaderboard/<pubkey>?lnbits_host=lnbits&lnbits_port=5000&lnbits_scheme=wss`).
+> It streams updates over the extension’s own websocket feed (`/cyberherd/ws/leaderboard/<pubkey>`), so no wallet keys or user IDs are exposed.  
+> When LNbits is proxied behind a different host/port, you can override the websocket target via `lnbits_host`, `lnbits_port`, or `lnbits_scheme` (e.g., `/cyberherd/static/leaderboard/<pubkey>?lnbits_host=lnbits&lnbits_port=5000&lnbits_scheme=wss`).
 
 ### Operations
 

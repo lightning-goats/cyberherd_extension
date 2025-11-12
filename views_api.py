@@ -89,7 +89,7 @@ from lnbits.core.crud import get_wallet_for_key
 from . import crud, services
 from .crud import clear_processed_zaps_for_user
 from .services.splits import reset_splits_to_predefined_wallet
-from .services.zap_monitor import get_zap_monitor
+from .services.zap_monitor import get_zap_monitor, payment_listener_required
 
 # Router for this module (will be included by package init)
 cyberherd_api_router = APIRouter()
@@ -1184,6 +1184,7 @@ async def api_put_settings(
 
     user_id = wallet_info.wallet.user
     settings = await crud.get_settings(user_id)
+    payment_listener_was_required = payment_listener_required(settings)
 
     # Capture previous toggle values to detect new enablement.
     zap_tracking_was_enabled = bool(getattr(settings, "zap_tracking_enabled", False))
@@ -1371,13 +1372,21 @@ async def api_put_settings(
 
     # Handle zap monitoring service start/stop based on toggle or mode updates (background)
     # Also update subscriptions when event type toggles change
-    toggles_changed = (
-        zap_tracking_enabled is not None or 
-        repost_tracking_enabled is not None or 
-        likes_tracking_enabled is not None
+    toggles_changed = any(
+        flag is not None
+        for flag in (
+            zap_tracking_enabled,
+            repost_tracking_enabled,
+            likes_tracking_enabled,
+        )
     )
 
-    if zap_tracking_enabled is not None or toggles_changed:
+    payment_listener_needed_now = payment_listener_required(settings)
+    monitor_requirements_changed = (
+        payment_listener_needed_now != payment_listener_was_required
+    )
+
+    if monitor_requirements_changed or toggles_changed:
         import asyncio
         async def _bg_update_zap_monitor():
             try:
@@ -1390,15 +1399,20 @@ async def api_put_settings(
 
                 zap_enabled = bool(getattr(settings, "zap_tracking_enabled", False))
 
-                if zap_tracking_enabled is not None:
-                    # Handle start/stop when zap tracking toggle changes
-                    if zap_enabled:
-                        # Start monitoring (now runs recovery in background)
+                if monitor_requirements_changed:
+                    if payment_listener_needed_now:
                         await zap_monitor.start_monitoring()
-                        logger.info("Zap monitor start initiated from settings update")
+                        logger.info(
+                            "Zap monitor start initiated from settings update (requirements changed)"
+                        )
                     else:
-                        await asyncio.wait_for(zap_monitor.stop_monitoring(), timeout=5.0)
-                        logger.info("Zap monitor stopped from settings update")
+                        try:
+                            await asyncio.wait_for(zap_monitor.stop_monitoring(), timeout=5.0)
+                            logger.info(
+                                "Zap monitor stopped from settings update (requirements changed)"
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning("Zap monitor stop timed out")
 
                 # Update subscriptions when event type toggles change (if monitor is running)
                 if toggles_changed and zap_monitor._running:
@@ -1425,8 +1439,6 @@ async def api_put_settings(
                     except Exception as e:
                         logger.warning(f"Failed to update subscriptions: {e}")
 
-            except asyncio.TimeoutError:
-                logger.warning("Zap monitor stop timed out")
             except Exception as e:
                 logger.warning(f"Failed to update zap monitoring: {e}")
         try:
@@ -2054,6 +2066,7 @@ async def websocket_leaderboard(websocket: WebSocket, pubkey: str):
         await unregister_leaderboard_watcher(user_id, queue)
 
 
+@cyberherd_api_router.get("/api/v1/leaderboard")
 async def api_get_leaderboard(
     pubkey: str = Query(..., min_length=64, max_length=64),
 ):
@@ -2062,22 +2075,15 @@ async def api_get_leaderboard(
     if not user_id:
         raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="pubkey not associated with any herd")
 
-    wallet_key = None
-    if settings:
-        herd_wallet = getattr(settings, "herd_wallet", None)
-        if herd_wallet:
-            try:
-                wallet = await get_wallet(herd_wallet)
-                if wallet and wallet.inkey:
-                    wallet_key = wallet.inkey
-            except Exception as exc:
-                logger.debug(f"Cyberherd: failed to fetch wallet inkey for leaderboard pubkey {pubkey}: {exc}")
-
     try:
         leaderboard = await get_leaderboard_entries(user_id)
     except Exception as exc:
         logger.error(f"Cyberherd: failed to fetch leaderboard for {pubkey}: {exc}")
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="failed to fetch leaderboard data")
+
+    return {
+        "leaderboard": leaderboard,
+    }
 
 
 

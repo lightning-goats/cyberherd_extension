@@ -178,11 +178,12 @@
         let lnbitsPort = '';
         let lnbitsSchemeOverride = null;
         (function initFromPath() {
-            const path = window.location.pathname;
-            const match = path.match(/leaderboard\\/([^/]+)/i);
+            const path = window.location.pathname || '';
             const params = new URLSearchParams(window.location.search);
-            if (match && match[1]) {
-                requestedPubkey = match[1];
+            const segments = path.split('/').filter(Boolean);
+            const leaderboardIdx = segments.findIndex(seg => seg.toLowerCase() === 'leaderboard');
+            if (leaderboardIdx !== -1 && segments[leaderboardIdx + 1]) {
+                requestedPubkey = decodeURIComponent(segments[leaderboardIdx + 1]);
             } else {
                 requestedPubkey = params.get('pubkey') || '';
             }
@@ -197,19 +198,29 @@
         let refreshTimer = null;
         let websocket = null;
         let reconnectDelay = BASE_RECONNECT_DELAY;
-        let walletKey = queryParams.get('wallet_key') || null;
         let wsInitialized = false;
 
         function formatAmount(value) {
             return Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 0 });
         }
 
-        function buildWalletWebSocketUrl(key) {
-            const protocol = lnbitsSchemeOverride
-                ? lnbitsSchemeOverride
-                : window.location.protocol === 'https:' ? 'wss' : 'ws';
+        function resolveWebsocketScheme() {
+            if (!lnbitsSchemeOverride) {
+                return window.location.protocol === 'https:' ? 'wss' : 'ws';
+            }
+            if (lnbitsSchemeOverride.startsWith('http')) {
+                return lnbitsSchemeOverride.replace('http', 'ws');
+            }
+            return lnbitsSchemeOverride;
+        }
+
+        function buildLeaderboardWebSocketUrl(pubkey) {
+            if (!pubkey) {
+                return null;
+            }
+            const protocol = resolveWebsocketScheme();
             const portSegment = lnbitsPort ? `:${lnbitsPort}` : '';
-            return `${protocol}://${lnbitsHost}${portSegment}/api/v1/ws/${encodeURIComponent(key)}`;
+            return `${protocol}://${lnbitsHost}${portSegment}${extensionBase}/ws/leaderboard/${encodeURIComponent(pubkey)}`;
         }
 
         function logWsMessage(message) {
@@ -278,13 +289,8 @@
                 }
                 const data = await resp.json();
                 renderLeaderboard(data.leaderboard || []);
-                if (!walletKey && data.wallet_key) {
-                    walletKey = data.wallet_key;
-                    if (!wsInitialized) {
-                        startWebsocket();
-                    }
-                } else if (!data.wallet_key && !wsInitialized) {
-                    logWsMessage('Server did not provide a wallet key; live updates disabled.');
+                if (!wsInitialized) {
+                    startWebsocket();
                 }
             } catch (err) {
                 console.error(err);
@@ -314,9 +320,11 @@
         }
 
         function startWebsocket() {
-            if (!walletKey) {
-                logWsMessage('Live updates unavailable (missing wallet key).');
-                scheduleRefresh();
+            if (wsInitialized) {
+                return;
+            }
+            if (!requestedPubkey) {
+                logWsMessage('Live updates unavailable (missing pubkey).');
                 return;
             }
             wsInitialized = true;
@@ -324,13 +332,14 @@
         }
 
         function connectWebsocket() {
-            if (!walletKey) {
+            const wsUrl = buildLeaderboardWebSocketUrl(requestedPubkey);
+            if (!wsUrl) {
+                logWsMessage('Unable to build leaderboard WebSocket URL.');
                 scheduleRefresh();
                 return;
             }
 
-            const wsUrl = buildWalletWebSocketUrl(walletKey);
-            logWsMessage(`Connecting to wallet feed…`);
+            logWsMessage(`Connecting to leaderboard feed…`);
             try {
                 websocket = new WebSocket(wsUrl);
             } catch (err) {
@@ -367,9 +376,7 @@
 
         loadLeaderboard();
         scheduleRefresh();
-        if (walletKey) {
-            startWebsocket();
-        }
+        startWebsocket();
     </script>
 </body>
 </html>
