@@ -168,19 +168,62 @@
         const statusEl = document.getElementById('status');
         const tableEl = document.getElementById('leaderboard-table');
         const tbodyEl = document.getElementById('leaderboard-body');
+        const MAX_ENTRIES = 10;
+        const REFRESH_INTERVAL_MS = 60000;
+        const BASE_RECONNECT_DELAY = 2000;
+
+        const queryParams = new URLSearchParams(window.location.search);
+        let requestedPubkey = '';
+        let lnbitsHost = '';
+        let lnbitsPort = '';
+        let lnbitsSchemeOverride = null;
+        (function initFromPath() {
+            const path = window.location.pathname;
+            const match = path.match(/leaderboard\\/([^/]+)/i);
+            const params = new URLSearchParams(window.location.search);
+            if (match && match[1]) {
+                requestedPubkey = match[1];
+            } else {
+                requestedPubkey = params.get('pubkey') || '';
+            }
+            const inferredHost = window.location.hostname || '127.0.0.1';
+            const inferredPort = window.location.port || '';
+            lnbitsHost = params.get('lnbits_host') || inferredHost;
+            lnbitsPort = params.get('lnbits_port') || inferredPort;
+            lnbitsSchemeOverride = params.get('lnbits_scheme');
+        })();
+
+        let cachedEntries = [];
+        let refreshTimer = null;
+        let websocket = null;
+        let reconnectDelay = BASE_RECONNECT_DELAY;
+        let walletKey = queryParams.get('wallet_key') || null;
+        let wsInitialized = false;
 
         function formatAmount(value) {
             return Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 0 });
         }
 
-        function getUserId() {
-            const params = new URLSearchParams(window.location.search);
-            return params.get('user_id') || '';
+        function buildWalletWebSocketUrl(key) {
+            const protocol = lnbitsSchemeOverride
+                ? lnbitsSchemeOverride
+                : window.location.protocol === 'https:' ? 'wss' : 'ws';
+            const portSegment = lnbitsPort ? `:${lnbitsPort}` : '';
+            return `${protocol}://${lnbitsHost}${portSegment}/api/v1/ws/${encodeURIComponent(key)}`;
         }
 
+        function logWsMessage(message) {
+            console.debug(`[leaderboard-ws] ${message}`);
+        }
+
+        const extensionBase = window.location.pathname.startsWith('/cyberherd')
+            ? '/cyberherd'
+            : '/extensions/cyberherd';
+
         function renderLeaderboard(entries) {
+            cachedEntries = entries.slice(0, MAX_ENTRIES);
             tbodyEl.innerHTML = '';
-            if (!entries.length) {
+            if (!cachedEntries.length) {
                 statusEl.textContent = 'No members found for this CyberHerd.';
                 tableEl.hidden = true;
                 return;
@@ -189,13 +232,13 @@
             tableEl.hidden = false;
             statusEl.textContent = '';
 
-            entries.forEach((entry, index) => {
+            cachedEntries.forEach((entry, index) => {
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
                     <td data-label="Rank">${index + 1}</td>
                     <td data-label="Member">
                         <div class="member-info">
-                            ${entry.picture ? `<img src="${entry.picture}" alt="${entry.display_name}"/>` : `<div style="width:48px;height:48px;border-radius:50%;background:#1f2937;display:flex;align-items:center;justify-content:center;">🟣</div>`}
+                            ${entry.picture ? `<img src="${entry.picture}" alt="${entry.display_name}" referrerpolicy="no-referrer" loading="lazy"/>` : `<div style="width:48px;height:48px;border-radius:50%;background:#1f2937;display:flex;align-items:center;justify-content:center;">🟣</div>`}
                             <div>
                                 <div>${entry.display_name || 'Anon'}</div>
                                 <div style="font-size:0.8rem;color:#94a3b8;">${entry.pubkey ? entry.pubkey.slice(0, 8) + '…' : ''}</div>
@@ -218,30 +261,115 @@
             });
         }
 
-        async function loadLeaderboard() {
-            const userId = getUserId();
-            if (!userId) {
-                statusEl.innerHTML = 'Please provide a <code>user_id</code> query parameter.';
+        async function loadLeaderboard(isRefresh = false) {
+            if (!requestedPubkey) {
+                statusEl.innerHTML = 'Please provide a <code>pubkey</code> query parameter.';
                 tableEl.hidden = true;
                 return;
             }
 
             try {
-                statusEl.textContent = 'Loading leaderboard...';
-                const resp = await fetch(`../api/v1/leaderboard?user_id=${encodeURIComponent(userId)}`);
+                if (!isRefresh) {
+                    statusEl.textContent = 'Loading leaderboard...';
+                }
+                const resp = await fetch(`${extensionBase}/api/v1/leaderboard?pubkey=${encodeURIComponent(requestedPubkey)}`);
                 if (!resp.ok) {
                     throw new Error(`Request failed: ${resp.status}`);
                 }
                 const data = await resp.json();
                 renderLeaderboard(data.leaderboard || []);
+                if (!walletKey && data.wallet_key) {
+                    walletKey = data.wallet_key;
+                    if (!wsInitialized) {
+                        startWebsocket();
+                    }
+                } else if (!data.wallet_key && !wsInitialized) {
+                    logWsMessage('Server did not provide a wallet key; live updates disabled.');
+                }
             } catch (err) {
                 console.error(err);
-                statusEl.textContent = 'Failed to load leaderboard. Please try again later.';
-                tableEl.hidden = true;
+                if (!isRefresh) {
+                    statusEl.textContent = 'Failed to load leaderboard. Please try again later.';
+                    tableEl.hidden = true;
+                }
             }
         }
 
+        function scheduleRefresh() {
+            if (refreshTimer) {
+                clearInterval(refreshTimer);
+            }
+            refreshTimer = setInterval(() => loadLeaderboard(true), REFRESH_INTERVAL_MS);
+        }
+
+        function handleWebsocketMessage(event) {
+            try {
+                const payload = JSON.parse(event.data);
+                if (payload && payload.type === 'leaderboard_update') {
+                    renderLeaderboard(payload.leaderboard || []);
+                }
+            } catch (err) {
+                console.debug('Leaderboard WebSocket non-JSON payload:', event.data);
+            }
+        }
+
+        function startWebsocket() {
+            if (!walletKey) {
+                logWsMessage('Live updates unavailable (missing wallet key).');
+                scheduleRefresh();
+                return;
+            }
+            wsInitialized = true;
+            connectWebsocket();
+        }
+
+        function connectWebsocket() {
+            if (!walletKey) {
+                scheduleRefresh();
+                return;
+            }
+
+            const wsUrl = buildWalletWebSocketUrl(walletKey);
+            logWsMessage(`Connecting to wallet feed…`);
+            try {
+                websocket = new WebSocket(wsUrl);
+            } catch (err) {
+                console.error('Failed to open leaderboard WebSocket', err);
+                scheduleReconnect();
+                return;
+            }
+
+            websocket.onopen = () => {
+                reconnectDelay = BASE_RECONNECT_DELAY;
+                logWsMessage('Live leaderboard connection active.');
+            };
+            websocket.onmessage = handleWebsocketMessage;
+            websocket.onerror = () => {
+                logWsMessage('Live connection error; retrying…');
+            };
+            websocket.onclose = () => {
+                logWsMessage('Live connection closed; attempting to reconnect…');
+                scheduleReconnect();
+            };
+        }
+
+        function scheduleReconnect() {
+            if (websocket) {
+                try {
+                    websocket.close();
+                } catch (_) {}
+                websocket = null;
+            }
+            const delay = reconnectDelay;
+            reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
+            setTimeout(connectWebsocket, delay);
+        }
+
         loadLeaderboard();
+        scheduleRefresh();
+        if (walletKey) {
+            startWebsocket();
+        }
     </script>
 </body>
 </html>

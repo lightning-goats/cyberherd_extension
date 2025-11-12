@@ -175,10 +175,12 @@ Rebuild zap totals by scanning the herd wallet's LNbits payments (instead of rel
 
 Public leaderboard data for a CyberHerd user.
 
-**Query params:** `user_id` (required) — LNbits user ID that owns the herd  
+**Query params:** `user_id` (optional) or `pubkey` (optional but required if user_id omitted).  
 **Returns:** Array of members with `display_name`, `picture`, `amount`, and `is_active` sorted by sats
 
-> Tip: A static leaderboard page is available at `/cyberherd/static/leaderboard.html?user_id=<LNbitsUserId>`.
+> Tip: A static leaderboard page is available at `/cyberherd/static/leaderboard/<EffectivePubkey>`.  
+> It automatically resolves the herd wallet’s read key and connects to the LNbits websocket feed.  
+> You can still override the target via `wallet_key`, `lnbits_host`, `lnbits_port`, or `lnbits_scheme` query params (e.g., `/cyberherd/static/leaderboard/<pubkey>?lnbits_host=lnbits&lnbits_port=5000&lnbits_scheme=wss`).
 
 ### Operations
 

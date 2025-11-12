@@ -7,7 +7,16 @@ import time
 from http import HTTPStatus
 from typing import Optional, Dict, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Security, Query
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+    Security,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import JSONResponse
 
 # Common LNbits helpers used across extensions
@@ -43,6 +52,13 @@ from lnbits.extensions.cyberherd.services.zap_totals import (
     get_zap_totals_for_zapper,
     rebuild_zap_totals_from_payments,
     ZapTotalsError,
+)
+from lnbits.extensions.cyberherd.services.leaderboard import (
+    get_leaderboard_entries,
+    broadcast_leaderboard_update,
+    register_leaderboard_watcher,
+    unregister_leaderboard_watcher,
+    resolve_user_by_pubkey,
 )
 from lnbits.extensions.cyberherd.services.splits import (
     update_split_targets_proportional,
@@ -2000,6 +2016,7 @@ async def api_backfill_zap_totals_from_payments(
             zapper_pubkey=zapper_pubkey,
             batch_size=batch_size or 250,
         )
+        await broadcast_leaderboard_update(user_id)
         return {"rebuild": stats}
     except ZapTotalsError as exc:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc))
@@ -2010,64 +2027,58 @@ async def api_backfill_zap_totals_from_payments(
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="failed to rebuild zap totals")
 
 
-@cyberherd_api_router.get("/api/v1/leaderboard")
-async def api_get_leaderboard(
-    user_id: str = Query(..., min_length=1),
-):
-    """Public leaderboard data for the specified CyberHerd user."""
-    try:
-        members = await crud.get_all_cyberherd_members(user_id)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error(f"Cyberherd: failed to fetch leaderboard members for {user_id}: {exc}")
-        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="failed to fetch leaderboard data")
+@cyberherd_api_router.websocket("/ws/leaderboard/{pubkey}")
+async def websocket_leaderboard(websocket: WebSocket, pubkey: str):
+    user_id, _settings = await resolve_user_by_pubkey(pubkey)
+    if not user_id:
+        await websocket.close(code=1008, reason="Unknown pubkey")
+        return
 
-    leaderboard: list[dict[str, Any]] = []
-    for member in members or []:
-        amount = 0
-        try:
-            amount = int(member.get("amount", 0) or 0)
-        except Exception:
-            amount = 0
-        pubkey = member.get("pubkey")
-        if not isinstance(pubkey, str):
-            continue
-        pubkey = pubkey.strip().lower()
-        zap_totals = await crud.get_zap_totals_row(user_id, pubkey)
-        historical_sats = 0
-        historical_events = 0
-        if zap_totals:
-            try:
-                historical_sats = int(zap_totals.get("total_sats") or 0)
-            except Exception:
-                historical_sats = 0
-            try:
-                historical_events = int(zap_totals.get("event_count") or 0)
-            except Exception:
-                historical_events = 0
-        leaderboard.append(
+    await websocket.accept()
+    queue = await register_leaderboard_watcher(user_id)
+    try:
+        initial = await get_leaderboard_entries(user_id)
+        await websocket.send_json(
             {
-                "pubkey": pubkey,
-                "display_name": member.get("display_name") or member.get("alias") or "Anon",
-                "picture": member.get("picture"),
-                "amount": amount,
-                "is_active": bool(member.get("is_active")),
-                "historical_sats": historical_sats,
-                "historical_events": historical_events,
+                "type": "leaderboard_update",
+                "user_id": user_id,
+                "leaderboard": initial,
             }
         )
+        while True:
+            payload = await queue.get()
+            await websocket.send_json(payload)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await unregister_leaderboard_watcher(user_id, queue)
 
-    leaderboard.sort(
-        key=lambda item: (item.get("historical_sats", 0), item.get("amount", 0)),
-        reverse=True,
-    )
-    leaderboard = leaderboard[:10]
-    return {
-        "user_id": user_id,
-        "count": len(leaderboard),
-        "leaderboard": leaderboard,
-    }
+
+async def api_get_leaderboard(
+    pubkey: str = Query(..., min_length=64, max_length=64),
+):
+    """Public leaderboard data for the specified CyberHerd user."""
+    user_id, settings = await resolve_user_by_pubkey(pubkey)
+    if not user_id:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail="pubkey not associated with any herd")
+
+    wallet_key = None
+    if settings:
+        herd_wallet = getattr(settings, "herd_wallet", None)
+        if herd_wallet:
+            try:
+                wallet = await get_wallet(herd_wallet)
+                if wallet and wallet.inkey:
+                    wallet_key = wallet.inkey
+            except Exception as exc:
+                logger.debug(f"Cyberherd: failed to fetch wallet inkey for leaderboard pubkey {pubkey}: {exc}")
+
+    try:
+        leaderboard = await get_leaderboard_entries(user_id)
+    except Exception as exc:
+        logger.error(f"Cyberherd: failed to fetch leaderboard for {pubkey}: {exc}")
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="failed to fetch leaderboard data")
+
 
 
 @cyberherd_api_router.post("/api/v1/members")

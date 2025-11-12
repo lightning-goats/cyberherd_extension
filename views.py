@@ -17,6 +17,10 @@ def cyberherd_renderer():
     return template_renderer(["cyberherd/templates"])
 
 
+def _static_dir() -> str:
+    return os.path.join(os.path.dirname(__file__), "static")
+
+
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request, user: User = Depends(check_user_exists)):
     """Serve the CyberHerd admin UI using the standard LNbits base layout.
@@ -40,3 +44,12 @@ async def index(request: Request, user: User = Depends(check_user_exists)):
             """,
             status_code=500,
         )
+
+
+@router.get("/static/leaderboard/{pubkey}", response_class=FileResponse)
+async def leaderboard_static(pubkey: str):
+    """Serve the leaderboard HTML while encoding pubkey in the path."""
+    leaderboard_path = os.path.join(_static_dir(), "leaderboard.html")
+    if not os.path.exists(leaderboard_path):
+        return HTMLResponse("Leaderboard file missing", status_code=404)
+    return FileResponse(leaderboard_path)

@@ -37,6 +37,7 @@ from .pubkey import resolve_effective_pubkey
 from .note_metadata import apply_event_address
 from .zap_totals import record_incremental_zap_total
 from ..utils.common import utc_now_timestamp  # Centralized UTC timestamp function
+from .leaderboard import broadcast_leaderboard_update
 
 # NostrEventMonitor was planned but not implemented - monitoring happens via subscriptions.py
 _monitoring_available = False
@@ -663,6 +664,50 @@ class ZapMonitorService:
                 is_tracked = target_note_id in tracked_notes
                 
                 if not is_tracked:
+                    author_hint_for_tracking = target_author
+                    if not author_hint_for_tracking:
+                        try:
+                            eff_hint = resolve_effective_pubkey(settings)
+                            if isinstance(eff_hint, str):
+                                author_hint_for_tracking = eff_hint.strip().lower()
+                        except Exception:
+                            author_hint_for_tracking = None
+
+                    if author_hint_for_tracking:
+                        logger.debug(
+                            f"Zap target {target_note_id[:8]}... missing from tracked list; "
+                            "attempting opportunistic tracking."
+                        )
+                        try:
+                            ensured = await self._ensure_note_tracked(
+                                settings=settings,
+                                note_id=target_note_id,
+                                author_hint=author_hint_for_tracking,
+                            )
+                        except Exception as exc:
+                            ensured = False
+                            logger.debug(
+                                "Opportunistic tracking attempt failed for note %s: %s",
+                                target_note_id[:8],
+                                exc,
+                            )
+
+                        if ensured:
+                            tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
+                            is_tracked = target_note_id in tracked_notes
+                            if is_tracked:
+                                logger.info(
+                                    "Auto-tracked note %s after zap from %s",
+                                    target_note_id[:8],
+                                    zapper_pubkey[:8],
+                                )
+                    else:
+                        logger.debug(
+                            "Skipping opportunistic tracking for note %s: no author hint available",
+                            target_note_id[:8],
+                        )
+
+                if not is_tracked:
                     logger.info(
                         f"❌ Zap target {target_note_id[:8]}... is NOT in tracked_event_ids "
                         f"({len(tracked_notes)} tracked events). Ignoring zap."
@@ -798,6 +843,10 @@ class ZapMonitorService:
                                 amount_sats=amount_sats,
                                 event_timestamp=payment_ts,
                                 event_id=event_id,
+                            )
+                            await broadcast_leaderboard_update(
+                                cast(str, self.user_id),
+                                settings=settings,
                             )
                         except Exception as exc:
                             logger.debug(
