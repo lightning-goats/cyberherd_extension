@@ -352,7 +352,7 @@ class ZapMonitorService:
         self._running = True
         
         # Start payment listener for LNURLp zaps AND automatic splits
-        self._payment_listener_task = asyncio.create_task(self.payment_listener())
+        self._payment_listener_task = asyncio.create_task(self._payment_listener_runner())
         logger.info(
             f"Started payment listener for user {self.user_id} "
             f"(zap_tracking={zap_tracking}, auto_splits={auto_splits})"
@@ -1214,7 +1214,31 @@ class ZapMonitorService:
             f"for note {note_id[:8]}... (note: zap was already processed successfully)"
         )
     
-    async def payment_listener(self):
+    async def _payment_listener_runner(self):
+        """Supervise the payment listener loop and restart on fatal errors."""
+        backoff_seconds = 1.0
+        while self._running:
+            try:
+                await self._payment_listener_worker()
+                backoff_seconds = 1.0
+                if not self._running:
+                    break
+                logger.warning(
+                    f"Payment listener exited unexpectedly for user {self.user_id}, restarting in {backoff_seconds:.1f}s"
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.last_error = str(exc)
+                logger.error(
+                    f"Payment listener crashed for user {self.user_id}: {exc}. "
+                    f"Retrying in {backoff_seconds:.1f}s"
+                )
+            await asyncio.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 2, 30.0)
+        logger.info(f"Payment listener supervisor exited for user {self.user_id}")
+
+    async def _payment_listener_worker(self):
         """Listen for invoice payments and detect LNURLp zaps.
         
         This is a background task that should be started when monitoring begins.
@@ -1277,9 +1301,12 @@ class ZapMonitorService:
 
             logger.info(f"Payment listener stopped for user {self.user_id}")
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"Fatal error in payment listener for user {self.user_id}: {e}")
             self.last_error = str(e)
+            raise
     
     async def update_tracked_notes(self, note_ids: list[str], author_pubkey: str | None = None,
                                    enable_zaps: bool = True, enable_reposts: bool = False, 

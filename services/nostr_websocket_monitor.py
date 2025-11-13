@@ -78,6 +78,19 @@ class NostrWebSocketMonitor:
         and only updated when settings change or new tracked events are found.
         No periodic refresh needed.
         """
+        if self.reconnect_task and not self.reconnect_task.done():
+            logger.debug(f"User {self.user_id}: Monitor already running")
+            return
+        
+        if self.reconnect_task and self.reconnect_task.done():
+            exc = self.reconnect_task.exception()
+            if exc:
+                logger.warning(
+                    f"User {self.user_id}: Previous monitor task ended with error: {exc}"
+                )
+            self.reconnect_task = None
+
+        self.shutdown = False
         logger.info(f"▶️  NostrWebSocketMonitor starting for user {self.user_id}")
         
         # Start WebSocket reconnection task
@@ -94,6 +107,13 @@ class NostrWebSocketMonitor:
         # Cancel tasks
         if self.reconnect_task:
             self.reconnect_task.cancel()
+            try:
+                await self.reconnect_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"Error waiting for reconnect task to stop: {e}")
+            self.reconnect_task = None
         
         # Close WebSocket
         if self.ws:
@@ -103,6 +123,10 @@ class NostrWebSocketMonitor:
                 logger.warning(f"Error closing WebSocket: {e}")
         
         logger.info(f"✅ NostrWebSocketMonitor stopped for user {self.user_id}")
+    
+    def is_running(self) -> bool:
+        """Return True when the reconnect loop is still active."""
+        return self.reconnect_task is not None and not self.reconnect_task.done()
     
     def _get_new_subid(self) -> str:
         """Generate unique subscription ID.
@@ -476,8 +500,9 @@ async def start_monitor_for_user(user_id: str, app=None) -> NostrWebSocketMonito
         app = _app_instance
     
     if user_id in _active_monitors:
-        logger.info(f"Monitor already running for user {user_id}")
-        return _active_monitors[user_id]
+        monitor = _active_monitors[user_id]
+        await monitor.start()
+        return monitor
     
     monitor = NostrWebSocketMonitor(user_id, app)
     await monitor.start()

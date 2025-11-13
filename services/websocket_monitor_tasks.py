@@ -80,6 +80,19 @@ async def handle_websocket_monitors(app):
                     except Exception as e:
                         logger.error(f"Failed to stop monitor for user {user_id}: {e}")
                 
+                # Ensure existing monitors are still running (restart if their tasks died)
+                current_monitors = get_active_monitors()
+                for user_id, monitor in current_monitors.items():
+                    if monitor.is_running():
+                        continue
+                    try:
+                        logger.warning(
+                            f"♻️  WebSocket monitor for user {user_id} was not running; restarting"
+                        )
+                        await monitor.start()
+                    except Exception as e:
+                        logger.error(f"Failed to restart monitor for user {user_id}: {e}")
+                
                 # Log status
                 if users_to_start or users_to_stop:
                     logger.info(
