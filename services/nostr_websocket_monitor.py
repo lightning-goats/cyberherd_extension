@@ -26,6 +26,8 @@ from .subscriptions import (
     process_note_for_tracked_tags,
     process_reaction_for_tracked_notes,
     process_repost_for_tracked_notes,
+    # New: process zap receipts (kind 9735)
+    process_zap_receipt_for_tracked_notes,
 )
 
 # Module-level app reference (set when first monitor is created)
@@ -69,7 +71,7 @@ class NostrWebSocketMonitor:
         # Reconnection task
         self.reconnect_task = None
         
-        logger.info(f"🔌 NostrWebSocketMonitor created for user {user_id}")
+        logger.debug(f"🔌 NostrWebSocketMonitor created for user {user_id}")
     
     async def start(self):
         """Start the monitor (WebSocket connection only).
@@ -91,16 +93,16 @@ class NostrWebSocketMonitor:
             self.reconnect_task = None
 
         self.shutdown = False
-        logger.info(f"▶️  NostrWebSocketMonitor starting for user {self.user_id}")
+        logger.debug(f"▶️  NostrWebSocketMonitor starting for user {self.user_id}")
         
         # Start WebSocket reconnection task
         self.reconnect_task = asyncio.create_task(self._connect_to_relay())
         
-        logger.info(f"✅ NostrWebSocketMonitor started for user {self.user_id}")
+        logger.debug(f"✅ NostrWebSocketMonitor started for user {self.user_id}")
     
     async def cleanup(self):
         """Cleanup resources and close connections."""
-        logger.info(f"🛑 NostrWebSocketMonitor stopping for user {self.user_id}")
+        logger.debug(f"🛑 NostrWebSocketMonitor stopping for user {self.user_id}")
         
         self.shutdown = True
         
@@ -122,7 +124,7 @@ class NostrWebSocketMonitor:
             except Exception as e:
                 logger.warning(f"Error closing WebSocket: {e}")
         
-        logger.info(f"✅ NostrWebSocketMonitor stopped for user {self.user_id}")
+        logger.debug(f"✅ NostrWebSocketMonitor stopped for user {self.user_id}")
     
     def is_running(self) -> bool:
         """Return True when the reconnect loop is still active."""
@@ -199,7 +201,7 @@ class NostrWebSocketMonitor:
                     logger.warning(f"Error closing old subscription {old_sub_id}: {e}")
             self.subscriptions.clear()
             
-            logger.info(
+            logger.debug(
                 f"User {self.user_id}: Subscribing - "
                 f"{len(tracked_note_ids)} tracked notes, "
                 f"{len(tracked_tags)} tracked tags, "
@@ -245,18 +247,18 @@ class NostrWebSocketMonitor:
                     if reaction_enabled:
                         engagement_types.append("reactions")
                     
-                    logger.info(
+                    logger.debug(
                         f"✅ User {self.user_id}: Created engagement subscription "
                         f"({'/'.join(engagement_types)}) for {len(tracked_note_ids)} tracked note(s) "
                         f"(sub_id: {sub_id})"
                     )
                 else:
-                    logger.info(
+                    logger.debug(
                         f"⏭️  User {self.user_id}: Has {len(tracked_note_ids)} tracked notes but "
                         f"both repost and reaction tracking are disabled - skipping engagement subscription"
                     )
             else:
-                logger.info(f"⏭️  User {self.user_id}: No tracked notes yet - skipping engagement subscription (will be created when notes are detected)")
+                logger.debug(f"⏭️  User {self.user_id}: No tracked notes yet - skipping engagement subscription (will be created when notes are detected)")
             
             # SUBSCRIPTION 2: New notes from user (kind 1, 30311)
             # Only create if we have effective pubkey
@@ -290,7 +292,7 @@ class NostrWebSocketMonitor:
                     "filter": filter_dict,
                 }
                 
-                logger.info(
+                logger.debug(
                     f"✅ User {self.user_id}: Created notes subscription (kind 1/30311) "
                     f"for pubkey {effective_pubkey[:8]}... "
                     f"{'with ' + str(len(tracked_tags)) + ' tag filter(s)' if tracked_tags else 'all tags'} "
@@ -299,9 +301,34 @@ class NostrWebSocketMonitor:
             else:
                 logger.debug(f"User {self.user_id}: No effective pubkey, skipping note subscription")
             
-            logger.info(
-                f"✅ User {self.user_id}: Created {len(self.subscriptions)} subscriptions"
-            )
+            # 3) Subscribe to zap receipts (kind 9735) addressed to our effective pubkey
+            #    Note: Existing members can zap ANY Lightning Goats note (not only tracked notes)
+            #    to increase their totals per CyberHerd rules. Therefore, we subscribe broadly
+            #    by recipient pubkey only, not filtering by #e. New-member admission rules
+            #    are enforced downstream in headbutt (requires today's tracked note).
+            if effective_pubkey:
+                try:
+                    sub_id = self._get_new_subid()
+                    filter_dict = {
+                        "kinds": [9735],
+                        "#p": [effective_pubkey],
+                        "since": int(time.time()),
+                    }
+                    await self._send(["REQ", sub_id, filter_dict])
+                    self.subscriptions[sub_id] = {
+                        "type": "zap_receipts",
+                        "filter": filter_dict,
+                    }
+                    logger.debug(
+                        f"✅ User {self.user_id}: Created zap receipts subscription (kind 9735) "
+                        f"for effective pubkey {effective_pubkey[:8]}... (sub_id: {sub_id})"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"User {self.user_id}: Failed to create 9735 subscription: {e}"
+                    )
+
+            logger.debug(f"✅ User {self.user_id}: Created {len(self.subscriptions)} subscriptions")
         
         except Exception as e:
             logger.error(f"User {self.user_id}: Error in _subscribe_to_tracked_notes: {e}")
@@ -321,7 +348,7 @@ class NostrWebSocketMonitor:
                 logger.debug(f"User {self.user_id}: Skipping refresh (not connected)")
                 return
             
-            logger.info(f"🔄 User {self.user_id}: Subscription refresh triggered")
+            logger.debug(f"🔄 User {self.user_id}: Subscription refresh triggered")
             await self._subscribe_to_tracked_notes()
             
         except Exception as e:
@@ -358,10 +385,15 @@ class NostrWebSocketMonitor:
                 logger.debug(f"User {self.user_id}: Processing reaction {event_id[:8]}...")
                 await process_reaction_for_tracked_notes(self.user_id, event, self.app)
             
+            elif kind == 9735:
+                # Zap receipt
+                logger.debug(f"User {self.user_id}: Processing zap receipt {event_id[:8]}...")
+                await process_zap_receipt_for_tracked_notes(self.user_id, event, self.app)
+            
             else:
                 logger.debug(
                     f"User {self.user_id}: Ignoring event kind {kind} "
-                    f"(only processing 1/30311=notes, 6=repost, 7=reaction)"
+                    f"(processing 1/30311=notes, 6=repost, 7=reaction, 9735=zap)"
                 )
         
         except Exception as e:
@@ -405,7 +437,7 @@ class NostrWebSocketMonitor:
             elif msg_type == "NOTICE":
                 # Relay notice
                 notice = msg[1] if len(msg) > 1 else ""
-                logger.info(f"User {self.user_id}: Relay notice: {notice}")
+                logger.debug(f"User {self.user_id}: Relay notice: {notice}")
             
             elif msg_type == "OK":
                 # Event publication response (we don't publish, so ignore)
@@ -422,7 +454,7 @@ class NostrWebSocketMonitor:
         
         Subscribes to tracked notes.
         """
-        logger.info(f"User {self.user_id}: WebSocket connected, subscribing...")
+        logger.debug(f"User {self.user_id}: WebSocket connected, subscribing...")
         await self._subscribe_to_tracked_notes()
     
     async def _connect_to_relay(self):
@@ -433,7 +465,7 @@ class NostrWebSocketMonitor:
         """
         await asyncio.sleep(1)  # Initial delay
         
-        logger.info(f"User {self.user_id}: Connecting to relay {self.relay}")
+        logger.debug(f"User {self.user_id}: Connecting to relay {self.relay}")
         
         while not self.shutdown:
             try:
@@ -443,7 +475,7 @@ class NostrWebSocketMonitor:
                     self.ws = ws
                     self.connected = True
                     
-                    logger.info(f"✅ User {self.user_id}: WebSocket connected")
+                    logger.debug(f"✅ User {self.user_id}: WebSocket connected")
                     
                     # Subscribe to tracked notes
                     await self._on_connection()
@@ -470,7 +502,7 @@ class NostrWebSocketMonitor:
             
             if not self.shutdown:
                 # Wait before reconnecting
-                logger.info(f"User {self.user_id}: Reconnecting in 5 seconds...")
+                logger.debug(f"User {self.user_id}: Reconnecting in 5 seconds...")
                 await asyncio.sleep(5)
 
 

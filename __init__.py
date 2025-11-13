@@ -31,7 +31,7 @@ from .services.note_metadata import apply_event_address
 from .utils.common import extract_t_tags_from_event, utc_now
 
 # Import zap monitor for initialization
-from .services.zap_monitor import get_zap_monitor
+from .services.payment_coordinator import get_payment_coordinator as get_zap_monitor
 from .models import CyberherdMember
 
 # Define the extension router and include both web UI and API subrouters
@@ -232,7 +232,9 @@ def init_extension(app):
                     if not (getattr(s, 'herd_wallet', None) and getattr(s, 'zap_tracking_enabled', False)) and not (getattr(s, 'zap_wallet', None) and getattr(s, 'zap_tracking_enabled', False)):
                         continue
                     try:
-                        from .services.zap_monitor import get_zap_monitor
+                        from .services.payment_coordinator import (
+                            get_payment_coordinator as get_zap_monitor,
+                        )
                         zm = get_zap_monitor(app=app, db=_cdb, user_id=uid)
                         await zm.start_monitoring()
                         started += 1

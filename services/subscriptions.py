@@ -40,6 +40,9 @@ from .time_utils import (
 # Import package-level CRUD helpers (lnbits/extensions/cyberherd/crud.py)
 from .. import crud
 from ..utils.common import parse_bool_env, parse_int_env, parse_float_env, utc_now
+from .zap_totals import record_incremental_zap_total, bolt11_decode  # type: ignore
+from .pubkey import resolve_effective_pubkey
+from .headbutt import trigger_headbutt_from_zap
 
 # Diagnostics for nostr_helpers interactions
 _helper_diagnostics = {
@@ -132,8 +135,9 @@ def _would_event_be_tracked(event: dict, eff_pub: str | None, tags: list[str]) -
             return False
 
         tags_norm = [t.lstrip('#').lower() for t in tags if t]
+        # If no tags configured, accept any note authored by eff_pub today
         if not tags_norm:
-            return False
+            return True
 
         ev_tags = []
         for t in event.get('tags', []) or []:
@@ -394,9 +398,6 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
         return False
     
     tags_norm = [t.lstrip('#').lower() for t in tags if t]
-    if not tags_norm:
-        _dbg(f"_append_today: no tracked tags configured for user {user_id}")
-        return False
     
     # Author check
     event_pubkey = event.get("pubkey")
@@ -437,8 +438,9 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
         )
         return False
     
-    # Use shared tag matching logic
-    if not _event_matches_tracked_tags(event, tags_norm):
+    # Use shared tag matching logic unless tags are empty (in which case accept all notes
+    # from the effective pubkey for today's window)
+    if tags_norm and not _event_matches_tracked_tags(event, tags_norm):
         # Extract event's tags for logging
         event_t_tags = [t[1] for t in event.get('tags', []) if isinstance(t, list) and len(t) >= 2 and t[0] == 't']
         content_preview = (event.get('content', '') or '')[:100]
@@ -1499,11 +1501,10 @@ async def process_note_for_tracked_tags(user_id: str, event: dict, app=None):
             logger.warning(f"No settings found for user {user_id}, cannot process note")
             return
         
-        # Check if user has tracked tags (notes are only tracked if tags are configured)
+        # Track notes even if no tracked_tags are configured.
+        # When tags are empty, any note authored by the effective pubkey today
+        # will be considered tracked (to support repost/reaction handling).
         tracked_tags = getattr(settings, 'tracked_tags', []) or []
-        if not tracked_tags:
-            logger.debug(f"No tracked tags configured for user {user_id}")
-            return
         
         # Debug: Check if effective pubkey is available
         eff_pub = get_effective_pubkey(settings)
@@ -1524,7 +1525,7 @@ async def process_note_for_tracked_tags(user_id: str, event: dict, app=None):
         
         # Process the event using the main logic
         # This will:
-        # 1. Check if note matches tracked tags
+        # 1. Check if note matches tracked tags (or any author note if tags empty)
         # 2. Add to tracked_event_ids via _append_today
         # 3. Trigger immediate subscription refresh (for engagement tracking)
         await process_event_for_user(user_id, event, settings, app, recovery_mode=False)
@@ -1593,3 +1594,210 @@ async def process_reaction_for_tracked_notes(user_id: str, event: dict, app=None
         
     except Exception as e:
         logger.error(f"Error processing reaction for user {user_id}: {e}")
+
+
+async def process_zap_receipt_for_tracked_notes(user_id: str, event: dict, app=None):
+    """Process a kind 9735 zap receipt event for tracked notes.
+
+    This validates the receipt (NIP-57), extracts the zapper pubkey and amount
+    from the tags/bolt11, de-duplicates by event id, and then routes the zap
+    to headbutt admission logic. On success, it records the processed zap and
+    updates zap totals for leaderboard consumers.
+
+    Args:
+        user_id: User ID to process the zap for
+        event: The kind 9735 zap receipt event from Nostr
+        app: Optional FastAPI app instance (required for processing)
+    """
+    try:
+        # Only handle proper kind
+        kind = event.get("kind")
+        if kind != 9735:
+            return
+
+        settings = await crud.get_settings(user_id)
+        if not settings:
+            logger.warning(f"No settings found for user {user_id}, cannot process zap receipt")
+            return
+
+        if not getattr(settings, "zap_tracking_enabled", False):
+            logger.debug(f"Zap tracking not enabled for user {user_id}")
+            return
+
+        # Validate receipt per NIP-57
+        ok, reason = nostr_helpers.validate_nip57_zap_receipt(event)
+        if not ok:
+            logger.debug(f"NIP-57 receipt validation failed for user {user_id}: {reason}")
+            return
+
+        event_id = (event.get("id") or "").strip().lower()
+        if not event_id:
+            return
+
+        # Idempotency: skip if already processed
+        try:
+            if await crud.is_event_processed(user_id, event_id):
+                logger.debug(f"Zap receipt {event_id[:8]}... already processed for user {user_id}")
+                return
+        except Exception:
+            pass
+
+        # Extract zapped note id and zapper pubkey
+        tags = event.get("tags") or []
+        zapped_note_id = None
+        recipient_pubkey = None
+        bolt11_invoice = None
+        amount_msat_tag = None
+        description_json = None
+        for tag in tags:
+            if not (isinstance(tag, list) and len(tag) >= 2):
+                continue
+            marker, value = tag[0], tag[1]
+            if marker == "e" and isinstance(value, str) and not zapped_note_id:
+                zapped_note_id = value.strip().lower()
+            elif marker == "p" and isinstance(value, str) and not recipient_pubkey:
+                recipient_pubkey = value.strip().lower()
+            elif marker == "bolt11" and isinstance(value, str) and value:
+                bolt11_invoice = value.strip()
+            elif marker == "amount" and isinstance(value, str):
+                # Keep raw amount (msat)
+                amount_msat_tag = value
+            elif marker == "description" and isinstance(value, str):
+                description_json = value
+
+        # Parse zap request to get zapper pubkey
+        zapper_pubkey = None
+        try:
+            if description_json:
+                req = json.loads(description_json)
+                if isinstance(req, dict):
+                    zp = req.get("pubkey")
+                    if isinstance(zp, str):
+                        zapper_pubkey = zp.strip().lower()
+        except Exception:
+            zapper_pubkey = None
+
+        if not zapper_pubkey:
+            logger.debug(f"Zap receipt {event_id[:8]}... missing zapper pubkey in description for user {user_id}")
+            return
+
+        # Reject self-zaps (effective pubkey == zapper)
+        try:
+            eff_pub = resolve_effective_pubkey(settings)
+            if eff_pub and zapper_pubkey == eff_pub.strip().lower():
+                logger.info(
+                    f"Zap rejected: zapper is the effective pubkey (operator's own zap) zapper={zapper_pubkey[:16]}..."
+                )
+                return
+        except Exception:
+            pass
+
+        # Amount: prefer explicit amount tag (msat); fallback to bolt11 decode
+        amount_msat = None
+        if isinstance(amount_msat_tag, str):
+            try:
+                digits = "".join(ch for ch in amount_msat_tag if ch.isdigit())
+                amount_msat = int(digits) if digits else None
+            except Exception:
+                amount_msat = None
+
+        if amount_msat is None and bolt11_invoice and bolt11_decode is not None:
+            try:
+                decoded = bolt11_decode(bolt11_invoice)
+                if getattr(decoded, "amount_msat", None) is not None:
+                    amount_msat = int(decoded.amount_msat)
+            except Exception:
+                logger.debug("Failed to decode bolt11 in zap receipt", exc_info=True)
+
+        if amount_msat is None:
+            logger.debug(f"Zap receipt {event_id[:8]}... missing amount information for user {user_id}")
+            return
+
+        amount_sats = max(0, amount_msat // 1000)
+        if amount_sats <= 0:
+            logger.debug(f"Zap receipt {event_id[:8]}... zero/negative amount for user {user_id}")
+            return
+
+        # Register processed receipt (idempotency) before side effects
+        inserted = False
+        try:
+            inserted = await crud.register_processed_event(
+                user_id,
+                event_id,
+                note_id=zapped_note_id,
+                pubkey=zapper_pubkey,
+                event_type="zap_receipt",
+            )
+        except Exception:
+            # Best-effort
+            pass
+        if not inserted:
+            # Another worker may have raced; stop to avoid duplicates
+            logger.debug(f"Zap receipt {event_id[:8]}... already registered for user {user_id}")
+            return
+
+        # Trigger headbutt admission for zap
+        try:
+            result = await trigger_headbutt_from_zap(
+                user_id=user_id,
+                pubkey=zapper_pubkey,
+                amount_sats=amount_sats,
+                note_id=zapped_note_id or "",
+                event_id=event_id,
+                app=app,
+            )
+        except Exception as e:
+            logger.error(f"Error triggering headbutt from zap receipt: {e}")
+            result = None
+
+        if result:
+            # Persist processed zap record (diagnostic/history)
+            try:
+                await crud.create_processed_zap(
+                    {
+                        "user_id": user_id,
+                        "event_id": event_id,
+                        "note_id": zapped_note_id or "",
+                        "zapper_pubkey": zapper_pubkey,
+                        "amount": int(amount_sats),
+                        "processed_at": int(utc_now().timestamp()),
+                    }
+                )
+            except Exception:
+                logger.debug("Failed to persist processed zap row", exc_info=True)
+
+            # Update zap totals and notify leaderboard watchers
+            try:
+                target_pubkey = resolve_effective_pubkey(settings)
+            except Exception:
+                target_pubkey = None
+
+            if target_pubkey:
+                try:
+                    created_at = int(event.get("created_at") or 0) or int(utc_now().timestamp())
+                except Exception:
+                    created_at = int(utc_now().timestamp())
+                try:
+                    await record_incremental_zap_total(
+                        user_id=user_id,
+                        zapper_pubkey=zapper_pubkey,
+                        target_pubkey=target_pubkey,
+                        amount_sats=amount_sats,
+                        event_timestamp=created_at,
+                        event_id=event_id,
+                    )
+                    from .leaderboard import broadcast_leaderboard_update
+
+                    await broadcast_leaderboard_update(user_id, settings=settings)
+                except Exception:
+                    logger.debug("Failed to update zap totals/broadcast", exc_info=True)
+
+            logger.info(
+                f"✅ Processed zap receipt: {amount_sats} sats from {zapper_pubkey[:8]}... on note {str(zapped_note_id)[:8]}..."
+            )
+        else:
+            logger.debug(
+                f"Zap receipt headbutt did not admit/update member for user {user_id} (event {event_id[:8]}...)"
+            )
+    except Exception as e:
+        logger.error(f"Error processing zap receipt for user {user_id}: {e}")

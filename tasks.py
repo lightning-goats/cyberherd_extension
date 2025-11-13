@@ -17,7 +17,9 @@ from .crud import (
     upsert_settings,
 )
 from .services.splits import reset_splits_to_predefined_wallet
-from .services.zap_monitor import get_zap_monitor
+from .services.payment_coordinator import (
+    get_payment_coordinator as get_zap_monitor,
+)
 from .services.nostr_websocket_monitor import (
     start_monitor_for_user,
     trigger_immediate_refresh,
@@ -144,12 +146,28 @@ def _normalize_zap_request(payment: Any) -> dict[str, Any] | None:
 
 
 async def process_incoming_payment(payment: Any, app: Any | None = None) -> None:
-    """Dispatcher invoked by invoice listener to process LNURLp zaps."""
+    """Dispatcher invoked by invoice listener for LNbits payments.
+
+    Note:
+    - Payment-based zap detection is disabled (zaps are processed via Nostr kind 9735).
+    - We still use payment events to trigger automatic splits when configured.
+    """
     try:
         wallet_id = getattr(payment, "wallet_id", None)
         if not wallet_id:
             logger.debug("CyberHerd: skipping payment without wallet_id")
             return
+
+        amount_msat = getattr(payment, "amount", 0) or 0
+        amount_sats = amount_msat // 1000
+
+        # Quiet by default: only log payment receipt at debug level
+        logger.debug(
+            "CyberHerd: PAYMENT EVENT RECEIVED | wallet=%s amount=%d msat (%d sats)",
+            wallet_id,
+            amount_msat,
+            amount_sats,
+        )
 
         try:
             wallet = await get_wallet(wallet_id)
@@ -166,12 +184,20 @@ async def process_incoming_payment(payment: Any, app: Any | None = None) -> None
             logger.debug("CyberHerd: wallet %s has no user, skipping payment", wallet_id)
             return
 
-        zap_request = _normalize_zap_request(payment)
-        if not zap_request:
-            return
+        # Wallet context log (debug level)
+        try:
+            wname = getattr(wallet, "name", None) or "<unnamed>"
+            logger.debug("CyberHerd: wallet=%s user=%s", wname, str(user_id)[:8])
+        except Exception:
+            pass
 
+        # Always trigger splits checks on any payment to the herd wallet
         monitor = get_zap_monitor(app=app, db=crud_module, user_id=user_id)
-        await monitor._process_payment_for_zap(payment)
+        try:
+            await monitor._check_and_trigger_splits(payment)
+            logger.debug("CyberHerd: splits check completed for user %s", str(user_id)[:8])
+        except Exception as exc:
+            logger.error(f"CyberHerd: error while checking/triggering splits: {exc}")
     except Exception as exc:
         logger.error(f"CyberHerd: process_incoming_payment error: {exc}")
 

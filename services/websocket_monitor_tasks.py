@@ -35,7 +35,7 @@ async def handle_websocket_monitors(app):
     Args:
         app: FastAPI app instance (required for event processing)
     """
-    logger.info("🚀 Starting WebSocket monitor management task")
+    logger.debug("🚀 Starting WebSocket monitor management task")
     
     try:
         while True:
@@ -66,7 +66,7 @@ async def handle_websocket_monitors(app):
                 users_to_start = users_needing_monitors - currently_active
                 for user_id in users_to_start:
                     try:
-                        logger.info(f"▶️  Starting monitor for user {user_id}")
+                        logger.debug(f"▶️  Starting monitor for user {user_id}")
                         await start_monitor_for_user(user_id, app)
                     except Exception as e:
                         logger.error(f"Failed to start monitor for user {user_id}: {e}")
@@ -75,7 +75,7 @@ async def handle_websocket_monitors(app):
                 users_to_stop = currently_active - users_needing_monitors
                 for user_id in users_to_stop:
                     try:
-                        logger.info(f"⏹️  Stopping monitor for user {user_id} (no tracked notes)")
+                        logger.debug(f"⏹️  Stopping monitor for user {user_id} (no tracked notes)")
                         await stop_monitor_for_user(user_id)
                     except Exception as e:
                         logger.error(f"Failed to stop monitor for user {user_id}: {e}")
@@ -95,7 +95,7 @@ async def handle_websocket_monitors(app):
                 
                 # Log status
                 if users_to_start or users_to_stop:
-                    logger.info(
+                    logger.debug(
                         f"📊 WebSocket monitors: {len(get_active_monitors())} active, "
                         f"{len(users_needing_monitors)} needed"
                     )
@@ -108,7 +108,7 @@ async def handle_websocket_monitors(app):
     
     except asyncio.CancelledError:
         # Clean shutdown - stop all monitors
-        logger.info("🛑 Stopping all WebSocket monitors...")
+        logger.debug("🛑 Stopping all WebSocket monitors...")
         active_monitors = get_active_monitors()
         for user_id in list(active_monitors.keys()):
             try:
@@ -116,7 +116,7 @@ async def handle_websocket_monitors(app):
             except Exception as e:
                 logger.error(f"Error stopping monitor for user {user_id}: {e}")
         
-        logger.info("✅ All WebSocket monitors stopped")
+        logger.debug("✅ All WebSocket monitors stopped")
         raise
 
 
@@ -130,7 +130,7 @@ async def start_monitor_immediately(user_id: str):
         user_id: LNbits user ID
     """
     try:
-        logger.info(f"▶️  Starting immediate monitor for user {user_id}")
+        logger.debug(f"▶️  Starting immediate monitor for user {user_id}")
         await start_monitor_for_user(user_id)
     except Exception as e:
         logger.error(f"Failed to start immediate monitor for user {user_id}: {e}")
@@ -146,7 +146,7 @@ async def stop_monitor_immediately(user_id: str):
         user_id: LNbits user ID
     """
     try:
-        logger.info(f"⏹️  Stopping immediate monitor for user {user_id}")
+        logger.debug(f"⏹️  Stopping immediate monitor for user {user_id}")
         await stop_monitor_for_user(user_id)
     except Exception as e:
         logger.error(f"Failed to stop immediate monitor for user {user_id}: {e}")

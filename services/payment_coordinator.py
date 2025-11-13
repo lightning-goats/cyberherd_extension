@@ -1,23 +1,13 @@
-"""Nostr-based CyberHerd event monitor.
+"""Payment coordinator: split triggers + payment recovery helpers.
 
-This service monitors Nostr events (reposts, reactions) for tracked notes
-using the subscription system. Event detection happens via Nostr relays through
-the subscriptions module (subscriptions.py), which publishes kind 6 reposts
-and kind 7 reactions.
+This module coordinates everything the invoice listener needs:
+- Triggers splits when payments reach the herd wallet (see _check_and_trigger_splits).
+- Provides diagnostics/testing helpers such as _process_payment_for_zap and
+  _recover_missed_payment_zaps for admin APIs.
 
-ZAP DETECTION: Zaps are detected ONLY via the payment listener system, which
-processes invoice payments containing zap requests in payment.extra["nostr"].
-Nostr-based zap detection (kinds 9734/9735) has been intentionally removed to
-avoid duplicate processing and ensure accurate tracking via invoice settlements.
-
-The payment listener parses LNURLp zap requests following NIP-57 format:
-- Zap request JSON from payment.extra["nostr"]
-- Target note ID extracted from tags: ["e", "<note_id>", ...]
-- Amount taken from payment.amount (in millisats)
-- Zapper pubkey from zap_request.get("pubkey")
-
-Note: The NostrEventMonitor class was planned but not implemented. Event monitoring
-is handled by the subscriptions system instead.
+Zap detection and engagement processing now live in the WebSocket monitor +
+subscriptions pipeline; this service only runs payment-related flows. The
+legacy ZapMonitorService name remains available via alias for compatibility.
 """
 
 from __future__ import annotations
@@ -32,40 +22,23 @@ import re
 from loguru import logger
 
 from .. import crud
-from .subscriptions import get_subscription_status
-from .pubkey import resolve_effective_pubkey
-from .note_metadata import apply_event_address
-from .zap_totals import record_incremental_zap_total
 from ..utils.common import utc_now_timestamp  # Centralized UTC timestamp function
-from .leaderboard import broadcast_leaderboard_update
 
 # Simplified payment monitoring: this service no longer registers its own
 # invoice listener. A single central listener is registered in
 # lnbits/extensions/cyberherd/tasks.py using the standard LNbits pattern
 # (wait_for_paid_invoices + create_permanent_unique_task), similar to the
 # lightning_goats extension. Split triggering is retained via
-# ZapMonitorService._check_and_trigger_splits, which is invoked by
+# PaymentCoordinatorService._check_and_trigger_splits, which is invoked by
 # tasks.process_incoming_payment.
 
-try:  # pragma: no cover
-    from . import nostr_helpers  # type: ignore
-except Exception:  # pragma: no cover
-    nostr_helpers = None  # type: ignore
-
-_instances: dict[str, 'ZapMonitorService'] = {}
-_last_access: dict[str, float] = {}
-_TTL = 1800
-
-# Aliases for backward compatibility with views_api.py imports
-_zap_monitor_instances = _instances
-_ZAP_MONITOR_LAST_ACCESS = _last_access
-
+# Nostr helpers not used here anymore (zap detection handled elsewhere)
 
 def payment_listener_required(settings) -> bool:
     """Return True when settings require the LNbits payment listener.
 
-    The listener is only useful when we have a herd wallet configured because all
-    realtime zap detection and automatic split triggers operate on that wallet.
+    The listener is necessary when we have a herd wallet configured because
+    automatic split triggers and zap tracking depend on that wallet.
     """
     if not settings:
         return False
@@ -79,6 +52,14 @@ def payment_listener_required(settings) -> bool:
     zap_tracking = bool(getattr(settings, "zap_tracking_enabled", False))
     auto_splits = bool(getattr(settings, "send_splits_enabled", False))
     return zap_tracking or auto_splits
+
+_instances: dict[str, 'PaymentCoordinatorService'] = {}
+_last_access: dict[str, float] = {}
+_TTL = 1800
+
+# Support legacy registry imports
+_zap_monitor_instances = _instances
+_ZAP_MONITOR_LAST_ACCESS = _last_access
 
 
 async def cleanup_stale_monitors(max_age: int | None = None) -> dict[str, int]:
@@ -100,27 +81,16 @@ async def cleanup_stale_monitors(max_age: int | None = None) -> dict[str, int]:
     return {"removed": removed, "age_seconds": age}
 
 
-class ZapMonitorService:
-    """Service for monitoring Nostr events (reposts, reactions) and payment-based zaps.
-    
-    This service uses two detection paths:
-    
-    1. **Payment Listener (Zaps)**: Monitors invoice payments for LNURLp zaps via
-       payment.extra["nostr"]. This is the ONLY way zaps are detected.
-       - Kind 9734 (zap request) and 9735 (zap receipt) are NOT monitored via Nostr
-       - Prevents duplicate processing and ensures accurate invoice-based tracking
-    
-    2. **Nostr Subscriptions (Engagement)**: Monitors Nostr relays for:
-       - Kind 6: Reposts (shares/boosts)
-       - Kind 7: Reactions (likes/emoji reactions)
-       - Kind 1: Regular notes (for today's notes cache)
-       - Kind 30311: Long-form content (for today's notes cache)
-    
-    Zaps are processed when:
-    - Invoice payment received to herd_wallet
-    - payment.extra["nostr"] contains valid NIP-57 zap request
-    - Target note ID extracted from tags: ["e", "<note_id>"]
-    - Amount from payment.amount (in millisats)
+class PaymentCoordinatorService:
+    """Payment coordinator and diagnostics shim.
+
+    Responsibilities kept here during migration:
+    - Start/stop lifecycle no-ops (invoice listener is centralized in tasks.py)
+    - Trigger automatic splits on payment events (_check_and_trigger_splits)
+    - Legacy/admin payment recovery helpers (disabled in live flows)
+    - Status reporting for diagnostics endpoints
+
+    Realtime zap detection and engagement handling are not in this class.
     """
     
     def __init__(self, app=None, db=None, messaging=None, user_id: str | None = None):
@@ -137,26 +107,15 @@ class ZapMonitorService:
         self.last_message_at = None  # epoch seconds
         self.last_zap_at = None      # epoch seconds of last processed zap
         self.last_error = None
-        self.mode = 'nostr'
+        self.mode = 'payment'
 
-        # Metrics / counters
-        self.total_zaps_processed = 0
-        self.total_reposts_processed = 0
-        self.total_reactions_processed = 0
         # Recovery scans performed (payment-based recovery routine)
         self.total_recovery_scans = 0
-        
-        # Deduplication cache: track processed events to prevent duplicate handling
-        # Key: (event_type, event_id, note_id, pubkey)
-        # Value: timestamp when processed
-        self._processed_events: dict[tuple[str, str, str, str], int] = {}
-        self._processed_events_max_size = 1000  # Prevent unbounded growth
         
         # Payment listener is centrally managed by cyberherd.tasks; no per-user
         # listener, task or queue is created here.
         
-        # NostrEventMonitor not implemented - monitoring handled by subscriptions.py
-        self.nostr_monitor: Optional[Any] = None  # Reserved for future implementation
+        # No internal Nostr monitoring; handled by websocket monitor/subscriptions
 
     @staticmethod
     def _normalize_payment_hash(value: Any) -> str | None:
@@ -235,94 +194,16 @@ class ZapMonitorService:
                 return ts
         return None
 
-    async def _resolve_note_from_addresses(
-        self,
-        settings,
-        address_candidates: list[str],
-    ) -> tuple[str | None, str | None]:
-        """Resolve note id and author from provided NIP-33 address candidates."""
-        if not address_candidates:
-            return None, None
-
-        try:
-            address_map = dict(getattr(settings, "tracked_event_addresses", {}) or {})
-        except Exception:
-            address_map = {}
-
-        # Prefer address matches already cached in settings
-        inverse: dict[str, str] = {}
-        for note_id, addr in address_map.items():
-            if isinstance(note_id, str) and isinstance(addr, str):
-                inverse[addr] = note_id.strip().lower()
-
-        for address in address_candidates:
-            note_id = inverse.get(address)
-            if note_id and re.fullmatch(r"[0-9a-f]{64}", note_id):
-                _, author, _ = self._parse_a_tag_address(address)
-                author_norm = author.strip().lower() if isinstance(author, str) else None
-                return note_id, author_norm
-
-        # Fallback to querying relays when cache is missing
-        if not nostr_helpers or not hasattr(nostr_helpers, "check_availability"):
-            return None, None
-        try:
-            available = nostr_helpers.check_availability()
-        except Exception:
-            available = False
-        if not available:
-            return None, None
-
-        for address in address_candidates:
-            kind, author, identifier = self._parse_a_tag_address(address)
-            if kind is None or not author:
-                continue
-            filters = {"kinds": [kind], "authors": [author]}
-            if identifier:
-                filters["#d"] = [identifier]
-            try:
-                events = await nostr_helpers.query_events(filters, limit=1, timeout=6.0)
-            except Exception as exc:
-                logger.debug(
-                    f"Zap monitor: failed to resolve address {address} for user {self.user_id}: {exc}"
-                )
-                continue
-            if not events:
-                continue
-            event = events[0]
-            note_id_raw = event.get("id")
-            if not isinstance(note_id_raw, str):
-                continue
-            note_id_norm = note_id_raw.strip().lower()
-            if not re.fullmatch(r"[0-9a-f]{64}", note_id_norm):
-                continue
-
-            # Cache the resolved address for future lookups
-            address_map[note_id_norm] = address
-            try:
-                apply_event_address(address_map, event)
-            except Exception:
-                pass
-            try:
-                settings.tracked_event_addresses = address_map
-            except Exception:
-                pass
-            if self.user_id:
-                try:
-                    await crud.upsert_settings(settings, self.user_id)
-                except Exception as exc:
-                    logger.debug(
-                        f"Zap monitor: failed to persist address mapping for user {self.user_id}: {exc}"
-                    )
-            return note_id_norm, author
-
+    async def _resolve_note_from_addresses(self, *args, **kwargs) -> tuple[str | None, str | None]:
+        """Deprecated: address-based note resolution no longer performed here."""
         return None, None
 
     async def start_monitoring(self):
         """Mark monitor as running; payments are handled centrally.
 
         Payment listening is performed by the central listener registered in
-        cyberherd.tasks.start_invoice_listener. This method retains the public
-        lifecycle API but does not start a per-user listener.
+        cyberherd.tasks.start_invoice_listener. This retains a public lifecycle
+        API but does not start a per-user listener.
         """
         settings = await crud.get_settings(self.user_id)
         herd_wallet = getattr(settings, 'herd_wallet', None) if settings else None
@@ -347,20 +228,11 @@ class ZapMonitorService:
         )
 
     async def stop_monitoring(self):
-        """Stop monitoring Nostr events."""
+        """Stop monitoring (no-op for payments)."""
         if not self._running:
             return
             
         self._running = False
-        
-        # Stop Nostr monitoring if active
-        if self.nostr_monitor:
-            try:
-                await self.nostr_monitor.stop()
-                logger.info(f"Nostr monitor stopped for user {self.user_id}")
-            except Exception as e:
-                logger.error(f"Error stopping Nostr monitor: {e}")
-            self.nostr_monitor = None
     
     async def _process_payment_for_zap(self, payment):
         """Process a payment notification to detect LNURLp zaps.
@@ -724,133 +596,9 @@ class ZapMonitorService:
                 self.last_error = None
                 return True
             
-            # Fast path in-memory check (still useful for within-session deduplication)
-            if event_id and self._mark_event_processed('zap_payment', event_id, target_note_id, zapper_pubkey):
-                self.last_error = None
-                return True  # Already processed in this session
-            
-            # Register payment in persisted store before processing to prevent races
-            inserted = True
-            try:
-                if event_id:
-                    inserted = await crud.register_processed_payment(
-                        user_id=cast(str, self.user_id),
-                        payment_hash=event_id,
-                        note_id=target_note_id,
-                        pubkey=zapper_pubkey,
-                        event_type="zap",
-                    )
-            except Exception:
-                # Best-effort: ignore persistence failures in tests/mocks
-                inserted = False
-
-            if event_id and not inserted:
-                logger.debug(
-                    f"Zap dedupe: payment hash {event_id[:16]}... already persisted for user {self.user_id}, skipping."
-                )
-                self.last_error = None
-                return True
-            
-            # Trigger headbutt processing
-            from .headbutt import trigger_headbutt_from_zap
-            
-            # Call trigger_headbutt_from_zap; it may be patched in tests as a non-async Mock.
-            try:
-                call_res = trigger_headbutt_from_zap(
-                    user_id=cast(str, self.user_id),
-                    pubkey=zapper_pubkey,
-                    amount_sats=amount_sats,
-                    note_id=target_note_id,
-                    event_id=event_id or "",
-                    app=self.app,
-                )
-                if asyncio.iscoroutine(call_res):
-                    result = await call_res
-                else:
-                    result = call_res
-                logger.debug(f"trigger_headbutt_from_zap returned: {result!r}")
-            except Exception as e:
-                logger.error(f"Error calling trigger_headbutt_from_zap: {e}")
-                result = None
-            
-            if result:
-                self.total_zaps_processed += 1
-                self.last_zap_at = utc_now_timestamp()
-                self.last_message_at = self.last_zap_at
-                self.last_error = None
-                logger.info(
-                    f"✅ Successfully processed LNURLp zap: {amount_sats} sats from {zapper_pubkey[:8]}..."
-                )
-
-                # Persist zap record for diagnostics and historical counters
-                try:
-                    if self.user_id:
-                        await crud.create_processed_zap(
-                            {
-                                "user_id": cast(str, self.user_id),
-                                "event_id": event_id or "",
-                                "note_id": target_note_id,
-                                "zapper_pubkey": zapper_pubkey,
-                                "amount": int(amount_sats),
-                                "processed_at": utc_now_timestamp(),
-                            }
-                        )
-                except Exception as exc:
-                    logger.debug(
-                        f"Zap monitor: failed to persist processed zap for user {self.user_id}: {exc}"
-                    )
-
-                # Increment zap totals cache for API consumers
-                if self.user_id:
-                    try:
-                        target_pubkey = resolve_effective_pubkey(settings)
-                    except Exception as exc:
-                        logger.debug(f"Zap monitor: failed to resolve effective pubkey: {exc}")
-                        target_pubkey = None
-
-                    if target_pubkey:
-                        payment_ts = self._extract_payment_timestamp(payment) or utc_now_timestamp()
-                        try:
-                            await record_incremental_zap_total(
-                                user_id=cast(str, self.user_id),
-                                zapper_pubkey=zapper_pubkey,
-                                target_pubkey=target_pubkey,
-                                amount_sats=amount_sats,
-                                event_timestamp=payment_ts,
-                                event_id=event_id,
-                            )
-                            await broadcast_leaderboard_update(
-                                cast(str, self.user_id),
-                                settings=settings,
-                            )
-                        except Exception as exc:
-                            logger.debug(
-                                f"Zap monitor: failed to update zap totals for {zapper_pubkey[:8]}...: {exc}"
-                            )
-                
-                # Note: Opportunistic registry update removed - we now enforce that notes
-                # must be in today's tracked_event_ids before processing zaps
-                # Note: Automatic splits trigger moved to _check_and_trigger_splits which is
-                # called for ALL payments to the herd wallet (not just zaps)
-                return True
-            else:
-                logger.warning(f"Failed to process LNURLp zap from {zapper_pubkey[:8]}...")
-                # Record failure for diagnostics and signal failure to caller
-                self.last_error = "headbutt_processing_failed"
-                return False
-                
         except Exception as e:
             logger.error(f"Error processing payment for zap: {e}")
-            import traceback
-            logger.debug(f"Traceback: {traceback.format_exc()}")
-            # Prefix with 'exception:' to match test expectations
-            try:
-                self.last_error = f"exception:{e}"
-            except Exception:
-                self.last_error = "exception:unknown"
             return False
-        # Default to False for any non-successful processing (explicit)
-        return False
 
     async def _check_and_trigger_splits(self, payment):
         """Check if automatic splits should be triggered for any payment to the herd wallet.
@@ -1015,159 +763,21 @@ class ZapMonitorService:
             )
             return False
 
-    async def _fetch_tagged_note(self, settings, note_id: str, author_hint: str) -> dict | None:
-        """Return the event dict when *note_id* carries one of the tracked tags."""
-        tags = getattr(settings, "tracked_tags", []) or []
-        tag_norm = [
-            t.lstrip("#").lower()
-            for t in tags
-            if isinstance(t, str) and t.strip()
-        ]
-        if not tag_norm:
-            return None
-
-        if nostr_helpers is None:
-            return None
-
-        try:
-            events = await nostr_helpers.query_events(
-                {"ids": [note_id], "kinds": [1, 30311]},
-                limit=1,
-                timeout=6.0,
-            )
-        except Exception as exc:
-            logger.debug(
-                "Zap monitor: failed to query note %s for tag verification: %s",
-                note_id[:8],
-                exc,
-            )
-            return None
-
-        if not events:
-            return None
-
-        event = events[0]
-        pubkey = event.get("pubkey")
-        if not isinstance(pubkey, str) or pubkey.strip().lower() != author_hint:
-            return None
-
-        if self._event_has_tracked_tag(event, tag_norm):
-            return event
+    async def _fetch_tagged_note(self, *args, **kwargs) -> dict | None:
+        """Deprecated: Nostr tag verification handled by subscriptions."""
         return None
 
-    async def _get_today_note_ids(self, settings) -> tuple[bool, list[str]]:
-        """Return (success, note_ids) for today's #CyberHerd notes."""
-        if not self.app:
-            return False, []
-
-        try:
-            from .headbutt import EnhancedHeadbuttService
-
-            helper = EnhancedHeadbuttService(
-                db=crud,
-                messaging_module=self.messaging,
-                app=self.app,
-                user_id=self.user_id,
-            )
-            notes = await helper._get_today_cyberherd_notes()
-            if not isinstance(notes, list):
-                return True, []
-            # Normalize to lowercase 64-hex strings
-            cleaned = []
-            for nid in notes:
-                if isinstance(nid, str):
-                    cleaned.append(nid.strip().lower())
-            return True, cleaned
-        except Exception as exc:
-            logger.debug(
-                "Zap monitor: failed to fetch today's note list for user %s: %s",
-                self.user_id,
-                exc,
-            )
-            return False, []
+    async def _get_today_note_ids(self, *args, **kwargs) -> tuple[bool, list[str]]:
+        """Deprecated: today's notes handled by subscriptions."""
+        return False, []
 
     @staticmethod
-    def _event_has_tracked_tag(event: dict, tracked_tags: list[str]) -> bool:
-        """Return True if *event* carries any of *tracked_tags*."""
-        tags = event.get("tags") or []
-        for tag in tags:
-            if not (isinstance(tag, list) and len(tag) > 1):
-                continue
-            if tag[0] != "t":
-                continue
-            try:
-                value = str(tag[1]).lstrip("#").lower()
-            except Exception:
-                continue
-            if value in tracked_tags:
-                return True
-
-        # Fallback to scanning content for hashtags
-        try:
-            content = event.get("content", "") or ""
-        except Exception:
-            content = ""
-        if not content:
-            return False
-
-        try:
-            hashtags = {match.lower() for match in re.findall(r"#([\w\-]+)", content, flags=re.UNICODE)}
-        except Exception:
-            hashtags = set()
-
-        return any(tag in hashtags for tag in tracked_tags)
+    def _event_has_tracked_tag(*args, **kwargs) -> bool:
+        """Deprecated: tag checks handled by subscriptions."""
+        return False
     
-    async def _opportunistic_registry_update(self, note_id: str, max_attempts: int = 7, delay: float = 2.0):
-        """Best-effort registry update when subscriptions become ready.
-        
-        This is called after successful headbutt processing when the note wasn't
-        initially in tracked_event_ids (likely because subscriptions weren't ready yet).
-        We periodically check if subscriptions are ready and mark the note when possible.
-        
-        Args:
-            note_id: Note ID to mark in registry
-            max_attempts: Maximum retry attempts (default: 7)
-            delay: Initial delay between retries in seconds (default: 2.0)
-        """
-        for attempt in range(1, max_attempts + 1):
-            try:
-                await asyncio.sleep(delay)
-                
-                # Check if subscriptions are ready now
-                status = get_subscription_status(self.app)
-                if bool(status.get("connected")):
-                    # Subscriptions ready - verify note is in tracked_event_ids
-                    settings = await crud.get_settings(self.user_id)
-                    if settings:
-                        tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
-                        if note_id in tracked_notes:
-                            logger.debug(
-                                f"✅ Registry update: note {note_id[:8]}... now in tracked_event_ids "
-                                f"(attempt {attempt}/{max_attempts})"
-                            )
-                            return  # Success
-                        else:
-                            logger.debug(
-                                f"ℹ️  Registry update: note {note_id[:8]}... still not in tracked list "
-                                f"(attempt {attempt}/{max_attempts})"
-                            )
-                else:
-                    logger.debug(
-                        f"⏳ Registry update: subscriptions still not ready "
-                        f"(attempt {attempt}/{max_attempts})"
-                    )
-                
-                # Increase delay slightly for next attempt (gentle backoff)
-                delay = min(delay * 1.2, 5.0)
-                
-            except Exception as e:
-                logger.debug(f"Error in opportunistic registry update (attempt {attempt}): {e}")
-        
-        # Max attempts reached - log as debug (not a failure, just informational)
-        logger.debug(
-            f"ℹ️  Opportunistic registry update completed after {max_attempts} attempts "
-            f"for note {note_id[:8]}... (note: zap was already processed successfully)"
-        )
+    async def _opportunistic_registry_update(self, *args, **kwargs):
+        return
     
     # Removed: per-instance payment listener runner/worker. Payment events are
     # consumed by the central listener in cyberherd.tasks, which calls into
@@ -1212,384 +822,19 @@ class ZapMonitorService:
         return True
     
     async def recover_events_since_midnight(self):
-        """DEPRECATED: This method is no longer used and should not be called.
-        
-        Original purpose: Recover events since midnight by updating Nostr subscriptions.
-        
-        Why deprecated:
-        - NostrEventMonitor (self.nostr_monitor) was never implemented
-        - Event monitoring is handled by subscriptions.py WebSocket system
-        - Recovery is now handled by force_requery_for_user() in subscriptions.py
-        - This method references non-existent self.nostr_monitor.update_subscriptions()
-        
-        Migration:
-        - Use force_requery_for_user(app, user_id) from subscriptions.py instead
-        - That function properly queries and processes events from today
-        
-        This method will be removed in a future version.
-        """
-        logger.warning(
-            f"DEPRECATED: recover_events_since_midnight() called for user {self.user_id}. "
-            f"Use force_requery_for_user() from subscriptions.py instead. "
-            f"This method will be removed in a future version."
-        )
         return False
+
+    async def _start_nostr_monitoring(self, *args, **kwargs):
+        return
+
+    # Removed deprecated Nostr handlers (_mark_event_processed, _handle_nostr_zap/repost/reaction)
     
-    async def _start_nostr_monitoring(self, settings, note_timestamps: dict[str, int] | None = None):
-        """Start Nostr event monitoring for tracked notes.
-        
-        Note: NostrEventMonitor class was planned but not implemented.
-        Event monitoring is handled by the subscriptions system (subscriptions.py).
-        This method is kept for compatibility but does nothing.
-        
-        Args:
-            settings: User settings with tracked_event_ids and event type preferences
-            note_timestamps: Optional dict mapping note_id -> created_at timestamp (for event recovery)
-        """
-        # NostrEventMonitor not implemented - monitoring handled by subscriptions.py
-        logger.debug(f"Event monitoring for user {self.user_id} is handled by subscriptions system")
+    async def _handle_nostr_repost(self, *args, **kwargs):
         return
     
-    def _mark_event_processed(self, event_type: str, event_id: str, note_id: str, pubkey: str) -> bool:
-        """Mark an event as processed and check if it was already processed.
-        
-        Returns:
-            True if event was already processed (should skip), False if new (should process)
-        """
-        from datetime import datetime, timezone
-        
-        # Create cache key
-        cache_key = (event_type, event_id, note_id, pubkey)
-        
-        # Check if already processed
-        if cache_key in self._processed_events:
-            logger.debug(
-                f"🔄 Duplicate {event_type} event detected: {event_id[:16]}... "
-                f"(note: {note_id[:8]}..., pubkey: {pubkey[:8]}...). Skipping."
-            )
-            return True
-        
-        # Mark as processed
-        self._processed_events[cache_key] = utc_now_timestamp()
-        
-        # Prevent unbounded growth - remove oldest entries if too large
-        if len(self._processed_events) > self._processed_events_max_size:
-            # Remove oldest 20% of entries
-            sorted_entries = sorted(self._processed_events.items(), key=lambda x: x[1])
-            num_to_remove = len(sorted_entries) // 5
-            for key, _ in sorted_entries[:num_to_remove]:
-                del self._processed_events[key]
-            logger.debug(f"Pruned {num_to_remove} old entries from processed events cache")
-        
-        return False
-    
-    async def _handle_nostr_zap(self, zapper_pubkey: str, zapped_note_id: str, 
-                                 amount_sats: int, event_id: str, event: dict):
-        """Handle zap receipt detected from Nostr.
-        
-        NOTE: This method is DEPRECATED and should not be called.
-        Zap detection now happens exclusively via the payment listener system,
-        which processes LNURLp payment.extra["nostr"] data. Nostr-based zap
-        detection (kinds 9734/9735) has been removed to avoid duplicate processing
-        and ensure accurate tracking via invoice settlements.
-        
-        This method is kept for backwards compatibility but will log a warning
-        and skip processing.
-        
-        Args:
-            zapper_pubkey: Pubkey of the zapper
-            zapped_note_id: Note ID that was zapped
-            amount_sats: Amount in sats
-            event_id: Zap receipt event ID
-            event: Full event dict
-        """
-        logger.warning(
-            f"⚠️  Nostr-based zap detection called but is deprecated. "
-            f"Zaps are now detected via payment listener only. "
-            f"Ignoring Nostr zap event {event_id[:16]}..."
-        )
-        return
-        
-        # DEPRECATED CODE BELOW - Not executed
-        try:
-            # Check for duplicate processing
-            if self._mark_event_processed('zap', event_id, zapped_note_id, zapper_pubkey):
-                return  # Already processed
-            
-            logger.info(
-                f"🔄 Processing Nostr zap: {amount_sats} sats from {zapper_pubkey[:8]}... "
-                f"to note {zapped_note_id[:8]}... (event: {event_id[:16]}...)"
-            )
-            
-            # Get settings to check if this is a valid zap for our system
-            settings = await crud.get_settings(self.user_id)
-            if not settings:
-                logger.warning(f"No settings found for user {self.user_id}, cannot process Nostr zap")
-                return
-            
-            # Verify the zapped note is one we're tracking
-            tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
-            if zapped_note_id not in tracked_notes:
-                logger.debug(
-                    f"❌ Zapped note {zapped_note_id[:16]}... not in tracked notes "
-                    f"(tracking {len(tracked_notes)} notes). Ignoring."
-                )
-                return
-            
-            logger.debug(
-                f"✅ Zapped note {zapped_note_id[:16]}... IS in tracked notes. "
-                f"Proceeding with headbutt processing..."
-            )
-            
-            # Trigger headbutt processing
-            # Import here to avoid circular dependency
-            from .headbutt import trigger_headbutt_from_zap
-            
-            result = await trigger_headbutt_from_zap(
-                user_id=self.user_id,
-                pubkey=zapper_pubkey,
-                amount_sats=amount_sats,
-                note_id=zapped_note_id,
-                event_id=event_id,
-                app=self.app
-            )
-            
-            if result:
-                self.total_zaps_processed += 1
-                self.last_zap_at = utc_now_timestamp()
-                self.last_message_at = utc_now_timestamp()
-                logger.info(f"Successfully processed Nostr zap from {zapper_pubkey[:8]}...")
-            else:
-                logger.warning(f"Failed to process Nostr zap from {zapper_pubkey[:8]}...")
-            
-        except Exception as e:
-            logger.error(f"Error handling Nostr zap: {e}")
-            self.last_error = str(e)
-    
-    async def _handle_nostr_repost(self, reposter_pubkey: str, reposted_note_id: str,
-                                    event_id: str, event: dict):
-        """Handle repost detected from Nostr.
-        
-        Args:
-            reposter_pubkey: Pubkey of the reposter
-            reposted_note_id: Note ID that was reposted
-            event_id: Repost event ID
-            event: Full event dict
-        """
-        try:
-            # Persistent dedupe: skip if persisted as processed (prevents cross-restart reprocessing)
-            try:
-                if event_id and await crud.is_event_processed(cast(str, self.user_id), event_id):
-                    logger.debug(f"Persisted repost event {event_id[:16]}... already processed. Skipping.")
-                    return
-            except Exception:
-                # If persistence check fails, fall back to in-memory dedupe
-                pass
-
-            # In-memory duplicate check
-            if self._mark_event_processed('repost', event_id, reposted_note_id, reposter_pubkey):
-                return  # Already processed
-            
-            logger.info(
-                f"🔄 Processing Nostr repost from {reposter_pubkey[:8]}... "
-                f"of note {reposted_note_id[:8]}... (event: {event_id[:16]}...)"
-            )
-            
-            # Get settings
-            settings = await crud.get_settings(self.user_id)
-            if not settings:
-                logger.warning(f"No settings found for user {self.user_id}, cannot process Nostr repost")
-                return
-            
-            # Verify the reposted note is one we're tracking
-            tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
-            if reposted_note_id not in tracked_notes:
-                logger.debug(f"Reposted note {reposted_note_id} not in tracked notes, ignoring")
-                return
-            
-            # Check if reposts are enabled
-            if not getattr(settings, 'repost_tracking_enabled', False):  # Note: singular "repost"
-                logger.debug(f"Repost tracking not enabled for user {self.user_id}")
-                return
-            
-            # Trigger headbutt processing for repost
-            from .headbutt import trigger_headbutt_from_repost
-            
-            result = await trigger_headbutt_from_repost(
-                user_id=cast(str, self.user_id),
-                pubkey=reposter_pubkey,
-                note_id=reposted_note_id,
-                event_id=event_id,
-                app=self.app
-            )
-            
-            if result:
-                self.total_reposts_processed += 1
-                self.last_message_at = utc_now_timestamp()
-                logger.info(f"Successfully processed Nostr repost from {reposter_pubkey[:8]}...")
-                # Persist processed status so reposts are never reprocessed across restarts
-                try:
-                    if event_id and isinstance(event_id, str):
-                            res = await crud.register_processed_event(
-                                cast(str, self.user_id),
-                                event_id,
-                                reposted_note_id,
-                                reposter_pubkey,
-                                event_type="repost",
-                            )
-                            # Metrics: increment counters on success/failure when app available
-                            try:
-                                st = getattr(self.app, 'state', self.app)
-                                metrics = getattr(st, 'cyberherd_metrics', None)
-                                if metrics is None:
-                                    metrics = {}
-                                    try:
-                                        setattr(st, 'cyberherd_metrics', metrics)
-                                    except Exception:
-                                        pass
-                                # success if register_processed_event returned truthy
-                                if res:
-                                    metrics['repost_persist_success'] = metrics.get('repost_persist_success', 0) + 1
-                                else:
-                                    metrics['repost_persist_failure'] = metrics.get('repost_persist_failure', 0) + 1
-                            except Exception:
-                                pass
-                            if res:
-                                logger.debug("Persisted repost event %s for user %s", event_id, self.user_id)
-                            else:
-                                logger.warning(f"Failed to persist repost event {event_id} for user {self.user_id}")
-                except Exception:
-                    # Non-fatal: persistence failure should not break processing
-                        try:
-                            st = getattr(self.app, 'state', self.app)
-                            metrics = getattr(st, 'cyberherd_metrics', None)
-                            if metrics is None:
-                                metrics = {}
-                                try:
-                                    setattr(st, 'cyberherd_metrics', metrics)
-                                except Exception:
-                                    pass
-                            metrics['repost_persist_failure'] = metrics.get('repost_persist_failure', 0) + 1
-                        except Exception:
-                            pass
-            else:
-                logger.warning(f"Failed to process Nostr repost from {reposter_pubkey[:8]}...")
-            
-        except Exception as e:
-            logger.error(f"Error handling Nostr repost: {e}")
-            self.last_error = str(e)
-    
-    async def _handle_nostr_reaction(self, reactor_pubkey: str, reacted_note_id: str,
-                                      reaction_content: str, event_id: str, event: dict):
-        """Handle reaction detected from Nostr.
-        
-        Args:
-            reactor_pubkey: Pubkey of the reactor
-            reacted_note_id: Note ID that was reacted to
-            reaction_content: Reaction content ("+", "❤️", etc.)
-            event_id: Reaction event ID
-            event: Full event dict
-        """
-        try:
-            # Persistent dedupe first: prevents cross-restart reprocessing of reactions
-            try:
-                if event_id and await crud.is_event_processed(cast(str, self.user_id), event_id):
-                    logger.debug(f"Persisted reaction event {event_id[:16]}... already processed. Skipping.")
-                    return
-            except Exception:
-                # Fall back to in-memory dedupe if persistence unavailable
-                pass
-
-            # In-memory duplicate check
-            if self._mark_event_processed('reaction', event_id, reacted_note_id, reactor_pubkey):
-                return  # Already processed
-            
-            logger.info(
-                f"🔄 Processing Nostr reaction '{reaction_content}' from {reactor_pubkey[:8]}... "
-                f"to note {reacted_note_id[:8]}... (event: {event_id[:16]}...)"
-            )
-            
-            # Get settings
-            settings = await crud.get_settings(self.user_id)
-            if not settings:
-                logger.warning(f"No settings found for user {self.user_id}, cannot process Nostr reaction")
-                return
-            
-            # Verify the reacted note is one we're tracking
-            tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
-            if reacted_note_id not in tracked_notes:
-                logger.debug(f"Reacted note {reacted_note_id} not in tracked notes, ignoring")
-                return
-            
-            # Check if reactions are enabled
-            if not getattr(settings, 'likes_tracking_enabled', False):
-                logger.debug(f"Reaction tracking not enabled for user {self.user_id}")
-                return
-            
-            # Trigger headbutt processing for reaction
-            from .headbutt import trigger_headbutt_from_reaction
-            
-            result = await trigger_headbutt_from_reaction(
-                user_id=cast(str, self.user_id),
-                pubkey=reactor_pubkey,
-                note_id=reacted_note_id,
-                event_id=event_id,
-                app=self.app
-            )
-            
-            if result:
-                self.total_reactions_processed += 1
-                self.last_message_at = utc_now_timestamp()
-                logger.info(f"Successfully processed Nostr reaction from {reactor_pubkey[:8]}...")
-                # Persist processed status to avoid reprocessing after restarts
-                try:
-                    if event_id and isinstance(event_id, str):
-                            res = await crud.register_processed_event(
-                                cast(str, self.user_id),
-                                event_id,
-                                reacted_note_id,
-                                reactor_pubkey,
-                                event_type="reaction",
-                            )
-                            try:
-                                st = getattr(self.app, 'state', self.app)
-                                metrics = getattr(st, 'cyberherd_metrics', None)
-                                if metrics is None:
-                                    metrics = {}
-                                    try:
-                                        setattr(st, 'cyberherd_metrics', metrics)
-                                    except Exception:
-                                        pass
-                                if res:
-                                    metrics['reaction_persist_success'] = metrics.get('reaction_persist_success', 0) + 1
-                                else:
-                                    metrics['reaction_persist_failure'] = metrics.get('reaction_persist_failure', 0) + 1
-                            except Exception:
-                                pass
-                            if res:
-                                logger.debug("Persisted reaction event %s for user %s", event_id, self.user_id)
-                            else:
-                                logger.warning(f"Failed to persist reaction event {event_id} for user {self.user_id}")
-                except Exception:
-                        try:
-                            st = getattr(self.app, 'state', self.app)
-                            metrics = getattr(st, 'cyberherd_metrics', None)
-                            if metrics is None:
-                                metrics = {}
-                                try:
-                                    setattr(st, 'cyberherd_metrics', metrics)
-                                except Exception:
-                                    pass
-                            metrics['reaction_persist_failure'] = metrics.get('reaction_persist_failure', 0) + 1
-                        except Exception:
-                            pass
-            else:
-                logger.warning(f"Failed to process Nostr reaction from {reactor_pubkey[:8]}...")
-            
-        except Exception as e:
-            logger.error(f"Error handling Nostr reaction: {e}")
-            self.last_error = str(e)
-
+    async def _handle_nostr_reaction(self, *args, **kwargs):
+        return  
+          
     async def status(self) -> dict[str, Any]:
         """Get current monitoring status and statistics."""
         persisted_totals: dict[str, int] = {}
@@ -1605,13 +850,9 @@ class ZapMonitorService:
         else:
             persisted_totals = {}
 
-        total_zaps = max(self.total_zaps_processed, persisted_totals.get("zap", 0))
-        total_reposts = max(
-            self.total_reposts_processed, persisted_totals.get("repost", 0)
-        )
-        total_reactions = max(
-            self.total_reactions_processed, persisted_totals.get("reaction", 0)
-        )
+        total_zaps = int(persisted_totals.get("zap", 0) or 0)
+        total_reposts = int(persisted_totals.get("repost", 0) or 0)
+        total_reactions = int(persisted_totals.get("reaction", 0) or 0)
 
         # Reflect central invoice listener registration status
         invoice_listener_registered = False
@@ -1626,19 +867,13 @@ class ZapMonitorService:
             'last_message_at': self.last_message_at,
             'last_zap_at': self.last_zap_at,
             'last_error': self.last_error,
-            'mode': 'nostr',  # Nostr-only implementation
+            'mode': 'payment',
             'monitoring_available': bool(invoice_listener_registered),
             'total_zaps_processed': total_zaps,
             'total_reposts_processed': total_reposts,
             'total_reactions_processed': total_reactions,
             'total_recovery_scans': getattr(self, 'total_recovery_scans', 0),
-            'nostr_monitoring_enabled': self.nostr_monitor is not None,
         }
-        
-        # Add Nostr monitor detailed status if available
-        if self.nostr_monitor:
-            status['nostr_monitor'] = self.nostr_monitor.status()
-        
         return status
 
     async def _recover_missed_payment_zaps(self, settings) -> dict:
@@ -1747,9 +982,9 @@ class ZapMonitorService:
 
 
 def get_zap_monitor(**kwargs):
-    """Get or create a ZapMonitorService instance for a user.
-    
-    This is a singleton factory that maintains one monitor instance per user_id.
+    """Get or create a PaymentCoordinatorService instance for a user.
+
+    This singleton factory maintains one coordinator instance per user_id.
     """
     uid = kwargs.get('user_id')
     if not uid:
@@ -1757,7 +992,7 @@ def get_zap_monitor(**kwargs):
     
     inst = _instances.get(uid)
     if inst is None:
-        inst = ZapMonitorService(
+        inst = PaymentCoordinatorService(
             app=kwargs.get('app'),
             db=kwargs.get('db'),
             messaging=kwargs.get('messaging'),
@@ -1779,5 +1014,14 @@ def get_zap_monitor(**kwargs):
     return inst
 
 
-# Alias for backward compatibility
-ZapMonitor = ZapMonitorService
+ZapMonitorService = PaymentCoordinatorService
+ZapMonitor = PaymentCoordinatorService
+
+
+def get_payment_coordinator(**kwargs) -> PaymentCoordinatorService:
+    """Preferred factory alias for external imports.
+
+    Mirrors get_zap_monitor for compatibility with imports that expect
+    get_payment_coordinator in this module.
+    """
+    return get_zap_monitor(**kwargs)

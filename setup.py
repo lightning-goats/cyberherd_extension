@@ -16,7 +16,7 @@ def register_services(app):
     Safe to call multiple times; subsequent calls just update attributes.
     """
     try:
-        from .services.zap_monitor import get_zap_monitor
+        from .services.payment_coordinator import get_payment_coordinator as get_zap_monitor
 
         zap_monitor = get_zap_monitor(app=app)
         # Ensure stored on app.state for other modules

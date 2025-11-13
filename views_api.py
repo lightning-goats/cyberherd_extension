@@ -89,7 +89,10 @@ from lnbits.core.crud import get_wallet_for_key
 from . import crud, services
 from .crud import clear_processed_zaps_for_user
 from .services.splits import reset_splits_to_predefined_wallet
-from .services.zap_monitor import get_zap_monitor, payment_listener_required
+from .services.payment_coordinator import (
+    get_payment_coordinator as get_zap_monitor,
+    payment_listener_required,
+)
 
 # Router for this module (will be included by package init)
 cyberherd_api_router = APIRouter()

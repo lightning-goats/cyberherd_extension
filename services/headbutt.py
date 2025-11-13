@@ -1610,6 +1610,19 @@ class EnhancedHeadbuttService:
             await self._maybe_update_splits()
         except Exception as e:
             logger.warning(e)
+        # Ensure SplitPayments targets reflect current active members and weights.
+        # This schedules a debounced recompute for the configured source wallet.
+        try:
+            settings = await self.db.get_settings(self.user_id)
+            source_wallet = getattr(settings, 'source_wallet', None) if settings else None
+            if source_wallet:
+                from .splits import schedule_split_recompute
+                await schedule_split_recompute(str(source_wallet), user_id=self.user_id)
+        except Exception as e:
+            try:
+                logger.debug(f"cyberherd: split recompute scheduling failed in _post_admission_tasks: {e}")
+            except Exception:
+                pass
         try:
             # Get websocket topic from settings
             websocket_topic = await self._get_websocket_topic()
