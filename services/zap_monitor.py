@@ -39,16 +39,13 @@ from .zap_totals import record_incremental_zap_total
 from ..utils.common import utc_now_timestamp  # Centralized UTC timestamp function
 from .leaderboard import broadcast_leaderboard_update
 
-# NostrEventMonitor was planned but not implemented - monitoring happens via subscriptions.py
-_monitoring_available = False
-_register_invoice_listener = None  # type: ignore
-
-try:  # pragma: no cover
-    from lnbits.tasks import register_invoice_listener as _register_invoice_listener  # type: ignore
-except Exception:  # pragma: no cover
-    _register_invoice_listener = None  # type: ignore
-else:  # pragma: no cover
-    _monitoring_available = True
+# Simplified payment monitoring: this service no longer registers its own
+# invoice listener. A single central listener is registered in
+# lnbits/extensions/cyberherd/tasks.py using the standard LNbits pattern
+# (wait_for_paid_invoices + create_permanent_unique_task), similar to the
+# lightning_goats extension. Split triggering is retained via
+# ZapMonitorService._check_and_trigger_splits, which is invoked by
+# tasks.process_incoming_payment.
 
 try:  # pragma: no cover
     from . import nostr_helpers  # type: ignore
@@ -155,9 +152,8 @@ class ZapMonitorService:
         self._processed_events: dict[tuple[str, str, str, str], int] = {}
         self._processed_events_max_size = 1000  # Prevent unbounded growth
         
-        # Payment listener task and registration state
-        self._payment_listener_task: Optional[asyncio.Task] = None
-        self._invoice_queue: Optional[asyncio.Queue] = None  # Queue for invoice payments
+        # Payment listener is centrally managed by cyberherd.tasks; no per-user
+        # listener, task or queue is created here.
         
         # NostrEventMonitor not implemented - monitoring handled by subscriptions.py
         self.nostr_monitor: Optional[Any] = None  # Reserved for future implementation
@@ -322,40 +318,32 @@ class ZapMonitorService:
         return None, None
 
     async def start_monitoring(self):
-        """Start monitoring for zaps via payment listener.
-        
-        The payment listener is started when:
-        - zap_tracking_enabled is true (for processing zaps), OR
-        - send_splits_enabled is true (for automatic splits)
-        
-        Nostr event monitoring (reposts/reactions) is handled separately by subscriptions.py.
-        """
-        # Get user settings
-        settings = await crud.get_settings(self.user_id)
-        
-        herd_wallet = getattr(settings, 'herd_wallet', None)
-        zap_tracking = bool(getattr(settings, 'zap_tracking_enabled', False))
-        auto_splits = bool(getattr(settings, 'send_splits_enabled', False))
-        needs_listener = payment_listener_required(settings)
+        """Mark monitor as running; payments are handled centrally.
 
-        if not needs_listener:
+        Payment listening is performed by the central listener registered in
+        cyberherd.tasks.start_invoice_listener. This method retains the public
+        lifecycle API but does not start a per-user listener.
+        """
+        settings = await crud.get_settings(self.user_id)
+        herd_wallet = getattr(settings, 'herd_wallet', None) if settings else None
+        zap_tracking = bool(getattr(settings, 'zap_tracking_enabled', False)) if settings else False
+        auto_splits = bool(getattr(settings, 'send_splits_enabled', False)) if settings else False
+
+        if not payment_listener_required(settings):
             logger.info(
-                f"Payment listener not started for user {self.user_id}: "
+                f"Payment listener not required for user {self.user_id}: "
                 f"herd_wallet={'set' if herd_wallet else 'missing'}, "
                 f"zap_tracking_enabled={zap_tracking}, send_splits_enabled={auto_splits}"
             )
             return
-        
+
         if self._running:
             return
-            
+
         self._running = True
-        
-        # Start payment listener for LNURLp zaps AND automatic splits
-        self._payment_listener_task = asyncio.create_task(self._payment_listener_runner())
         logger.info(
-            f"Started payment listener for user {self.user_id} "
-            f"(zap_tracking={zap_tracking}, auto_splits={auto_splits})"
+            f"Zap monitor active for user {self.user_id} "
+            f"(payments handled by central listener; zap_tracking={zap_tracking}, auto_splits={auto_splits})"
         )
 
     async def stop_monitoring(self):
@@ -364,16 +352,6 @@ class ZapMonitorService:
             return
             
         self._running = False
-        
-        # Stop payment listener task
-        if self._payment_listener_task:
-            try:
-                self._payment_listener_task.cancel()
-                await asyncio.wait([self._payment_listener_task], timeout=2.0)
-                logger.info(f"Payment listener stopped for user {self.user_id}")
-            except Exception as e:
-                logger.error(f"Error stopping payment listener: {e}")
-            self._payment_listener_task = None
         
         # Stop Nostr monitoring if active
         if self.nostr_monitor:
@@ -387,8 +365,10 @@ class ZapMonitorService:
     async def _process_payment_for_zap(self, payment):
         """Process a payment notification to detect LNURLp zaps.
         
-        This method is called by the invoice listener and parses zap requests from
-        payment.extra["nostr"] (NIP-57 zap request JSON string).
+        This method previously parsed payment.extra["nostr"] for NIP-57 zap
+        requests. Payment-based zap detection has been disabled in favour of
+        Nostr kind 9735 subscriptions. This method is retained for tests/admin
+        tooling but is not called from the live invoice listener.
         
         IMPORTANT: Only processes zaps for TODAY's tracked notes. This enforces
         the rule that zaps are only valid for the current day's CyberHerd notes.
@@ -397,30 +377,13 @@ class ZapMonitorService:
             payment: Payment object with extra data containing zap request
         """
         try:
-            # Only process payments to the configured herd wallet
+            # Disabled in live flow; keep as no-op fast exit
             settings = await crud.get_settings(self.user_id)
             if not settings:
-                logger.debug(f"No settings found for user {self.user_id}")
-                return
-            
-            if not getattr(settings, "zap_tracking_enabled", False):
-                logger.info(
-                    f"Zap processing skipped for user {self.user_id}: zap_tracking_enabled is False"
-                )
-                self.last_error = "zap_tracking_disabled"
                 return False
-            
             herd_wallet_id = getattr(settings, 'herd_wallet', None)
-            # Coerce herd_wallet_id to a string only if it's a real value. Tests use Mock objects
-            # which will return a Mock for missing attributes; treat non-str values as unset.
-            if not isinstance(herd_wallet_id, str):
-                herd_wallet_id = None
-
-            # If herd_wallet_id is configured, require the payment to be to that wallet.
-            if herd_wallet_id:
-                if payment.wallet_id != herd_wallet_id:
-                    # Payment is not to the herd wallet, ignore
-                    return
+            if herd_wallet_id and payment.wallet_id != herd_wallet_id:
+                return False
             
             # Extract zap request from payment.extra["nostr"] (preferred) or comment (fallback)
             zap_request = None
@@ -518,16 +481,8 @@ class ZapMonitorService:
                     # Best-effort; do not fail if assignment fails
                     pass
             
-            if not zap_request:
-                payment_hash_preview = None
-                try:
-                    payment_hash = getattr(payment, 'payment_hash', None) or getattr(payment, 'checking_id', None)
-                    payment_hash_preview = payment_hash[:16] if isinstance(payment_hash, str) else None
-                except Exception:
-                    payment_hash_preview = None
-                logger.debug(f"No zap request found in payment {payment_hash_preview}...")
-                self.last_error = "payment_missing_nostr_field"
-                return False
+            # Payment-based zap detection disabled
+            return False
             
             # Extract zapper pubkey
             zapper_pubkey = zap_request.get("pubkey")
@@ -1214,99 +1169,9 @@ class ZapMonitorService:
             f"for note {note_id[:8]}... (note: zap was already processed successfully)"
         )
     
-    async def _payment_listener_runner(self):
-        """Supervise the payment listener loop and restart on fatal errors."""
-        backoff_seconds = 1.0
-        while self._running:
-            try:
-                await self._payment_listener_worker()
-                backoff_seconds = 1.0
-                if not self._running:
-                    break
-                logger.warning(
-                    f"Payment listener exited unexpectedly for user {self.user_id}, restarting in {backoff_seconds:.1f}s"
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.last_error = str(exc)
-                logger.error(
-                    f"Payment listener crashed for user {self.user_id}: {exc}. "
-                    f"Retrying in {backoff_seconds:.1f}s"
-                )
-            await asyncio.sleep(backoff_seconds)
-            backoff_seconds = min(backoff_seconds * 2, 30.0)
-        logger.info(f"Payment listener supervisor exited for user {self.user_id}")
-
-    async def _payment_listener_worker(self):
-        """Listen for invoice payments and detect LNURLp zaps.
-        
-        This is a background task that should be started when monitoring begins.
-        It registers with the LNbits invoice listener system (once) and processes payments.
-        """
-        global _register_invoice_listener, _monitoring_available
-        try:
-            if _register_invoice_listener is None:
-                from lnbits.tasks import register_invoice_listener as _imported  # type: ignore
-
-                _register_invoice_listener = _imported  # type: ignore
-                _monitoring_available = True
-        except Exception as e:  # pragma: no cover - defensive import guard
-            logger.error(
-                f"Cyberherd payment listener unavailable for user {self.user_id}: {e}"
-            )
-            self.last_error = str(e)
-            _monitoring_available = False
-            return
-
-        if _register_invoice_listener is None:
-            logger.error(
-                f"Cyberherd payment listener could not be registered for user {self.user_id} (missing handler)"
-            )
-            self.last_error = "invoice_listener_unavailable"
-            _monitoring_available = False
-            return
-
-        try:
-            # Register listener only once per monitor instance (idempotent)
-            if self._invoice_queue is None:
-                self._invoice_queue = asyncio.Queue()
-                _register_invoice_listener(  # type: ignore[misc]
-                    self._invoice_queue, f"cyberherd_zap_monitor_{self.user_id}"
-                )
-                logger.info(f"✅ Payment listener registered for user {self.user_id}")
-            else:
-                logger.debug(
-                    f"Payment listener already registered for user {self.user_id}, reusing queue"
-                )
-
-            while self._running:
-                try:
-                    # Wait for payment with timeout to allow checking _running flag
-                    payment = await asyncio.wait_for(
-                        self._invoice_queue.get(), timeout=1.0
-                    )
-                    # Process payment for zap detection (if applicable)
-                    await self._process_payment_for_zap(payment)
-                    
-                    # Check if automatic splits should be triggered for ANY payment
-                    # to the herd wallet (not just zaps)
-                    await self._check_and_trigger_splits(payment)
-                except asyncio.TimeoutError:
-                    # Normal timeout, check if still running
-                    continue
-                except Exception as e:
-                    logger.error(f"Error in payment listener for user {self.user_id}: {e}")
-                    await asyncio.sleep(1)  # Brief pause before retrying
-
-            logger.info(f"Payment listener stopped for user {self.user_id}")
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.error(f"Fatal error in payment listener for user {self.user_id}: {e}")
-            self.last_error = str(e)
-            raise
+    # Removed: per-instance payment listener runner/worker. Payment events are
+    # consumed by the central listener in cyberherd.tasks, which calls into
+    # _check_and_trigger_splits as needed.
     
     async def update_tracked_notes(self, note_ids: list[str], author_pubkey: str | None = None,
                                    enable_zaps: bool = True, enable_reposts: bool = False, 
@@ -1748,15 +1613,21 @@ class ZapMonitorService:
             self.total_reactions_processed, persisted_totals.get("reaction", 0)
         )
 
+        # Reflect central invoice listener registration status
+        invoice_listener_registered = False
+        try:
+            from lnbits.tasks import invoice_listeners  # type: ignore
+            invoice_listener_registered = 'ext_cyberherd' in invoice_listeners
+        except Exception:
+            invoice_listener_registered = False
+
         status = {
             'running': bool(self._running),
             'last_message_at': self.last_message_at,
             'last_zap_at': self.last_zap_at,
             'last_error': self.last_error,
             'mode': 'nostr',  # Nostr-only implementation
-            'monitoring_available': bool(
-                _monitoring_available or self._invoice_queue is not None
-            ),
+            'monitoring_available': bool(invoice_listener_registered),
             'total_zaps_processed': total_zaps,
             'total_reposts_processed': total_reposts,
             'total_reactions_processed': total_reactions,
