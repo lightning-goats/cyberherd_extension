@@ -64,9 +64,15 @@ class NostrWebSocketMonitor:
         self.connected = False
         self.shutdown = False
         
-        # Subscriptions tracking
-        self.subscriptions: dict[str, dict[str, Any]] = {}  # sub_id -> filter
+        # Subscriptions tracking (per-subscription metadata)
+        # Keys are sub_ids, values include type/filter plus lifecycle info
+        self.subscriptions: dict[str, dict[str, Any]] = {}
         self.subscription_counter = 0
+        # Timeout (in seconds) for initial subscription handshake (EVENT/EOSE/CLOSED).
+        # If a subscription never receives any message within this window, we treat
+        # it as stale and refresh all subscriptions, mirroring the NWC pattern.
+        self.subscription_timeout = 10
+        self.subscription_timeout_task = None
         
         # Reconnection task
         self.reconnect_task = None
@@ -97,6 +103,12 @@ class NostrWebSocketMonitor:
         
         # Start WebSocket reconnection task
         self.reconnect_task = asyncio.create_task(self._connect_to_relay())
+
+        # Start subscription-timeout monitor task (if not already running)
+        if not self.subscription_timeout_task or self.subscription_timeout_task.done():
+            self.subscription_timeout_task = asyncio.create_task(
+                self._handle_subscription_timeouts()
+            )
         
         logger.debug(f"✅ NostrWebSocketMonitor started for user {self.user_id}")
     
@@ -107,6 +119,18 @@ class NostrWebSocketMonitor:
         self.shutdown = True
         
         # Cancel tasks
+        if self.subscription_timeout_task:
+            self.subscription_timeout_task.cancel()
+            try:
+                await self.subscription_timeout_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(
+                    f"Error waiting for subscription-timeout task to stop: {e}"
+                )
+            self.subscription_timeout_task = None
+
         if self.reconnect_task:
             self.reconnect_task.cancel()
             try:
@@ -163,6 +187,99 @@ class NostrWebSocketMonitor:
         
         message = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
         await self.ws.send(message)
+
+    async def _close_subscription(self, sub_id: str, send_event: bool = True):
+        """Close a subscription locally and optionally send CLOSE to the relay.
+        
+        Mirrors the NWC pattern: track a closed flag and ensure we don't try
+        to CLOSE the same subscription multiple times.
+        """
+        meta = self.subscriptions.get(sub_id)
+        if not meta:
+            return
+
+        if not meta.get("closed"):
+            meta["closed"] = True
+            if send_event:
+                try:
+                    await self._send(["CLOSE", sub_id])
+                except Exception as e:
+                    logger.warning(
+                        f"User {self.user_id}: Error sending CLOSE for "
+                        f"subscription {sub_id}: {e}"
+                    )
+
+        # Remove from tracking regardless of whether sending CLOSE succeeded
+        self.subscriptions.pop(sub_id, None)
+
+    async def _handle_subscription_timeouts(self):
+        """Monitor new subscriptions and refresh if handshakes never complete.
+        
+        For each subscription we expect at least one message (EVENT, EOSE or
+        CLOSED) shortly after sending REQ. If nothing arrives within
+        subscription_timeout, we treat subscriptions as stale and refresh them,
+        following the spirit of the NWC subscription handling pattern.
+        """
+        try:
+            while not self.shutdown:
+                await asyncio.sleep(int(self.subscription_timeout * 0.5))
+
+                # Skip checks while disconnected
+                if not self.connected:
+                    continue
+
+                now = time.time()
+
+                # If we're connected but have no active subscriptions, refresh.
+                if not self.subscriptions:
+                    try:
+                        logger.warning(
+                            f"User {self.user_id}: No active subscriptions while "
+                            "connected; refreshing subscriptions"
+                        )
+                        await self._subscribe_to_tracked_notes()
+                    except Exception as e:
+                        logger.error(
+                            f"User {self.user_id}: Error refreshing subscriptions "
+                            f"when none active: {e}"
+                        )
+                    continue
+
+                # Detect any subscription whose handshake never completed.
+                stale_found = False
+                for sub_id, meta in list(self.subscriptions.items()):
+                    if meta.get("closed"):
+                        continue
+                    created_at = meta.get("created_at") or 0
+                    handshake_completed = meta.get("handshake_completed", False)
+                    if not created_at or handshake_completed:
+                        continue
+                    elapsed = now - created_at
+                    if elapsed > self.subscription_timeout:
+                        logger.warning(
+                            f"User {self.user_id}: Subscription {sub_id} handshake "
+                            f"timed out after {int(elapsed)}s; refreshing "
+                            "subscriptions"
+                        )
+                        stale_found = True
+                        break
+
+                if stale_found:
+                    try:
+                        await self._subscribe_to_tracked_notes()
+                    except Exception as e:
+                        logger.error(
+                            f"User {self.user_id}: Error refreshing subscriptions "
+                            f"after timeout: {e}"
+                        )
+        except asyncio.CancelledError:
+            logger.debug(
+                f"User {self.user_id}: Subscription-timeout monitor cancelled"
+            )
+        except Exception as e:
+            logger.error(
+                f"User {self.user_id}: Error in subscription-timeout monitor: {e}"
+            )
     
     async def _subscribe_to_tracked_notes(self):
         """Subscribe to reactions and reposts for all tracked notes.
@@ -196,10 +313,11 @@ class NostrWebSocketMonitor:
             old_subs = list(self.subscriptions.keys())
             for old_sub_id in old_subs:
                 try:
-                    await self._send(["CLOSE", old_sub_id])
+                    await self._close_subscription(old_sub_id, send_event=True)
                 except Exception as e:
-                    logger.warning(f"Error closing old subscription {old_sub_id}: {e}")
-            self.subscriptions.clear()
+                    logger.warning(
+                        f"Error closing old subscription {old_sub_id}: {e}"
+                    )
             
             logger.debug(
                 f"User {self.user_id}: Subscribing - "
@@ -239,6 +357,10 @@ class NostrWebSocketMonitor:
                     self.subscriptions[sub_id] = {
                         "type": "engagement",  # reposts/reactions
                         "filter": filter_dict,
+                        "created_at": time.time(),
+                        "handshake_completed": False,
+                        "last_event_at": None,
+                        "closed": False,
                     }
                     
                     engagement_types = []
@@ -290,6 +412,10 @@ class NostrWebSocketMonitor:
                 self.subscriptions[sub_id] = {
                     "type": "notes",  # new notes from user
                     "filter": filter_dict,
+                    "created_at": time.time(),
+                    "handshake_completed": False,
+                    "last_event_at": None,
+                    "closed": False,
                 }
                 
                 logger.debug(
@@ -318,6 +444,10 @@ class NostrWebSocketMonitor:
                     self.subscriptions[sub_id] = {
                         "type": "zap_receipts",
                         "filter": filter_dict,
+                        "created_at": time.time(),
+                        "handshake_completed": False,
+                        "last_event_at": None,
+                        "closed": False,
                     }
                     logger.debug(
                         f"✅ User {self.user_id}: Created zap receipts subscription (kind 9735) "
@@ -416,12 +546,18 @@ class NostrWebSocketMonitor:
                 
                 # Only process events from our subscriptions
                 if sub_id in self.subscriptions:
+                    meta = self.subscriptions.get(sub_id) or {}
+                    meta["handshake_completed"] = True
+                    meta["last_event_at"] = time.time()
                     await self._process_event(event)
             
             elif msg_type == "EOSE":
                 # End of stored events
                 sub_id = msg[1]
                 logger.debug(f"User {self.user_id}: EOSE for subscription {sub_id}")
+                meta = self.subscriptions.get(sub_id)
+                if meta is not None:
+                    meta["handshake_completed"] = True
             
             elif msg_type == "CLOSED":
                 # Subscription closed by relay
@@ -430,9 +566,9 @@ class NostrWebSocketMonitor:
                 logger.warning(
                     f"User {self.user_id}: Subscription {sub_id} closed by relay: {reason}"
                 )
-                # Remove from tracking
+                # Remove from tracking (do not send CLOSE back, relay initiated)
                 if sub_id in self.subscriptions:
-                    del self.subscriptions[sub_id]
+                    await self._close_subscription(sub_id, send_event=False)
             
             elif msg_type == "NOTICE":
                 # Relay notice

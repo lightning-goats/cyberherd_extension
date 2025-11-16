@@ -72,10 +72,84 @@ def _coerce_int(value: Any, default: int = 0) -> int:
 
 def _format_spots_suffix(spots_remaining: int) -> str:
     if spots_remaining > 1:
-        return f"⚡ {spots_remaining} more spots available. ⚡"
+        return f"\n\n⚡ {spots_remaining} more spots available. ⚡"
     if spots_remaining == 1:
         return "⚡ 1 more spot available. ⚡"
     return ""
+
+
+def _build_websocket_members(event_type: str, values: dict[str, Any] | None) -> list[dict[str, Any]] | None:
+    """
+    Build a minimal `members` list for websocket payloads from loosely-structured values.
+
+    This ensures clients like progress_ws.html can call displayCyberHerdMembers()
+    without needing to reverse‑engineer the various membership fields.
+    """
+    if not isinstance(values, dict):
+        return None
+
+    # Only attach members for membership-style events; other events don't drive the roster.
+    if event_type not in _MEMBERSHIP_EVENTS:
+        return None
+
+    # Prefer a structured cyber_herd_item when provided (as in headbutt/views flows)
+    ch_item = {}
+    try:
+        if "cyber_herd_item" in values and isinstance(values["cyber_herd_item"], dict):
+            ch_item = dict(values["cyber_herd_item"])
+    except Exception:
+        ch_item = {}
+
+    member: dict[str, Any] = {}
+
+    # Name / display name
+    display_name = (
+        ch_item.get("display_name")
+        or values.get("member_display_name")
+        or values.get("display_name")
+        or values.get("member_name")
+        or values.get("name")
+    )
+    if display_name:
+        member["display_name"] = str(display_name)
+
+    # Pubkey (used for newest highlighting)
+    pubkey = (
+        ch_item.get("pubkey")
+        or values.get("member_pubkey")
+        or values.get("pubkey")
+    )
+    if pubkey:
+        member["pubkey"] = str(pubkey)
+
+    # Picture / avatar
+    picture = (
+        ch_item.get("picture")
+        or values.get("member_picture")
+        or values.get("picture")
+        or values.get("imageUrl")
+        or values.get("image_url")
+    )
+    if picture:
+        member["picture"] = str(picture)
+        member.setdefault("imageUrl", str(picture))
+
+    # Contribution amount (used for sorting and display)
+    amount_candidate = ch_item.get("amount")
+    for key in ("new_total", "initial_amount", "amount", "increase_amount", "new_amount"):
+        if amount_candidate is not None:
+            break
+        if values.get(key) is not None:
+            amount_candidate = values.get(key)
+            break
+    if amount_candidate is not None:
+        member["amount"] = _coerce_int(amount_candidate, 0)
+
+    # Only return a member entry when we have at least a name or a picture
+    if not member:
+        return None
+
+    return [member]
 
 
 def _build_membership_context(values: dict[str, Any] | None) -> Optional[dict[str, Any]]:
@@ -928,6 +1002,12 @@ async def publish_shared_template(
             if goat_data is not None:
                 payload["goat_data"] = goat_data
 
+            # For membership-style events, also expose a minimal members list so
+            # websocket clients can drive displayCyberHerdMembers() directly.
+            members = _build_websocket_members(message_type or category, values_dict)
+            if members:
+                payload["members"] = members
+
             res = await _msg.send_to_websocket_clients(websocket_topic, payload)
             broadcasted = bool(res)
             if broadcasted:
@@ -1210,6 +1290,11 @@ async def publish_event_message(
                         for extra_key in ("goat_data", "spots_info", "headbutt_text"):
                             if payload.get(extra_key) is not None:
                                 message_obj[extra_key] = payload[extra_key]
+
+                    # Attach members list for membership-style events when possible
+                    members = _build_websocket_members(event_type, values)
+                    if members:
+                        message_obj["members"] = members
                     res = await _msg.send_to_websocket_clients(
                         websocket_topic,
                         message_obj,
@@ -1300,6 +1385,11 @@ async def publish_event_message(
                     for extra_key in ("goat_data", "spots_info", "headbutt_text"):
                         if payload.get(extra_key) is not None:
                             message_obj[extra_key] = payload[extra_key]
+
+                # Attach members list for membership-style events when possible
+                members = _build_websocket_members(event_type, values)
+                if members:
+                    message_obj["members"] = members
                 res = await _msg.send_to_websocket_clients(
                     websocket_topic,
                     message_obj,

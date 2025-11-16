@@ -1036,7 +1036,7 @@ async def api_get_settings(request: Request, auth=Depends(auth_wallet_or_admin_d
             if wallet and wallet.inkey:
                 host = request.headers.get('host') or request.url.hostname
                 # Prefer secure scheme for canonical URL
-                websocket_url = f"wss://{host}/ws/{wallet.inkey}"
+                websocket_url = f"wss://{host}/api/v1/ws/{wallet.inkey}"
     except Exception:
         websocket_url = None
 
@@ -2235,6 +2235,21 @@ async def api_post_member(
                     )
                     difference_value = feeder_difference if feeder_difference is not None else 0
                     picture = member_data.get("picture")
+
+                    # Build a structured cyber_herd_item so the messaging stack
+                    # (and cyberherd_messaging.message_builder) can use real member
+                    # data for both Nostr and websocket payloads.
+                    cyber_herd_item = {
+                        "display_name": display_name,
+                        "pubkey": pubkey,
+                        "nprofile": nprofile,
+                        "event_id": tracked_event_id or zap_event_id,
+                        "amount": initial_amount_val,
+                    }
+                    if picture:
+                        cyber_herd_item["picture"] = picture
+                        cyber_herd_item.setdefault("imageUrl", picture)
+
                     values_payload = {
                         "member_name": member_name,
                         "member_display_name": display_name,
@@ -2243,6 +2258,12 @@ async def api_post_member(
                         "name": member_name,
                         "thanks_part": thanks_part,
                         "difference": difference_value,
+                        # Membership context used by cyberherd_messaging
+                        "member_pubkey": pubkey,
+                        "member_nprofile": nprofile,
+                        "pubkey": pubkey,
+                        "nprofile": nprofile,
+                        "cyber_herd_item": cyber_herd_item,
                     }
                     if picture:
                         values_payload["picture"] = picture
@@ -2425,6 +2446,20 @@ async def api_put_member(
 
                     picture = (updated_row or {}).get("picture") or (row.get("picture") if isinstance(row, dict) else None)
 
+                    # Build a structured cyber_herd_item so the messaging stack
+                    # (and cyberherd_messaging.message_builder) can use real member
+                    # data for both Nostr and websocket payloads, matching headbutt.py.
+                    cyber_herd_item = {
+                        "display_name": display_name,
+                        "pubkey": pubkey,
+                        "nprofile": nprofile,
+                        "event_id": publish_thread_id,
+                        "amount": new_total,
+                    }
+                    if picture:
+                        cyber_herd_item["picture"] = picture
+                        cyber_herd_item.setdefault("imageUrl", picture)
+
                     if event_type == "new_member":
                         values = {
                             "member_name": member_name,
@@ -2440,6 +2475,14 @@ async def api_put_member(
                             "new_total": new_total,
                             "difference": difference_value,
                         }
+
+                    # Membership context used by cyberherd_messaging
+                    values.setdefault("member_pubkey", pubkey)
+                    values.setdefault("member_nprofile", nprofile)
+                    values.setdefault("pubkey", pubkey)
+                    values.setdefault("nprofile", nprofile)
+                    values["cyber_herd_item"] = cyber_herd_item
+
                     if picture:
                         values.setdefault("picture", picture)
                         values.setdefault("member_picture", picture)

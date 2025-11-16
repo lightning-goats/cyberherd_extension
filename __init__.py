@@ -86,6 +86,15 @@ def cyberherd_start():
     except Exception as e:
         logger.error(f"Cyberherd: Failed to start invoice listener: {e}", exc_info=True)
 
+    # Also schedule the midnight reset task here to cover environments
+    # where init_extension() is not invoked by the core loader.
+    try:
+        from .tasks import cyberherd_tasks as _cyberherd_tasks
+        _cyberherd_tasks(None)
+        logger.info("✅ Cyberherd: Midnight reset scheduler initialized")
+    except Exception as e:
+        logger.error(f"Cyberherd: Failed to schedule midnight reset: {e}", exc_info=True)
+
 
 # Match standard pattern (splitpayments): directly include routers without alias.
 try:  # web UI router
@@ -160,21 +169,17 @@ def init_extension(app):
     
     _init_db(app)
     _attach_metadata(app)
+    # Provide app reference to tasks module without starting tasks yet
+    try:
+        from . import tasks as _tasks
+        _tasks._APP_REF = app
+    except Exception:
+        pass
     _mount_api_routes(app)
     _mount_ui(app)
     _register_services(app)
-    # Schedule midnight reset recurring task
-    try:
-        cyberherd_tasks(app)
-    except Exception as e:
-        logger.warning(f"Cyberherd tasks init failed: {e}")
-    
-    # Register invoice listener so realtime zap detection starts immediately
-    try:
-        start_invoice_listener(app)
-        logger.info("Cyberherd: invoice listener registered during init")
-    except Exception as e:
-        logger.warning(f"Cyberherd: failed to register invoice listener: {e}")
+    # NOTE: Background tasks (invoice listener, midnight reset) are started in
+    # cyberherd_start() to ensure LNbits is fully started before they run.
     
     # WebSocket-based event monitoring is started via cyberherd_start() using create_permanent_unique_task
     # (see cyberherd_start() function above)

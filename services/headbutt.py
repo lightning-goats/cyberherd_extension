@@ -1607,6 +1607,13 @@ class EnhancedHeadbuttService:
 
     async def _post_admission_tasks(self, pubkey: str, event_id: str | None = None, note_id: str | None = None):
         try:
+            # Ensure payouts are recomputed after any membership change so
+            # frontend displays and split calculations use the latest values.
+            try:
+                await self.db.recompute_member_payouts(self.user_id)
+            except Exception as e:
+                logger.warning(f"cyberherd: recompute_member_payouts in _post_admission_tasks failed: {e}")
+
             await self._maybe_update_splits()
         except Exception as e:
             logger.warning(e)
@@ -1616,8 +1623,18 @@ class EnhancedHeadbuttService:
             settings = await self.db.get_settings(self.user_id)
             source_wallet = getattr(settings, 'source_wallet', None) if settings else None
             if source_wallet:
-                from .splits import schedule_split_recompute
+                from .splits import schedule_split_recompute, update_split_targets_proportional
+                # Debounced recompute to batch rapid changes
                 await schedule_split_recompute(str(source_wallet), user_id=self.user_id)
+                # Also perform an immediate recompute so SplitPayments reflects
+                # this change right away in most UIs.
+                try:
+                    await update_split_targets_proportional(str(source_wallet))
+                except Exception as ie:
+                    try:
+                        logger.debug(f"cyberherd: immediate split recompute failed: {ie}")
+                    except Exception:
+                        pass
         except Exception as e:
             try:
                 logger.debug(f"cyberherd: split recompute scheduling failed in _post_admission_tasks: {e}")

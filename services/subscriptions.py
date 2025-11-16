@@ -444,7 +444,7 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
         # Extract event's tags for logging
         event_t_tags = [t[1] for t in event.get('tags', []) if isinstance(t, list) and len(t) >= 2 and t[0] == 't']
         content_preview = (event.get('content', '') or '')[:100]
-        logger.warning(
+        logger.debug(
             f"🏷️ Skipping event {eid[:16]}... with t-tags {event_t_tags} content_preview='{content_preview}' "
             f"(not matching tracked tags {tags_norm}) user_id={user_id}"
         )
@@ -912,7 +912,9 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
             if result:
                 logger.info(f"✅ New tracked note detected: {eid[:16]}... for user {user_id}")
             else:
-                logger.warning(f"⚠️ Event {eid[:16]}... was not added to tracked_event_ids (filtered out) user_id={user_id}")
+                logger.debug(
+                    f"⚠️ Event {eid[:16]}... was not added to tracked_event_ids (filtered out) user_id={user_id}"
+                )
 
         # kind 6: reposts
         elif kind == 6 and getattr(settings, "repost_tracking_enabled", False):
