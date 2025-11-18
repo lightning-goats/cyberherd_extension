@@ -1317,6 +1317,196 @@ async def set_member_ban_status(pubkey: str, banned: bool, user_id: str | None =
         return False
 
 
+async def ensure_inactive_cyberherd_member(
+    pubkey: str,
+    user_id: str | None = None,
+    *,
+    refresh_metadata: bool = False,
+) -> None:
+    """Ensure a cyberherd member row exists as inactive for the given user.
+
+    This is a lightweight helper used by historical backfill tasks (e.g. zap
+    totals from payments). It creates a minimal member row without triggering
+    messaging or split recomputation. Existing rows (for this user) are left
+    unchanged.
+    """
+    if not user_id:
+        logger.warning("ensure_inactive_cyberherd_member called without user_id, skipping")
+        return
+
+    normalized_pubkey = str(pubkey or "").strip().lower()
+    if not normalized_pubkey:
+        logger.warning("ensure_inactive_cyberherd_member called without valid pubkey, skipping")
+        return
+
+    # If a row already exists for this user, either respect its current state
+    # or refresh its metadata depending on the caller's intent.
+    existing = await get_cyberherd_member_by_pubkey(normalized_pubkey, user_id=user_id)
+    if existing and not refresh_metadata:
+        return
+
+    table_name = f"{db.references_schema}cyber_herd"
+
+    # Start with existing values so refresh_metadata does not wipe fields when
+    # lookups fail or return partial data.
+    display_name: str | None = (existing or {}).get("display_name") if existing else None
+    lud16: str | None = (existing or {}).get("lud16") if existing else None
+    picture: str | None = (existing or {}).get("picture") if existing else None
+    nip05: str | None = (existing or {}).get("nip05") if existing else None
+    nprofile: str | None = (existing or {}).get("nprofile") if existing else None
+    relays_str: str | None = (existing or {}).get("relays") if existing else None
+    metadata_ts: int | None = (existing or {}).get("metadata_last_checked_at") if existing else None
+
+    if refresh_metadata:
+        try:
+            from .services.nostr_helpers import lookup_metadata, lookup_relays  # type: ignore
+
+            try:
+                md = await lookup_metadata(normalized_pubkey)
+            except Exception as exc:
+                md = None
+                try:
+                    logger.debug(
+                        f"ensure_inactive_cyberherd_member: metadata lookup failed for {normalized_pubkey[:8]}...: {exc}"
+                    )
+                except Exception:
+                    pass
+
+            if md:
+                try:
+                    dn = md.get("display_name") or "Anon"
+                    display_name = str(dn)
+                except Exception:
+                    display_name = display_name or "Anon"
+                try:
+                    lud16_val = md.get("lud16")
+                    if isinstance(lud16_val, str):
+                        lud16 = lud16_val.strip().lower() or lud16
+                except Exception:
+                    pass
+                try:
+                    picture_val = md.get("picture")
+                    if isinstance(picture_val, str):
+                        picture = picture_val
+                except Exception:
+                    pass
+                try:
+                    nip_val = md.get("nip05")
+                    if isinstance(nip_val, str):
+                        nip05_candidate = nip_val.strip().lower()
+                        if nip05_candidate:
+                            nip05 = nip05_candidate
+                except Exception:
+                    pass
+
+            try:
+                relay_list = await lookup_relays(normalized_pubkey)
+            except Exception as exc:
+                relay_list = []
+                try:
+                    logger.debug(
+                        f"ensure_inactive_cyberherd_member: relay lookup failed for {normalized_pubkey[:8]}...: {exc}"
+                    )
+                except Exception:
+                    pass
+
+            if isinstance(relay_list, list) and relay_list:
+                relays_str = ",".join(str(r) for r in relay_list if isinstance(r, str))
+
+            try:
+                from .utils.tlv import hex_to_nprofile  # type: ignore
+
+                try:
+                    relay_hints = relay_list if isinstance(relay_list, list) else None
+                    nprofile = hex_to_nprofile(normalized_pubkey, relays=relay_hints)
+                except Exception:
+                    # Keep existing nprofile on failure
+                    pass
+            except Exception as exc:
+                try:
+                    logger.debug(
+                        f"ensure_inactive_cyberherd_member: nprofile generation failed for {normalized_pubkey[:8]}...: {exc}"
+                    )
+                except Exception:
+                    pass
+
+            try:
+                metadata_ts = int(time.time())
+            except Exception:
+                # Fall back to existing timestamp if conversion fails
+                metadata_ts = metadata_ts
+        except Exception as exc:
+            try:
+                logger.debug(
+                    f"ensure_inactive_cyberherd_member: enrichment skipped for {normalized_pubkey[:8]}...: {exc}"
+                )
+            except Exception:
+                pass
+
+    values = {
+        "pubkey": normalized_pubkey,
+        "user_id": user_id,
+        "display_name": display_name,
+        "nprofile": nprofile,
+        "lud16": lud16,
+        "nip05": nip05,
+        "picture": picture,
+        "relays": relays_str,
+        "metadata_last_checked_at": metadata_ts,
+    }
+
+    # For refresh_metadata we want to upsert all known metadata fields; for
+    # first-time creation without refresh_metadata, we only ensure a stub row.
+    if refresh_metadata:
+        insert_sql = f"""
+            INSERT INTO {table_name} (
+                pubkey, user_id, display_name, nprofile, lud16, nip05,
+                picture, relays, metadata_last_checked_at, is_active
+            )
+            VALUES (
+                :pubkey, :user_id, :display_name, :nprofile, :lud16, :nip05,
+                :picture, :relays, :metadata_last_checked_at, 0
+            )
+            ON CONFLICT(pubkey) DO UPDATE SET
+                user_id = excluded.user_id,
+                display_name = COALESCE(excluded.display_name, {table_name}.display_name),
+                nprofile = COALESCE(excluded.nprofile, {table_name}.nprofile),
+                lud16 = COALESCE(excluded.lud16, {table_name}.lud16),
+                nip05 = COALESCE(excluded.nip05, {table_name}.nip05),
+                picture = COALESCE(excluded.picture, {table_name}.picture),
+                relays = COALESCE(excluded.relays, {table_name}.relays),
+                metadata_last_checked_at = COALESCE(excluded.metadata_last_checked_at, {table_name}.metadata_last_checked_at)
+        """
+    else:
+        insert_sql = f"""
+            INSERT INTO {table_name} (pubkey, user_id, is_active)
+            VALUES (:pubkey, :user_id, 0)
+            ON CONFLICT(pubkey) DO UPDATE SET
+                user_id = excluded.user_id
+        """
+
+    for attempt in range(2):
+        try:
+            await db.execute(insert_sql, values)
+            break
+        except Exception as e:
+            err_msg = str(e).lower()
+            if attempt == 0 and any(
+                t in err_msg
+                for t in [
+                    "undefinedtable",
+                    "does not exist",
+                    "no such table",
+                    "no such column",
+                    "undefined column",
+                ]
+            ):
+                await _bootstrap_cyberherd_tables()
+                continue
+            logger.debug(f"ensure_inactive_cyberherd_member failed: {e}")
+            raise
+
+
 async def add_new_active_member(member_data: dict, user_id: str | None = None):
     """Add or update a cyberherd member for a specific user.
     
@@ -1799,6 +1989,83 @@ async def delete_cyberherd_member_by_pubkey(pubkey: str, user_id: str | None = N
         logger.warning(f"Failed to schedule split recompute after member deletion: {e}")
 
 
+async def delete_cyberherd_members_without_lud16(user_id: str | None = None) -> int:
+    """Delete cyberherd members for a user who have no lud16 configured.
+
+    This is intended as a cleanup/maintenance helper. It removes members
+    where lud16 is NULL or empty (regardless of display_name), then recomputes
+    payouts and splits. Since lud16 is required for payouts, these rows are
+    not eligible for distribution.
+
+    Args:
+        user_id: User ID to scope deletions. If None, operation is skipped.
+
+    Returns:
+        Number of members deleted.
+    """
+    if not user_id:
+        logger.warning("delete_cyberherd_members_without_lud16 called without user_id, skipping")
+        return 0
+
+    table = f"{db.references_schema}cyber_herd"
+    # First count matching rows so we can return a stable deleted count.
+    # Treat NULL, empty string, or single '-' (placeholder used by some UIs)
+    # as "no lud16 configured".
+    count_sql = f"""
+        SELECT COUNT(*) AS count
+        FROM {table}
+        WHERE user_id = :user_id
+          AND (
+              lud16 IS NULL
+              OR TRIM(lud16) = ''
+              OR TRIM(lud16) = '-'
+          )
+    """
+    delete_sql = f"""
+        DELETE FROM {table}
+        WHERE user_id = :user_id
+          AND (
+              lud16 IS NULL
+              OR TRIM(lud16) = ''
+              OR TRIM(lud16) = '-'
+          )
+    """
+    params = {"user_id": user_id}
+
+    deleted = 0
+    try:
+        row = await db.fetchone(count_sql, params)
+        if row:
+            try:
+                deleted = int(row.get("count") or 0)
+            except Exception:
+                try:
+                    deleted = int(row["count"])  # type: ignore[index]
+                except Exception:
+                    deleted = 0
+        await db.execute(delete_sql, params)
+    except Exception as e:
+        logger.warning(f"delete_cyberherd_members_without_lud16 failed for user {user_id}: {e}")
+        return 0
+
+    # Recompute payouts and splits after deletions
+    try:
+        await recompute_member_payouts(user_id)
+    except Exception as exc:
+        logger.debug(f"cyberherd: recompute after delete_members_without_lud16 skipped: {exc}")
+
+    try:
+        from .services.splits import schedule_split_recompute  # type: ignore
+        s = await get_settings(user_id)
+        sw = getattr(s, "source_wallet", None)
+        if sw:
+            await schedule_split_recompute(str(sw), user_id=user_id)
+    except Exception as e:
+        logger.warning(f"Failed to schedule split recompute after delete_members_without_lud16: {e}")
+
+    return deleted
+
+
 async def update_cyberherd_member_allocation(pubkey: str, allocation_percentage: float, user_id: str | None = None):
     """Set a member's allocation percentage for a specific user.
     
@@ -1841,7 +2108,7 @@ async def update_cyberherd_member_allocation(pubkey: str, allocation_percentage:
                 s = await get_settings(user_id)
                 sw = getattr(s, "source_wallet", None)
                 if sw:
-                    await update_split_targets_proportional(str(sw))
+                    await update_split_targets_proportional(str(sw), user_id=user_id)
             else:
                 try:
                     logger.debug("cyberherd: update_cyberherd_member_allocation: skipping split recompute (member not eligible and eligible members exist)")

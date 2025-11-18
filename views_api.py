@@ -1557,8 +1557,10 @@ async def api_put_settings(
         logger.warning(f"Failed to signal subscription refresh: {e}")
     # Try recomputing splits if a source wallet is configured
     try:
-        if getattr(settings, 'source_wallet', None):
-            await update_split_targets_proportional(str(getattr(settings, 'source_wallet')))
+        if getattr(settings, "source_wallet", None):
+            await update_split_targets_proportional(
+                str(getattr(settings, "source_wallet")), user_id=user_id
+            )
     except Exception as e:
         logger.warning(f"Failed to recompute splits after settings save: {e}")
     # Include effective pubkey values for immediate UI update
@@ -2008,28 +2010,50 @@ async def api_get_zap_totals(
 @cyberherd_api_router.post("/api/v1/zap_totals/backfill_payments")
 async def api_backfill_zap_totals_from_payments(
     request: Request,
+    pubkey: str | None = Query(None),
     payload: dict | None = None,
     auth=Depends(auth_wallet_or_admin_dep),
 ):
     if not auth or auth.get("type") != "wallet":
         raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED, detail="wallet key required")
-
     user_id = auth["value"].wallet.user  # type: ignore[union-attr]
     payload = payload or {}
-    zapper_pubkey = payload.get("zapper_pubkey")
+    # Allow specifying the zapper via either "zapper_pubkey" (preferred) or "pubkey"
+    # in the JSON body, or via ?pubkey= query parameter.
+    zapper_pubkey = payload.get("zapper_pubkey") or payload.get("pubkey") or pubkey
+
+    # Optional flag: when true, include *all* LNURLp zaps to the herd wallet
+    # (not just those targeting tracked_event_ids) and refresh metadata for
+    # any zapper encountered who is or becomes a cyberherd member.
+    all_zaps_raw = payload.get("all_zaps")
+    all_zaps = False
+    if all_zaps_raw is not None:
+        try:
+            all_zaps = coerce_bool(all_zaps_raw)
+        except Exception:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST, detail="all_zaps must be a boolean"
+            )
+
     batch_size = payload.get("batch_size")
     if batch_size is not None:
         try:
             batch_size = int(batch_size)
         except Exception:
-            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="batch_size must be an integer")
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST, detail="batch_size must be an integer"
+            )
         if batch_size <= 0:
-            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="batch_size must be positive")
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST, detail="batch_size must be positive"
+            )
+
     try:
         stats = await rebuild_zap_totals_from_payments(
             user_id=user_id,
             zapper_pubkey=zapper_pubkey,
             batch_size=batch_size or 250,
+            all_zaps=all_zaps,
         )
         await broadcast_leaderboard_update(user_id)
         return {"rebuild": stats}
@@ -2549,6 +2573,26 @@ async def api_delete_member(
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="delete failed")
 
 
+@cyberherd_api_router.delete("/api/v1/members/prune_without_lud16")
+async def api_delete_members_without_lud16(
+    request: Request,
+    wallet_info: WalletTypeInfo = Depends(require_admin_key),
+):
+    """Delete all cyberherd members for this user who have no lud16 configured.
+
+    This is a maintenance endpoint for cleaning up legacy or incomplete member
+    rows. It only affects the authenticated user's herd and does not emit any
+    notifications.
+    """
+    try:
+        user_id = wallet_info.wallet.user
+        deleted = await crud.delete_cyberherd_members_without_lud16(user_id)
+        return {"ok": True, "deleted": deleted}
+    except Exception as e:
+        logger.warning(f"Cyberherd: prune members without lud16 failed for user {wallet_info.wallet.user}: {e}")
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="prune failed")
+
+
 @cyberherd_api_router.post("/api/v1/members/{pubkey}/activate")
 async def api_activate_member(
     request: Request,
@@ -3037,7 +3081,7 @@ async def api_recompute_splits(request: Request, wallet_info: WalletTypeInfo = D
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="source_wallet not configured")
     try:
         await crud.recompute_member_payouts(user_id)
-        await update_split_targets_proportional(str(getattr(s, 'source_wallet')))
+        await update_split_targets_proportional(str(getattr(s, "source_wallet")), user_id=user_id)
         return {"ok": True}
     except Exception as e:
         logger.warning(f"Cyberherd: recompute_splits failed: {e}")

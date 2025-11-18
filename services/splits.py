@@ -28,13 +28,28 @@ _split_signature_cache: Dict[str, str] = {}
 _pending_recompute: Dict[str, asyncio.Task] = {}
 _RECOMPUTE_DELAY_SEC = 0.75  # debounce window
 
+
 def _compute_signature(members: list[dict], zap_wallet: str | None) -> str:
-    parts = []
+    """Build a compact signature representing the current split-relevant state.
+
+    We include pubkey, amount, lud16, *and* kinds/is_active so that changes in
+    engagement types (e.g. new kind 6/7 events) or activation status cause the
+    signature to change and trigger a real recompute. Previously we only used
+    pubkey/amount/lud16 which could cause recomputes to be skipped when only
+    kinds changed.
+    """
+    parts: list[str] = []
     for m in sorted(members, key=lambda x: (x.get("pubkey") or "")):
-        parts.append(f"{m.get('pubkey')}:{m.get('amount')}:{(m.get('lud16') or '').strip()}")
-    parts.append(f"zap={zap_wallet or ''}")
+        pubkey = (m.get("pubkey") or "").strip().lower()
+        amount = int(m.get("amount") or 0)
+        lud16 = (m.get("lud16") or "").strip().lower()
+        kinds = (m.get("kinds") or "").strip()
+        is_active = int(m.get("is_active") or 0)
+        parts.append(f"{pubkey}:{amount}:{lud16}:{kinds}:{is_active}")
+    parts.append(f"zap={ (zap_wallet or '').strip().lower() }")
     raw = "|".join(parts)
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
 
 async def schedule_split_recompute(source_wallet: str, user_id: str | None = None):
     """Debounce split recomputation for a source_wallet."""
@@ -56,17 +71,19 @@ async def schedule_split_recompute(source_wallet: str, user_id: str | None = Non
     async def _delayed():
         try:
             await asyncio.sleep(_RECOMPUTE_DELAY_SEC)
-            await update_split_targets_proportional(source_wallet)
+            await update_split_targets_proportional(source_wallet, user_id=user_id)
         except Exception as e:
             logger.debug(f"schedule_split_recompute failed: {e}")
         finally:
             _pending_recompute.pop(source_wallet, None)
+
     _pending_recompute[source_wallet] = asyncio.create_task(_delayed())
 
 
 
 async def update_split_targets_proportional(
     source_wallet: str,
+    user_id: str | None = None,
 ) -> dict[str, list[dict[str, str | float | None]]]:
     """Compute proportional split targets from active CyberHerd members and update
     SplitPayments.
@@ -78,21 +95,25 @@ async def update_split_targets_proportional(
     is configured and no eligible members exist, clear split targets.
     """
     try:
-        settings = await crud.get_settings_for_source_wallet(source_wallet)
-        user_id = getattr(settings, "user_id", None)
-        if not user_id:
-            logger.warning(
-                f"update_split_targets_proportional: no user_id found for source_wallet {source_wallet}, skipping recompute"
-            )
-            return {"targets": []}
-        settings = await crud.get_settings(user_id)
+        resolved_user_id = user_id
+        if resolved_user_id:
+            settings = await crud.get_settings(resolved_user_id)
+        else:
+            settings = await crud.get_settings_for_source_wallet(source_wallet)
+            resolved_user_id = getattr(settings, "user_id", None)
+            if not resolved_user_id:
+                logger.warning(
+                    f"update_split_targets_proportional: no user_id found for source_wallet {source_wallet}, skipping recompute"
+                )
+                return {"targets": []}
+            settings = await crud.get_settings(resolved_user_id)
     except Exception:
         logger.warning(
             f"update_split_targets_proportional: failed to resolve settings for source_wallet {source_wallet}"
         )
         return {"targets": []}
 
-    members = await crud.get_active_cyberherd_members(user_id)
+    members = await crud.get_active_cyberherd_members(resolved_user_id)
     zap_wallet = getattr(settings, "zap_wallet", None)
     zap_wallet_alias = getattr(settings, "zap_wallet_alias", None) or "Zap Wallet"
     member_total = 10 if zap_wallet else 100

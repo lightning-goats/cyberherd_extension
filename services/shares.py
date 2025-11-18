@@ -170,6 +170,8 @@ def compute_member_share_percentages(
     total_with_kind = len(kind_67_only) + len(zappers_with_kind)
 
     if total_with_kind == 0:
+        # No kind 6/7 activity at all: entire member_total is distributed
+        # proportionally by zap amount.
         all_zappers = [record for record in active_records if record["amount"] > 0]
         if all_zappers:
             weights = [record["amount"] for record in all_zappers]
@@ -178,7 +180,17 @@ def compute_member_share_percentages(
                 shares[record["pubkey"]] = pct
         return shares
 
-    kind67_bonus_total = min(safe_total, 1)
+    # Allocate at most 1 percentage point of the overall split pool (i.e. 1% of
+    # the SplitPayments distribution) to the kind 6/7 bonus, regardless of the
+    # size of `member_total`. The remaining portion is distributed purely based
+    # on zap amounts.
+    #
+    # For the standard configuration (zap wallet present) `member_total` is 10,
+    # so kind 6/7 events collectively receive up to 1% of the *overall* payout
+    # (1 out of 100 percentage points), with the other 9% of the member pool
+    # allocated proportionally by zap amounts.
+    bonus_from_pool = max(1, safe_total // 100)
+    kind67_bonus_total = min(safe_total, bonus_from_pool)
     zap_distribution_total = max(0, safe_total - kind67_bonus_total)
 
     kind67_members = kind_67_only + zappers_with_kind
@@ -198,6 +210,62 @@ def compute_member_share_percentages(
         zap_percents = _proportional_percentages(weights, total=zap_distribution_total)
         for record, pct in zip(all_zappers, zap_percents):
             shares[record["pubkey"]] = shares.get(record["pubkey"], 0) + pct
+
+    # Enforce a minimum of 1 percentage point for any active member who
+    # meaningfully participates in the pool (has zap amount > 0 or a kind 6/7
+    # engagement), since SplitPayments only accepts whole percentages. We keep
+    # the overall sum at `safe_total` by shaving points from members with the
+    # largest shares.
+    try:
+        total_assigned = sum(max(0, int(v or 0)) for v in shares.values())
+        if total_assigned > 0 and safe_total > 0:
+            # Eligible members: active with either zap amount or kind 6/7
+            eligible_pubkeys: List[str] = []
+            for record in active_records:
+                if record["amount"] > 0 or record["has_kind_67"]:
+                    eligible_pubkeys.append(record["pubkey"])
+            # Deduplicate while preserving order
+            seen: Set[str] = set()
+            eligible_pubkeys = [
+                pk for pk in eligible_pubkeys
+                if not (pk in seen or seen.add(pk))
+            ]
+
+            if eligible_pubkeys and len(eligible_pubkeys) <= safe_total:
+                to_boost = [pk for pk in eligible_pubkeys if shares.get(pk, 0) == 0]
+                if to_boost:
+                    extra_needed = len(to_boost)
+                    # First, grant +1 to each zero-share eligible member
+                    for pk in to_boost:
+                        shares[pk] = shares.get(pk, 0) + 1
+                    # Recompute total and required trimming
+                    trim_needed = (total_assigned + extra_needed) - safe_total
+                    if trim_needed > 0:
+                        # Donors: members not just boosted and currently >1
+                        donors: List[str] = [
+                            pk for pk, pct in shares.items()
+                            if pk not in to_boost and pct > 1
+                        ]
+                        # Check that we have enough capacity to trim without
+                        # driving any donor below 1.
+                        capacity = sum(shares[pk] - 1 for pk in donors)
+                        if capacity >= trim_needed and donors:
+                            donors_sorted = sorted(
+                                donors, key=lambda pk: shares[pk], reverse=True
+                            )
+                            idx = 0
+                            while trim_needed > 0 and donors_sorted:
+                                pk = donors_sorted[idx]
+                                if shares[pk] > 1:
+                                    shares[pk] -= 1
+                                    trim_needed -= 1
+                                idx = (idx + 1) % len(donors_sorted)
+                        # If capacity is insufficient, we leave the original
+                        # distribution unchanged to avoid negative or zero sums.
+                        # (Given typical herd sizes, this should be rare.)
+    except Exception:
+        # Never let safety adjustments break share computation.
+        pass
 
     return shares
 

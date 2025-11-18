@@ -1629,7 +1629,7 @@ class EnhancedHeadbuttService:
                 # Also perform an immediate recompute so SplitPayments reflects
                 # this change right away in most UIs.
                 try:
-                    await update_split_targets_proportional(str(source_wallet))
+                    await update_split_targets_proportional(str(source_wallet), user_id=self.user_id)
                 except Exception as ie:
                     try:
                         logger.debug(f"cyberherd: immediate split recompute failed: {ie}")
@@ -2056,7 +2056,7 @@ class EnhancedHeadbuttService:
                 s = await self.db.get_settings(self.user_id)
                 sw = getattr(s, 'source_wallet', None)
                 if sw:
-                    await update_split_targets_proportional(str(sw))
+                    await update_split_targets_proportional(str(sw), user_id=self.user_id)
             except Exception:
                 pass
             

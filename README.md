@@ -165,10 +165,20 @@ Get zap totals for a specific zapper (contributor).
 
 #### `POST /api/v1/zap_totals/backfill_payments`
 
-Rebuild zap totals by scanning the herd wallet's LNbits payments (instead of relay data).
+Rebuild zap totals for CyberHerd contributors by scanning the herd wallet's LNbits payments.
 
 **Auth:** Wallet or admin key  
-**Body (optional):** `{"zapper_pubkey": "<hex>", "batch_size": 250}`  
+**Body (optional):**
+
+- Targeted (single zapper):  
+  `{"zapper_pubkey": "<hex>", "batch_size": 250}`  
+  You may also use `{"pubkey": "<hex>"}` or the query parameter `?pubkey=<hex>` as a shorthand; when provided, only payments for that zapper pubkey are backfilled.
+
+- Full rebuild (all zaps, refresh metadata):  
+  `{"all_zaps": true, "batch_size": 250}`  
+  When `all_zaps` is true, all LNURLp zaps to the herd wallet are counted (not just those targeting tracked notes), and metadata is refreshed for any zapper encountered who is or becomes a CyberHerd member (auto-added as inactive, no notifications).
+
+By default (when `all_zaps` is false or omitted), only zaps whose Nostr zap request targets a CyberHerd-tracked event (any matching tagged note in `tracked_event_ids`) are counted, and new zappers discovered via these payments are auto-added as inactive members (no notifications).  
 **Returns:** Rebuild statistics (`payments_scanned`, `zap_candidates`, `zappers_updated`, etc.)
 
 #### `GET /api/v1/leaderboard`
@@ -181,6 +191,15 @@ Public leaderboard data for a CyberHerd user.
 > Tip: A static leaderboard page is available at `/cyberherd/static/leaderboard/<EffectivePubkey>`.  
 > It streams updates over the extension’s own websocket feed (`/cyberherd/ws/leaderboard/<pubkey>`), so no wallet keys or user IDs are exposed.  
 > When LNbits is proxied behind a different host/port, you can override the websocket target via `lnbits_host`, `lnbits_port`, or `lnbits_scheme` (e.g., `/cyberherd/static/leaderboard/<pubkey>?lnbits_host=lnbits&lnbits_port=5000&lnbits_scheme=wss`).
+
+#### `DELETE /api/v1/members/prune_without_lud16`
+
+Delete all CyberHerd members for the authenticated user who do not have a `lud16` configured (where `lud16` is NULL or empty). Members without a lud16 are not eligible for payouts.
+
+**Auth:** Admin key (wallet admin key)  
+**Returns:** `{"ok": true, "deleted": <count>}`  
+
+After pruning, member payouts and split targets are recomputed for the remaining members.
 
 ### Operations
 

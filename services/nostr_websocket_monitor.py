@@ -79,6 +79,10 @@ class NostrWebSocketMonitor:
         
         logger.debug(f"🔌 NostrWebSocketMonitor created for user {user_id}")
     
+    def _is_shutting_down(self) -> bool:
+        """Return True if the monitor (or LNbits) is shutting down."""
+        return self.shutdown or not settings.lnbits_running
+    
     async def start(self):
         """Start the monitor (WebSocket connection only).
         
@@ -164,11 +168,14 @@ class NostrWebSocketMonitor:
         self.subscription_counter += 1
         return sub_id
     
-    async def _wait_for_connection(self):
-        """Wait until WebSocket is connected."""
+    async def _wait_for_connection(self, timeout: int = 60 * 2):
+        """Wait until WebSocket is connected or timeout/shutdown occurs."""
+        start = time.time()
         while not self.connected:
-            if self.shutdown:
+            if self._is_shutting_down():
                 raise Exception("Monitor is shutting down")
+            if time.time() - start > timeout:
+                raise Exception("Connection timeout, cannot connect to nostr relay")
             await asyncio.sleep(0.5)
     
     async def _send(self, data: list[Any]):
@@ -179,7 +186,7 @@ class NostrWebSocketMonitor:
         """
         if not self.ws:
             raise Exception("WebSocket not connected")
-        if self.shutdown:
+        if self._is_shutting_down():
             logger.warning(f"User {self.user_id}: Trying to send while shutting down")
             return
         
@@ -221,7 +228,7 @@ class NostrWebSocketMonitor:
         following the spirit of the NWC subscription handling pattern.
         """
         try:
-            while not self.shutdown:
+            while not self._is_shutting_down():
                 await asyncio.sleep(int(self.subscription_timeout * 0.5))
 
                 # Skip checks while disconnected
@@ -603,7 +610,7 @@ class NostrWebSocketMonitor:
         
         logger.debug(f"User {self.user_id}: Connecting to relay {self.relay}")
         
-        while not self.shutdown:
+        while not self._is_shutting_down():
             try:
                 logger.debug(f"User {self.user_id}: Creating WebSocket connection...")
                 
@@ -617,7 +624,7 @@ class NostrWebSocketMonitor:
                     await self._on_connection()
                     
                     # Message loop
-                    while not self.shutdown:
+                    while not self._is_shutting_down():
                         try:
                             message = await ws.recv()
                             if isinstance(message, bytes):
@@ -636,7 +643,7 @@ class NostrWebSocketMonitor:
             # Mark as disconnected
             self.connected = False
             
-            if not self.shutdown:
+            if not self._is_shutting_down():
                 # Wait before reconnecting
                 logger.debug(f"User {self.user_id}: Reconnecting in 5 seconds...")
                 await asyncio.sleep(5)

@@ -108,7 +108,17 @@ def _coerce_extra_dict(extra: Any) -> dict | None:
 
 
 def _extract_zap_from_payment(payment: Any) -> dict | None:
-    """Return zap metadata (zapper, amount, timestamp, ids) from LNbits payment row."""
+    """Return zap metadata (zapper, amount, timestamp, ids) from LNbits payment row.
+
+    The LNbits payment.extra["nostr"] field is expected to contain a NIP-57
+    zap request (kind 9734). We extract:
+    - zapper pubkey
+    - target pubkey (p-tag)
+    - target note id (e-tag) when present
+    - amount in sats (from payment.amount msat)
+    - created_at (from payment.time)
+    - event_id (payment_hash/checking_id)
+    """
     try:
         amount_msat = int(getattr(payment, "amount", 0) or 0)
     except Exception:
@@ -148,15 +158,23 @@ def _extract_zap_from_payment(payment: Any) -> dict | None:
 
     tags = nostr_payload.get("tags") or []
     target_pubkey = None
+    target_note_id: Optional[str] = None
     for tag in tags:
-        if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "p":
-            candidate = tag[1]
-            if isinstance(candidate, str):
-                try:
-                    target_pubkey = _normalise_pubkey(candidate)
-                except ZapTotalsError:
-                    target_pubkey = None
-            break
+        if not (isinstance(tag, list) and len(tag) >= 2):
+            continue
+        marker = tag[0]
+        value = tag[1]
+        if marker == "p" and isinstance(value, str) and target_pubkey is None:
+            candidate = value
+            try:
+                target_pubkey = _normalise_pubkey(candidate)
+            except ZapTotalsError:
+                target_pubkey = None
+        elif marker == "e" and isinstance(value, str) and target_note_id is None:
+            try:
+                target_note_id = value.strip().lower()
+            except Exception:
+                target_note_id = None
 
     created_at = None
     try:
@@ -175,6 +193,7 @@ def _extract_zap_from_payment(payment: Any) -> dict | None:
     return {
         "zapper": zapper,
         "target_pubkey": target_pubkey,
+        "target_note_id": target_note_id,
         "amount_sats": amount_msat // 1000,
         "created_at": created_at,
         "event_id": event_id,
@@ -499,6 +518,7 @@ async def rebuild_zap_totals_from_payments(
     user_id: str,
     zapper_pubkey: str | None = None,
     batch_size: int = 250,
+    all_zaps: bool = False,
 ) -> dict:
     """Scan LNbits payments for the herd wallet and rebuild zap totals.
 
@@ -514,6 +534,12 @@ async def rebuild_zap_totals_from_payments(
     herd_wallet = getattr(settings, "herd_wallet", None)
     if not herd_wallet:
         raise ZapTotalsError("herd wallet not configured")
+    # tracked_event_ids contains all notes that matched the configured tags
+    # (manual + automatic). By default we only count zaps that target these
+    # tracked notes. When all_zaps=True, this filter is disabled and *all*
+    # LNURLp zaps to the herd wallet are included.
+    tracked_notes = set(getattr(settings, "tracked_event_ids", []) or [])
+
     watch_pubkey = resolve_effective_pubkey(settings)
     if not watch_pubkey:
         raise ZapTotalsError("Effective watch pubkey is not configured")
@@ -529,13 +555,30 @@ async def rebuild_zap_totals_from_payments(
         for m in members
         if isinstance(m.get("pubkey"), str)
     }
+    # If a specific zapper is requested but not yet in the herd, create (or
+    # refresh) an inactive member with up-to-date metadata so historical
+    # contributors are tracked and fully enriched.
     if zapper_filter and zapper_filter not in member_pks:
-        raise ZapTotalsError("zapper is not a cyberherd member")
+        try:
+            await crud.ensure_inactive_cyberherd_member(
+                zapper_filter,
+                user_id=user_id,
+                refresh_metadata=True,
+            )
+            member_pks.add(zapper_filter)
+        except Exception as exc:
+            logger.debug(
+                f"zap_totals: failed to ensure inactive member for {zapper_filter[:8]}...: {exc}"
+            )
 
     aggregates: dict[str, dict[str, Any]] = {}
     payments_scanned = 0
     zap_candidates = 0
     offset = 0
+
+    # Track which zappers we've already ensured/metadata-refreshed in this run
+    # to avoid repeated metadata lookups when all_zaps is True.
+    touched_zappers: set[str] = set()
 
     while True:
         filters = Filters(
@@ -559,10 +602,49 @@ async def rebuild_zap_totals_from_payments(
             if not zap:
                 continue
             zapper = zap["zapper"]
+            target_note_id = zap.get("target_note_id")
+
+            # When tracked notes exist, restrict to zaps that target those notes,
+            # unless all_zaps=True (full rebuild over all zaps).
+            if tracked_notes and not all_zaps:
+                if not isinstance(target_note_id, str) or target_note_id not in tracked_notes:
+                    continue
+
             if zapper_filter and zapper != zapper_filter:
                 continue
-            if zapper not in member_pks:
-                continue
+
+            # Ensure zapper is represented as a cyberherd member. In normal
+            # mode we only auto-enrol missing members with minimal metadata.
+            # When all_zaps=True we also refresh metadata for existing members
+            # so their profiles are up to date.
+            if all_zaps:
+                if zapper not in touched_zappers:
+                    try:
+                        await crud.ensure_inactive_cyberherd_member(
+                            zapper,
+                            user_id=user_id,
+                            refresh_metadata=True,
+                        )
+                        member_pks.add(zapper)
+                    except Exception as exc:
+                        logger.debug(
+                            f"zap_totals: failed to ensure/refresh member for {zapper[:8]}...: {exc}"
+                        )
+                        # If we cannot ensure the member row, still allow
+                        # zap_totals aggregation to proceed.
+                    touched_zappers.add(zapper)
+            else:
+                if zapper not in member_pks:
+                    try:
+                        await crud.ensure_inactive_cyberherd_member(zapper, user_id=user_id)
+                        member_pks.add(zapper)
+                    except Exception as exc:
+                        logger.debug(
+                            f"zap_totals: failed to ensure inactive member for {zapper[:8]}...: {exc}"
+                        )
+                        # If we cannot create the member row, skip this zapper to
+                        # keep behaviour consistent with previous member-only logic.
+                        continue
             amount_sats = int(zap.get("amount_sats") or 0)
             if amount_sats <= 0:
                 continue
