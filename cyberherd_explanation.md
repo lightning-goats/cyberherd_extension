@@ -33,8 +33,8 @@ Members can join the CyberHerd without zapping by reposting or reacting to TODAY
 ### Repost (Kind 6) and Reaction (Kind 7) Rules:
 - **Free entry when slots available**: If the herd has open slots, reposts and reactions can join without paying
 - **TODAY'S note requirement**: Must repost or react to the current day's #CyberHerd note (older notes invalid)
-- **1% payout allocation shared**: The 1% bonus is split evenly among ALL members with kind 6 or kind 7 events (or both). If 2 members have kind 6/7, each receives 0.5% of the member allocation
-- **Bonus for zappers**: Members who have zaps AND kind 6/7 events receive their proportional zap share PLUS their share of the 1% bonus
+- **1% payout allocation (max per user)**: Members with kind 6 OR kind 7 (or both) share a 1% bonus pool evenly. Having both kind 6 AND kind 7 does NOT give double bonus - maximum 1% per user regardless of how many engagement types
+- **Bonus for zappers**: Members who have zaps AND kind 6/7 events receive their proportional zap share (from the 9% zap pool) PLUS their share of the 1% bonus pool
 - **Valid requirements**: NIP-05 identifier (configurable, can be disabled) and Lightning address required
 - **Vulnerable to displacement**: Any zap (even 1 sat) will displace repost/reaction-only members first
 - **Repost headbutting (kind 6)**: Reposts CAN headbutt other repost-only or reaction-only members (amount=0) when the herd is full
@@ -87,7 +87,7 @@ When the Lightning Goats feeder activates (around 850 sats), payments are automa
 
 - **Zaps of 10+ sats count for payouts** - Members receive proportional share based on zap amount
 - **Kind 6/7 members receive 1%** - Members with reposts or reactions (even without zaps) receive 1% of the member allocation
-- **Zapper bonus** - Members who have BOTH zaps AND kind 6/7 events receive their proportional zap share PLUS 1% bonus
+- **Zapper bonus** - Members who have BOTH zaps AND kind 6/7 events receive their proportional zap share PLUS their share of the 1% bonus pool
 - **Only Lightning Goats content** - Zaps to other people's notes don't count
 - **Payments when feeder triggers** - You don't get paid immediately, but when the feeder activates
 - **Bigger contributions = bigger share** - The more you've zapped, the larger your piece of the available allocation
@@ -132,31 +132,40 @@ Here's how your share gets calculated:
 - Feeder triggers with 5,000 sats
 - Your share: ~150 sats sent directly to your Lightning address (based on your contribution ratio)
 
-**Example 4 - Repost/reaction member receives full 1%:**
+**Example 4 - Repost member receives share of 1% bonus:**
 - Herd members: [Repost only (0 sats), Zap (300 sats), Zap (700 sats)]
 - Feeder triggers with 10,000 sats → 1,000 sats to CyberHerd (10%)
-- Kind 6/7 bonus pool: 1% = 10 sats total (only repost member qualifies)
-- Zap distribution pool: 99% = 990 sats
-- Repost member: 10 sats (full 1% bonus, sole kind 6/7 member)
+- Kind 6/7 bonus pool: 1% = 10 sats (only repost member qualifies, gets full 1%)
+- Zap distribution pool: 9% = 990 sats
+- Repost member: 10 sats (full 1% bonus)
 - Zap member 1: 297 sats (300/1000 * 990)
 - Zap member 2: 693 sats (700/1000 * 990)
 
-**Example 5 - Zapper with kind 6/7 bonus:**
+**Example 5 - Zapper with kind 6 bonus:**
 - Herd members: [Zap+Repost (500 sats, has kind 6), Zap only (300 sats), Zap only (200 sats)]
 - Feeder triggers with 10,000 sats → 1,000 sats to CyberHerd (10%)
-- Kind 6/7 bonus pool: 1% = 10 sats (goes to sole member with kind 6)
-- Zap distribution pool: 99% = 990 sats shared proportionally among all zappers
+- Kind 6/7 bonus pool: 1% = 10 sats (goes to sole member with engagement)
+- Zap distribution pool: 9% = 990 sats shared proportionally among all zappers
 - Member 1 (500 sats + kind 6): 505 sats (500/1000 * 990 + 10 bonus)
 - Member 2 (300 sats): 297 sats (300/1000 * 990)
 - Member 3 (200 sats): 198 sats (200/1000 * 990)
 
-**Example 6 - Multiple members with kind 6/7 share bonus:**
+**Example 6 - Multiple members share the 1% bonus:**
 - Herd members: [Zap+Repost (400 sats, has kind 6), Zap+React (400 sats, has kind 7), Zap only (200 sats)]
 - Feeder triggers with 10,000 sats → 1,000 sats to CyberHerd (10%)
 - Kind 6/7 bonus pool: 1% = 10 sats split between 2 members = 5 sats each
-- Zap distribution pool: 99% = 990 sats shared proportionally among all zappers
+- Zap distribution pool: 9% = 990 sats shared proportionally among all zappers
 - Member 1 (400 sats + kind 6): 401 sats (400/1000 * 990 + 5 bonus)
 - Member 2 (400 sats + kind 7): 401 sats (400/1000 * 990 + 5 bonus)
+- Member 3 (200 sats): 198 sats (200/1000 * 990)
+
+**Example 7 - Member with BOTH kind 6 AND kind 7 (still max 1% bonus):**
+- Herd members: [Zap+Repost+React (600 sats, has kind 6+7), Zap only (200 sats), Zap only (200 sats)]
+- Feeder triggers with 10,000 sats → 1,000 sats to CyberHerd (10%)
+- Kind 6/7 bonus pool: 1% = 10 sats (sole member with engagement, gets full 1%)
+- Zap distribution pool: 9% = 990 sats shared proportionally among all zappers
+- Member 1 (600 sats + kind 6+7): 604 sats (600/1000 * 990 + 10 bonus)
+- Member 2 (200 sats): 198 sats (200/1000 * 990)
 - Member 3 (200 sats): 198 sats (200/1000 * 990)
 
 ## The ⚡Headbutting⚡ Mechanism
@@ -283,8 +292,8 @@ The CyberHerd works automatically behind the scenes:
 - **Zap priority**: Zaps always displace repost/reaction-only members first before competing with other zaps
 - **Repost headbutting**: Reposts (kind 6) can displace repost-only or reaction-only members (amount=0)
 - **Reaction limitation**: Reactions (kind 7) cannot headbutt - can only join when open slots available
-- **Kind 6/7 allocation**: The 1% bonus pool is split evenly among all members with kind 6 or 7 events (or both)
+- **Kind 6/7 allocation**: The 1% bonus pool is split evenly among all members with kind 6 OR 7 events. Having both does not double the bonus
 - **Zapper bonus**: Members with zaps AND kind 6/7 events receive proportional zap share PLUS their share of 1% bonus
 - **Headbutt consequences**: Getting headbutted resets your accumulated payout score to zero
 - **Feeder-triggered payouts**: Payments sent when feeder activates (threshold configurable, typically ~850 sats), not immediately
-- **90/10 split**: 90% feeds goats, 10% distributed among CyberHerd members (99% of member allocation zap-based, 1% kind 6/7 bonus)
+- **90/10 split**: 90% feeds goats, 10% distributed among CyberHerd members (9% of member allocation zap-based, 1% kind 6/7 shared bonus)

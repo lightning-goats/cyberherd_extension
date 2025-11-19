@@ -434,36 +434,18 @@ class NostrWebSocketMonitor:
             else:
                 logger.debug(f"User {self.user_id}: No effective pubkey, skipping note subscription")
             
-            # 3) Subscribe to zap receipts (kind 9735) addressed to our effective pubkey
-            #    Note: Existing members can zap ANY Lightning Goats note (not only tracked notes)
-            #    to increase their totals per CyberHerd rules. Therefore, we subscribe broadly
-            #    by recipient pubkey only, not filtering by #e. New-member admission rules
-            #    are enforced downstream in headbutt (requires today's tracked note).
+            # 3) Zap receipts (kind 9735) subscription intentionally DISABLED
+            # Previously we created a broad subscription for kind 9735 addressed to
+            # the user's effective pubkey. To avoid relying on nostr zap receipts
+            # over WebSocket (and to prefer payment-based/fallback recovery paths),
+            # we no longer create real-time 9735 subscriptions here. Zap receipts
+            # are still processed when discovered via recovery queries or payment
+            # coordinator flows.
             if effective_pubkey:
-                try:
-                    sub_id = self._get_new_subid()
-                    filter_dict = {
-                        "kinds": [9735],
-                        "#p": [effective_pubkey],
-                        "since": int(time.time()),
-                    }
-                    await self._send(["REQ", sub_id, filter_dict])
-                    self.subscriptions[sub_id] = {
-                        "type": "zap_receipts",
-                        "filter": filter_dict,
-                        "created_at": time.time(),
-                        "handshake_completed": False,
-                        "last_event_at": None,
-                        "closed": False,
-                    }
-                    logger.debug(
-                        f"✅ User {self.user_id}: Created zap receipts subscription (kind 9735) "
-                        f"for effective pubkey {effective_pubkey[:8]}... (sub_id: {sub_id})"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"User {self.user_id}: Failed to create 9735 subscription: {e}"
-                    )
+                logger.debug(
+                    f"User {self.user_id}: Zap receipts (kind 9735) subscriptions are disabled; "
+                    f"skipping creation for effective pubkey {effective_pubkey[:8]}..."
+                )
 
             logger.debug(f"✅ User {self.user_id}: Created {len(self.subscriptions)} subscriptions")
         
@@ -599,6 +581,16 @@ class NostrWebSocketMonitor:
         """
         logger.debug(f"User {self.user_id}: WebSocket connected, subscribing...")
         await self._subscribe_to_tracked_notes()
+        
+        # Trigger recovery of missed events (notes, zaps, engagements)
+        # This ensures that if we were disconnected, we catch up on what we missed
+        try:
+            from .subscriptions import force_requery_for_user
+            logger.info(f"User {self.user_id}: Triggering forced recovery after connection established")
+            # Run in background to not block the websocket loop
+            asyncio.create_task(force_requery_for_user(self.app, self.user_id))
+        except Exception as e:
+            logger.warning(f"User {self.user_id}: Failed to trigger recovery on connect: {e}")
     
     async def _connect_to_relay(self):
         """Connect to nostrclient relay and handle messages.

@@ -116,7 +116,9 @@ async def update_split_targets_proportional(
     members = await crud.get_active_cyberherd_members(resolved_user_id)
     zap_wallet = getattr(settings, "zap_wallet", None)
     zap_wallet_alias = getattr(settings, "zap_wallet_alias", None) or "Zap Wallet"
-    member_total = 10 if zap_wallet else 100
+    # Use configured member allocation percentage, default to 10 if zap wallet present, 100 otherwise
+    member_allocation_percent = getattr(settings, "member_allocation_percent", 10 if zap_wallet else 100)
+    member_total = member_allocation_percent if zap_wallet else 100
 
     signature = _compute_signature(members, zap_wallet)
     prev_sig = _split_signature_cache.get(source_wallet)
@@ -166,12 +168,13 @@ async def update_split_targets_proportional(
 
     targets: list[Target] = []
     if zap_wallet:
+        zap_wallet_percent = 100 - member_allocation_percent
         targets.append(
             Target(
                 id=urlsafe_short_hash(),
                 wallet=zap_wallet,
                 source=source_wallet,
-                percent=90,
+                percent=zap_wallet_percent,
                 alias=zap_wallet_alias,
             )
         )

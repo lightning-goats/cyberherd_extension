@@ -23,6 +23,9 @@ from loguru import logger
 
 from .. import crud
 from ..utils.common import utc_now_timestamp  # Centralized UTC timestamp function
+from .pubkey import resolve_effective_pubkey
+from .note_metadata import apply_event_address
+from .headbutt import trigger_headbutt_from_zap
 
 # Simplified payment monitoring: this service no longer registers its own
 # invoice listener. A single central listener is registered in
@@ -237,10 +240,10 @@ class PaymentCoordinatorService:
     async def _process_payment_for_zap(self, payment):
         """Process a payment notification to detect LNURLp zaps.
         
-        This method previously parsed payment.extra["nostr"] for NIP-57 zap
-        requests. Payment-based zap detection has been disabled in favour of
-        Nostr kind 9735 subscriptions. This method is retained for tests/admin
-        tooling but is not called from the live invoice listener.
+        This method parses payment.extra["nostr"] for NIP-57 zap requests
+        and processes them as a FALLBACK when kind 9735 WebSocket monitoring
+        misses zaps. Primary zap detection is via Nostr kind 9735 subscriptions,
+        but this provides recovery for payments that have zap request data.
         
         IMPORTANT: Only processes zaps for TODAY's tracked notes. This enforces
         the rule that zaps are only valid for the current day's CyberHerd notes.
@@ -353,8 +356,9 @@ class PaymentCoordinatorService:
                     # Best-effort; do not fail if assignment fails
                     pass
             
-            # Payment-based zap detection disabled
-            return False
+            if not zap_request:
+                # No zap request found in payment data
+                return False
             
             # Extract zapper pubkey
             zapper_pubkey = zap_request.get("pubkey")
@@ -595,6 +599,46 @@ class PaymentCoordinatorService:
                 )
                 self.last_error = None
                 return True
+            
+            # Trigger headbutt admission for zap
+            try:
+                result = await trigger_headbutt_from_zap(
+                    user_id=cast(str, self.user_id),
+                    pubkey=zapper_pubkey,
+                    amount_sats=amount_sats,
+                    note_id=target_note_id or "",
+                    event_id=event_id or "",
+                    app=self.app,
+                )
+            except Exception as e:
+                logger.error(f"Error triggering headbutt from payment-based zap: {e}")
+                result = None
+            
+            if result:
+                # Mark payment as processed to prevent duplicates
+                try:
+                    if event_id:
+                        await crud.register_processed_event(
+                            cast(str, self.user_id),
+                            event_id,
+                            "payment_zap"
+                        )
+                        logger.debug(f"Registered payment {event_id[:16]}... as processed")
+                except Exception as e:
+                    logger.warning(f"Failed to register processed payment: {e}")
+                
+                self.last_zap_at = int(time.time())
+                logger.info(
+                    f"✅ Payment-based zap processed: {amount_sats} sats from {zapper_pubkey[:8]}... "
+                    f"to note {target_note_id[:8]}..."
+                )
+                return True
+            else:
+                logger.warning(
+                    f"Headbutt processing returned no result for payment zap: "
+                    f"{amount_sats} sats from {zapper_pubkey[:8]}..."
+                )
+                return False
             
         except Exception as e:
             logger.error(f"Error processing payment for zap: {e}")

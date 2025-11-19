@@ -149,8 +149,9 @@ async def process_incoming_payment(payment: Any, app: Any | None = None) -> None
     """Dispatcher invoked by invoice listener for LNbits payments.
 
     Note:
-    - Payment-based zap detection is disabled (zaps are processed via Nostr kind 9735).
-    - We still use payment events to trigger automatic splits when configured.
+    - Payment-based zap detection is enabled as a realtime path for immediate processing.
+    - Kind 9735 Nostr subscriptions provide the primary detection path.
+    - This payment-based path acts as immediate fallback before kind 9735 arrives.
     """
     try:
         wallet_id = getattr(payment, "wallet_id", None)
@@ -191,8 +192,17 @@ async def process_incoming_payment(payment: Any, app: Any | None = None) -> None
         except Exception:
             pass
 
-        # Always trigger splits checks on any payment to the herd wallet
+        # Get monitor to access zap processing
         monitor = get_zap_monitor(app=app, db=crud_module, user_id=user_id)
+        
+        # Process payment for zap (realtime detection)
+        try:
+            await monitor._process_payment_for_zap(payment)
+            logger.debug("CyberHerd: payment zap processing completed for user %s", str(user_id)[:8])
+        except Exception as exc:
+            logger.debug(f"CyberHerd: payment zap processing skipped or failed: {exc}")
+
+        # Always trigger splits checks on any payment to the herd wallet
         try:
             await monitor._check_and_trigger_splits(payment)
             logger.debug("CyberHerd: splits check completed for user %s", str(user_id)[:8])

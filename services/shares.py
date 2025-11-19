@@ -144,32 +144,27 @@ def compute_member_share_percentages(
         amount = max(0, amount)
 
         kinds_set = _parse_kinds(raw.get("kinds"))
-        has_kind_67 = 6 in kinds_set or 7 in kinds_set
+        has_kind_6 = 6 in kinds_set
+        has_kind_7 = 7 in kinds_set
 
         active_records.append(
             {
                 "pubkey": pubkey,
                 "amount": amount,
-                "has_kind_67": has_kind_67,
+                "has_kind_6": has_kind_6,
+                "has_kind_7": has_kind_7,
             }
         )
 
     if safe_total <= 0 or not active_records:
         return shares
 
-    kind_67_only = [
-        record for record in active_records if record["amount"] == 0 and record["has_kind_67"]
-    ]
-    zappers_with_kind = [
-        record for record in active_records if record["amount"] > 0 and record["has_kind_67"]
-    ]
-    zappers_only = [
-        record for record in active_records if record["amount"] > 0 and not record["has_kind_67"]
-    ]
+    # Check if any kind 6 or kind 7 activity exists
+    has_any_kind67 = any(
+        record["has_kind_6" ] or record["has_kind_7"] for record in active_records
+    )
 
-    total_with_kind = len(kind_67_only) + len(zappers_with_kind)
-
-    if total_with_kind == 0:
+    if not has_any_kind67:
         # No kind 6/7 activity at all: entire member_total is distributed
         # proportionally by zap amount.
         all_zappers = [record for record in active_records if record["amount"] > 0]
@@ -180,36 +175,19 @@ def compute_member_share_percentages(
                 shares[record["pubkey"]] = pct
         return shares
 
-    # Allocate at most 1 percentage point of the overall split pool (i.e. 1% of
-    # the SplitPayments distribution) to the kind 6/7 bonus, regardless of the
-    # size of `member_total`. The remaining portion is distributed purely based
-    # on zap amounts.
-    #
-    # For the standard configuration (zap wallet present) `member_total` is 10,
-    # so kind 6/7 events collectively receive up to 1% of the *overall* payout
-    # (1 out of 100 percentage points), with the other 9% of the member pool
-    # allocated proportionally by zap amounts.
-    bonus_from_pool = max(1, safe_total // 100)
-    kind67_bonus_total = min(safe_total, bonus_from_pool)
-    zap_distribution_total = max(0, safe_total - kind67_bonus_total)
-
-    kind67_members = kind_67_only + zappers_with_kind
-    bonus_distribution = []
-    if kind67_members and kind67_bonus_total > 0:
-        bonus_distribution = _proportional_percentages(
-            [1] * len(kind67_members), total=kind67_bonus_total
-        )
-
-    for record, bonus_pct in zip(kind67_members, bonus_distribution):
-        if bonus_pct > 0:
-            shares[record["pubkey"]] = shares.get(record["pubkey"], 0) + bonus_pct
-
+    # No separate engagement bonus allocation needed - the minimum enforcement
+    # logic below (lines 214-268) already ensures that any member with engagement
+    # (kind 6 or kind 7) gets at least 1%, while keeping the total at safe_total.
+    # This prevents the total from exceeding 10% while still rewarding engagement.
+    
+    # Distribute entire member_total based on zap amounts
     all_zappers = [record for record in active_records if record["amount"] > 0]
-    if all_zappers and zap_distribution_total > 0:
+    if all_zappers:
         weights = [record["amount"] for record in all_zappers]
-        zap_percents = _proportional_percentages(weights, total=zap_distribution_total)
+        zap_percents = _proportional_percentages(weights, total=safe_total)
         for record, pct in zip(all_zappers, zap_percents):
             shares[record["pubkey"]] = shares.get(record["pubkey"], 0) + pct
+
 
     # Enforce a minimum of 1 percentage point for any active member who
     # meaningfully participates in the pool (has zap amount > 0 or a kind 6/7
@@ -222,7 +200,7 @@ def compute_member_share_percentages(
             # Eligible members: active with either zap amount or kind 6/7
             eligible_pubkeys: List[str] = []
             for record in active_records:
-                if record["amount"] > 0 or record["has_kind_67"]:
+                if record["amount"] > 0 or record["has_kind_6"] or record["has_kind_7"]:
                     eligible_pubkeys.append(record["pubkey"])
             # Deduplicate while preserving order
             seen: Set[str] = set()

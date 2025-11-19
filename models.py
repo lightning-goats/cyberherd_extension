@@ -42,6 +42,8 @@ class CyberherdSettings(BaseModel):
     send_splits_enabled: bool = False
     # toggle to enable/disable NIP-05 verification requirement
     nip05_verification_enabled: bool = True
+    # percentage of total pot allocated to members (remaining goes to goats/zap wallet)
+    member_allocation_percent: int = 10
     # user ID associated with these settings
     user_id: Optional[str] = None
 

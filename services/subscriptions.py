@@ -667,6 +667,58 @@ async def force_requery_for_user(app, user_id: str) -> list[str]:
                 logger.error(f"Failed to query engagement events for recovery: {e}")
                 _record_helper_query(False, str(e))
         
+        # Query zap receipts (kind 9735) for effective pubkey
+        # Note: Zaps are addressed to the pubkey, not necessarily the note (though they tag the note)
+        # We query all zaps to the user's pubkey since midnight and let process_zap_receipt_for_tracked_notes filter them
+        if effective_pubkey:
+            logger.debug(f"Querying zap receipts for pubkey {effective_pubkey[:8]}...")
+            
+            filters = {
+                "kinds": [9735],
+                "#p": [effective_pubkey],
+                "since": since_ts,
+                "limit": 1000
+            }
+            
+            try:
+                zap_events = await nostr_helpers.query_events(filters, limit=1000, timeout=10.0)
+                _record_helper_query(True)
+                
+                logger.info(f"Found {len(zap_events)} zap receipts for user {user_id} recovery")
+                
+                # Process each zap receipt
+                for event in zap_events:
+                    try:
+                        await process_zap_receipt_for_tracked_notes(
+                            user_id=user_id,
+                            event=event,
+                            app=app
+                        )
+                        event_id = event.get("id")
+                        if event_id:
+                            processed_ids.append(event_id)
+                    except Exception as e:
+                        logger.warning(f"Failed to process zap receipt {event.get('id')} during recovery: {e}")
+                        
+            except Exception as e:
+                logger.error(f"Failed to query zap receipts for recovery: {e}")
+                _record_helper_query(False, str(e))
+        
+        # Payment-based recovery as fallback for missed zaps
+        # This catches zaps that have payment.extra["nostr"] data but weren't
+        # captured via kind 9735 WebSocket subscriptions
+        try:
+            from ..services.payment_coordinator import get_payment_coordinator
+            monitor = get_payment_coordinator(app=app, db=crud, user_id=user_id)
+            logger.info(f"Triggering payment-based zap recovery for user {user_id}")
+            payment_result = await monitor._recover_missed_payment_zaps(settings)
+            if payment_result:
+                scanned = payment_result.get("scanned", 0)
+                processed = payment_result.get("processed", 0)
+                logger.info(f"Payment recovery: scanned {scanned}, processed {processed} payments")
+        except Exception as e:
+            logger.warning(f"Payment-based recovery failed for user {user_id}: {e}")
+        
         logger.info(f"✅ Recovery completed for user {user_id}: {len(processed_ids)} events processed")
         return processed_ids
         
@@ -1560,8 +1612,29 @@ async def process_repost_for_tracked_notes(user_id: str, event: dict, app=None):
             logger.debug(f"Repost tracking not enabled for user {user_id}")
             return
         
+        # Deduplication: skip if already processed
+        event_id = (event.get("id") or "").strip().lower()
+        if event_id:
+            try:
+                if await crud.is_event_processed(user_id, event_id):
+                    logger.debug(f"Repost {event_id[:8]}... already processed for user {user_id}")
+                    return
+            except Exception:
+                pass
+        
         # Process the event using the main logic
         await process_event_for_user(user_id, event, settings, app, recovery_mode=False)
+        
+        # Mark as processed after successful processing
+        if event_id:
+            try:
+                await crud.register_processed_event(
+                    user_id,
+                    event_id,
+                    event_type="repost"
+                )
+            except Exception as e:
+                logger.debug(f"Failed to register processed repost {event_id[:8]}...: {e}")
         
     except Exception as e:
         logger.error(f"Error processing repost for user {user_id}: {e}")
@@ -1591,8 +1664,29 @@ async def process_reaction_for_tracked_notes(user_id: str, event: dict, app=None
             logger.debug(f"Reaction tracking not enabled for user {user_id}")
             return
         
+        # Deduplication: skip if already processed
+        event_id = (event.get("id") or "").strip().lower()
+        if event_id:
+            try:
+                if await crud.is_event_processed(user_id, event_id):
+                    logger.debug(f"Reaction {event_id[:8]}... already processed for user {user_id}")
+                    return
+            except Exception:
+                pass
+        
         # Process the event using the main logic
         await process_event_for_user(user_id, event, settings, app, recovery_mode=False)
+        
+        # Mark as processed after successful processing
+        if event_id:
+            try:
+                await crud.register_processed_event(
+                    user_id,
+                    event_id,
+                    event_type="reaction"
+                )
+            except Exception as e:
+                logger.debug(f"Failed to register processed reaction {event_id[:8]}...: {e}")
         
     except Exception as e:
         logger.error(f"Error processing reaction for user {user_id}: {e}")
@@ -1720,7 +1814,47 @@ async def process_zap_receipt_for_tracked_notes(user_id: str, event: dict, app=N
             logger.debug(f"Zap receipt {event_id[:8]}... zero/negative amount for user {user_id}")
             return
 
-        # Register processed receipt (idempotency) before side effects
+        # Register payment hash FIRST to prevent duplicate via payment recovery
+        # This is done before the zap receipt duplicate check so that even if this
+        # zap was already processed via kind 9735, we still register the payment hash
+        # to prevent payment-based recovery from reprocessing it
+        payment_hash_registered = False
+        if bolt11_invoice and bolt11_decode is not None:
+            try:
+                decoded = bolt11_decode(bolt11_invoice)
+                payment_hash = getattr(decoded, "payment_hash", None)
+                if payment_hash:
+                    # Normalize to lowercase hex string
+                    if isinstance(payment_hash, bytes):
+                        payment_hash = payment_hash.hex().lower()
+                    elif isinstance(payment_hash, str):
+                        payment_hash = payment_hash.strip().lower()
+                    
+                    # Register payment hash to prevent payment-based recovery from re-processing
+                    # IMPORTANT: Check return value! If False, it means payment was already processed
+                    # (e.g. by payment coordinator), so we MUST stop here to avoid double counting.
+                    ph_inserted = await crud.register_processed_event(
+                        user_id,
+                        payment_hash,
+                        note_id=zapped_note_id,
+                        pubkey=zapper_pubkey,
+                        event_type="payment_zap",
+                    )
+                    payment_hash_registered = True
+                    
+                    if not ph_inserted:
+                        logger.info(
+                            f"Zap receipt {event_id[:8]}... skipped: payment hash {payment_hash[:16]}... already processed"
+                        )
+                        return
+                    
+                    logger.debug(
+                        f"Registered payment hash {payment_hash[:16]}... for zap receipt {event_id[:8]}..."
+                    )
+            except Exception as e:
+                logger.debug(f"Failed to extract/register payment hash from bolt11: {e}")
+
+        # Register processed receipt (idempotency) - check AFTER payment hash registration
         inserted = False
         try:
             inserted = await crud.register_processed_event(
@@ -1734,9 +1868,14 @@ async def process_zap_receipt_for_tracked_notes(user_id: str, event: dict, app=N
             # Best-effort
             pass
         if not inserted:
-            # Another worker may have raced; stop to avoid duplicates
-            logger.debug(f"Zap receipt {event_id[:8]}... already registered for user {user_id}")
+            # Already processed - but we still registered the payment hash above (if available)
+            # so payment recovery won't reprocess this zap
+            logger.debug(
+                f"Zap receipt {event_id[:8]}... already registered for user {user_id} "
+                f"(payment hash {'registered' if payment_hash_registered else 'N/A'})"
+            )
             return
+
 
         # Trigger headbutt admission for zap
         try:

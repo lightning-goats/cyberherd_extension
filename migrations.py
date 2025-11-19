@@ -31,6 +31,7 @@ __all__ = [
     'm030_add_banned_column',  # Add banned column for member banning
     'm031_add_send_splits_enabled',  # Add send_splits_enabled toggle for automatic splits
     'm032_enable_interaction_tracking',  # Enable repost/reaction tracking by default for existing users
+    'm033_add_member_allocation_percent',  # Add member_allocation_percent for configurable split percentage
 ]
 
 logger.info(f"CYBERHERD MIGRATIONS: Registered {len(__all__)} migrations: {__all__}")
@@ -583,3 +584,21 @@ async def m032_enable_interaction_tracking(db: Database):
     except Exception as e:
         logger.warning(f"CYBERHERD m032: failed to enable interaction tracking: {e}")
 
+
+async def m033_add_member_allocation_percent(db: Database):
+    """Add member_allocation_percent column to settings table for configurable split percentage."""
+    logger.info("CYBERHERD m033: adding member_allocation_percent column")
+    try:
+        await db.execute(
+            """
+            ALTER TABLE cyberherd.settings 
+            ADD COLUMN member_allocation_percent INTEGER DEFAULT 10;
+            """
+        )
+        logger.info("CYBERHERD m033: member_allocation_percent column added successfully")
+    except Exception as e:
+        msg = str(e).lower()
+        if any(token in msg for token in ("duplicate", "already exists", "duplicate column")):
+            logger.info("CYBERHERD m033: member_allocation_percent column already exists, skipping")
+        else:
+            logger.warning(f"CYBERHERD m033: failed to add member_allocation_percent column: {e}")

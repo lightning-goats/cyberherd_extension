@@ -13,6 +13,7 @@ window.app = Vue.createApp({
           max_members: 3,
           minimum_sats: 10,
           feeder_trigger_sats: null,
+          member_allocation_percent: 10,
           send_splits_enabled: false,
           tracked_tags: '#CyberHerd',
           zap_tracking_enabled: false,
@@ -30,10 +31,10 @@ window.app = Vue.createApp({
           effective_nostr_npub: ''
         },
         members: [],
-  shares: [],
-  allocationModel: 'none',
-  zapWallet: null,
-  noteIds: [],
+        shares: [],
+        allocationModel: 'none',
+        zapWallet: null,
+        noteIds: [],
         zapMonitorStatus: {
           running: false,
           last_message_at: null,
@@ -68,7 +69,7 @@ window.app = Vue.createApp({
         if (newW && newW.id) {
           this.cyberherdData.form.source_wallet = newW.id
         }
-      } catch (e) {}
+      } catch (e) { }
     },
     'cyberherdData.form.zap_wallet'(newId) {
       try {
@@ -78,7 +79,7 @@ window.app = Vue.createApp({
           this.cyberherdData.form.zap_wallet_alias = zw.name || ''
           this.cyberherdData.form.zap_wallet_alias_auto = true
         }
-      } catch (e) {}
+      } catch (e) { }
     }
   },
   methods: {
@@ -90,7 +91,7 @@ window.app = Vue.createApp({
           this._cyberherdResolvedBase = '/extensions/cyberherd'
         } else {
           const pathname = window.location.pathname
-            // Prefer direct /cyberherd if UI served there; else default to /extensions path
+          // Prefer direct /cyberherd if UI served there; else default to /extensions path
           this._cyberherdResolvedBase = pathname.startsWith('/cyberherd') ? '/cyberherd' : '/extensions/cyberherd'
         }
       }
@@ -118,11 +119,11 @@ window.app = Vue.createApp({
               }
             }
           }
-        } catch (_) {}
+        } catch (_) { }
         throw e
       }
     },
-  findInvoiceKeyForWalletId(walletId) {
+    findInvoiceKeyForWalletId(walletId) {
       try {
         const wallets = (this.g && this.g.user && Array.isArray(this.g.user.wallets)) ? this.g.user.wallets : []
         if (walletId) {
@@ -171,14 +172,14 @@ window.app = Vue.createApp({
           this.cyberherdData.ui.nostrclientAvailable = false
         }
 
-  const res = await this._cyberherdFetch('GET', '/api/v1/settings', this.getReadKey() || null)
+        const res = await this._cyberherdFetch('GET', '/api/v1/settings', this.getReadKey() || null)
         const data = res.data
 
         if (data && typeof data.nostrclient_available !== 'undefined') {
           this.cyberherdData.ui.nostrclientAvailable = !!data.nostrclient_available
         }
 
-  Object.assign(this.cyberherdData.form, {
+        Object.assign(this.cyberherdData.form, {
           source_wallet: data.source_wallet || null,
           zap_wallet: data.zap_wallet || null,
           zap_wallet_alias: data.zap_wallet_alias || '',
@@ -189,6 +190,7 @@ window.app = Vue.createApp({
             ? data.feeder_trigger_sats
             : null,
           send_splits_enabled: typeof data.send_splits_enabled !== 'undefined' ? !!data.send_splits_enabled : false,
+          member_allocation_percent: data.member_allocation_percent || 10,
           tracked_tags: (data.tracked_tags || []).join(', '),
           zap_tracking_enabled: data.zap_tracking_enabled || false,
           midnight_reset_enabled: typeof data.midnight_reset_enabled !== 'undefined' ? !!data.midnight_reset_enabled : false,
@@ -215,23 +217,23 @@ window.app = Vue.createApp({
         }
 
         // If nostr mode is selected but nostrclient is not available, fall back to payment mode
-  // zap_monitor_mode no longer selectable; always payment
+        // zap_monitor_mode no longer selectable; always payment
 
-  // Sync selectedWallet to current form source wallet or default to first
-  const wallets = (this.g && this.g.user && Array.isArray(this.g.user.wallets)) ? this.g.user.wallets : []
-  const match = wallets.find(w => w.id === this.cyberherdData.form.source_wallet)
-  this.selectedWallet = match || wallets[0] || null
-  // Initialize alias from zap wallet name if available; otherwise from selected wallet
-  const zw = wallets.find(w => w.id === this.cyberherdData.form.zap_wallet)
-  if (zw) {
-    this.cyberherdData.form.zap_wallet_alias = zw.name || ''
-    this.cyberherdData.form.zap_wallet_alias_auto = true
-  } else if (!this.cyberherdData.form.zap_wallet_alias && this.selectedWallet) {
-    this.cyberherdData.form.zap_wallet_alias = this.selectedWallet.name || ''
-    this.cyberherdData.form.zap_wallet_alias_auto = true
-  } else {
-    this.cyberherdData.form.zap_wallet_alias_auto = false
-  }
+        // Sync selectedWallet to current form source wallet or default to first
+        const wallets = (this.g && this.g.user && Array.isArray(this.g.user.wallets)) ? this.g.user.wallets : []
+        const match = wallets.find(w => w.id === this.cyberherdData.form.source_wallet)
+        this.selectedWallet = match || wallets[0] || null
+        // Initialize alias from zap wallet name if available; otherwise from selected wallet
+        const zw = wallets.find(w => w.id === this.cyberherdData.form.zap_wallet)
+        if (zw) {
+          this.cyberherdData.form.zap_wallet_alias = zw.name || ''
+          this.cyberherdData.form.zap_wallet_alias_auto = true
+        } else if (!this.cyberherdData.form.zap_wallet_alias && this.selectedWallet) {
+          this.cyberherdData.form.zap_wallet_alias = this.selectedWallet.name || ''
+          this.cyberherdData.form.zap_wallet_alias_auto = true
+        } else {
+          this.cyberherdData.form.zap_wallet_alias_auto = false
+        }
       } catch (e) {
         if (e && e.response && e.response.status === 401) {
           this.showAdminBanner()
@@ -241,7 +243,7 @@ window.app = Vue.createApp({
         console.error('Failed to fetch cyberherd settings', e)
       }
     },
-  async saveSettings() {
+    async saveSettings() {
       try {
         const sourceId = this.selectedWallet?.id || this.cyberherdData.form.source_wallet
         // Always set alias to the chosen Predefined wallet's name (fallback to selected wallet)
@@ -264,6 +266,7 @@ window.app = Vue.createApp({
           max_members: Number(this.cyberherdData.form.max_members) || 3,
           minimum_sats: Number(this.cyberherdData.form.minimum_sats) || 10,
           feeder_trigger_sats: feederTriggerValue,
+          member_allocation_percent: Number(this.cyberherdData.form.member_allocation_percent) || 10,
           send_splits_enabled: this.cyberherdData.form.send_splits_enabled,
           tracked_tags: this.cyberherdData.form.tracked_tags.split(',').map(s => s.trim()).filter(Boolean),
           zap_tracking_enabled: this.cyberherdData.form.zap_tracking_enabled,
@@ -283,33 +286,33 @@ window.app = Vue.createApp({
           payload.nostr_private_key = this.cyberherdData.form.nostr_private_key
         }
 
-  // Follow LNbits patterns (splitpayments/tpos): don't pre-validate via a
-  // separate endpoint. Save settings directly using the selected wallet's
-  // admin key.
+        // Follow LNbits patterns (splitpayments/tpos): don't pre-validate via a
+        // separate endpoint. Save settings directly using the selected wallet's
+        // admin key.
 
-  // Ensure we have an admin key - try selectedWallet first, then any wallet
-  const authKey = this.getAuthKey() || this.getAuthKey(payload.source_wallet)
-  if (!authKey) {
-    this.$q.notify({ type: 'negative', message: 'No admin key available. Please select a wallet with admin privileges.' })
-    return
-  }
+        // Ensure we have an admin key - try selectedWallet first, then any wallet
+        const authKey = this.getAuthKey() || this.getAuthKey(payload.source_wallet)
+        if (!authKey) {
+          this.$q.notify({ type: 'negative', message: 'No admin key available. Please select a wallet with admin privileges.' })
+          return
+        }
 
-  console.log('Cyberherd saveSettings: API call to', `${this.cyberherdApiBase()}/api/v1/settings`)
-  console.log('Cyberherd saveSettings: payload', payload)
-  console.log('Cyberherd saveSettings: authKey present', !!authKey)
+        console.log('Cyberherd saveSettings: API call to', `${this.cyberherdApiBase()}/api/v1/settings`)
+        console.log('Cyberherd saveSettings: payload', payload)
+        console.log('Cyberherd saveSettings: authKey present', !!authKey)
 
-  const putRes = await this._cyberherdFetch('PUT', '/api/v1/settings', authKey, payload)
-  // Immediately reflect effective pubkey/npub from server response
-  try {
-    const ed = (putRes && putRes.data) ? putRes.data : {}
-    if (Object.prototype.hasOwnProperty.call(ed, 'effective_nostr_pubkey')) {
-      this.cyberherdData.form.effective_nostr_pubkey = ed.effective_nostr_pubkey || ''
-      this.cyberherdData.form.effective_nostr_npub = ed.effective_nostr_npub || ''
-      this.cyberherdData.form.nostr_private_key_set = !!ed.effective_nostr_pubkey
-      // Clear the input so we don't keep secrets in memory/UI after save
-      this.cyberherdData.form.nostr_private_key = ''
-    }
-  } catch (e) {}
+        const putRes = await this._cyberherdFetch('PUT', '/api/v1/settings', authKey, payload)
+        // Immediately reflect effective pubkey/npub from server response
+        try {
+          const ed = (putRes && putRes.data) ? putRes.data : {}
+          if (Object.prototype.hasOwnProperty.call(ed, 'effective_nostr_pubkey')) {
+            this.cyberherdData.form.effective_nostr_pubkey = ed.effective_nostr_pubkey || ''
+            this.cyberherdData.form.effective_nostr_npub = ed.effective_nostr_npub || ''
+            this.cyberherdData.form.nostr_private_key_set = !!ed.effective_nostr_pubkey
+            // Clear the input so we don't keep secrets in memory/UI after save
+            this.cyberherdData.form.nostr_private_key = ''
+          }
+        } catch (e) { }
         await this.refreshMembers()
         await this.fetchSettings()
         await this.fetchZapMonitorStatus()
@@ -367,7 +370,7 @@ window.app = Vue.createApp({
       this.cyberherdData.form.effective_nostr_npub = ''
       this.$q.notify({ type: 'info', message: 'Nostr private key will be cleared on Save.' })
     },
-  // removed validateSourceWallet pre-check; not needed in standard patterns
+    // removed validateSourceWallet pre-check; not needed in standard patterns
     async fetchMembers() {
       try {
         if (this.cyberherdData.adminAuthFailed) return
@@ -387,7 +390,7 @@ window.app = Vue.createApp({
     async fetchShares() {
       try {
         if (this.cyberherdData.adminAuthFailed) return
-  const res = await this._cyberherdFetch('GET', '/api/v1/shares', this.getReadKey() || null)
+        const res = await this._cyberherdFetch('GET', '/api/v1/shares', this.getReadKey() || null)
         if (res.data) {
           this.cyberherdData.shares = Array.isArray(res.data.shares) ? res.data.shares : []
           this.cyberherdData.allocationModel = res.data.allocation_model || 'none'
@@ -421,7 +424,7 @@ window.app = Vue.createApp({
     async removeMember(pubkey) {
       if (!confirm('Remove member ' + pubkey + '?')) return
       try {
-  await this._cyberherdFetch('DELETE', '/api/v1/members/' + encodeURIComponent(pubkey), this.getAuthKey() || null)
+        await this._cyberherdFetch('DELETE', '/api/v1/members/' + encodeURIComponent(pubkey), this.getAuthKey() || null)
         await this.refreshMembers()
       } catch (e) {
         if (e && e.response && e.response.status === 401) {
@@ -435,7 +438,7 @@ window.app = Vue.createApp({
     },
     async activateMember(pubkey) {
       try {
-  await this._cyberherdFetch('POST', '/api/v1/members/' + encodeURIComponent(pubkey) + '/activate', this.getAuthKey() || null, {})
+        await this._cyberherdFetch('POST', '/api/v1/members/' + encodeURIComponent(pubkey) + '/activate', this.getAuthKey() || null, {})
         await this.refreshMembers()
         this.$q.notify({ type: 'positive', message: 'Member activated' })
       } catch (e) {
@@ -444,7 +447,7 @@ window.app = Vue.createApp({
     },
     async deactivateMember(pubkey) {
       try {
-  await this._cyberherdFetch('POST', '/api/v1/members/' + encodeURIComponent(pubkey) + '/deactivate', this.getAuthKey() || null)
+        await this._cyberherdFetch('POST', '/api/v1/members/' + encodeURIComponent(pubkey) + '/deactivate', this.getAuthKey() || null)
         await this.refreshMembers()
         this.$q.notify({ type: 'positive', message: 'Member deactivated' })
       } catch (e) {
@@ -484,7 +487,7 @@ window.app = Vue.createApp({
             })
             const res = await this._cyberherdFetch('POST', '/api/v1/recover_events', authKey, {})
             // Close dialog
-            try { this.$q.dialog().hide() } catch (e) {}
+            try { this.$q.dialog().hide() } catch (e) { }
             // If diagnostics returned, show a friendly summary and an expandable details view
             if (res && res.data && res.data.diagnostics) {
               const d = res.data.diagnostics
@@ -500,7 +503,7 @@ window.app = Vue.createApp({
                 }
                 if (d.zaps && typeof d.zaps.processed === 'number') msgs.push(`${d.zaps.processed} zaps processed`)
                 if (d.zaps && d.zaps.errors && d.zaps.errors.length) msgs.push(`${d.zaps.errors.length} zap errors`)
-              } catch (e) {}
+              } catch (e) { }
               const summary = msgs.length ? msgs.join(', ') : 'Recovery completed'
               this.$q.notify({ type: 'positive', message: summary })
 
@@ -531,7 +534,7 @@ window.app = Vue.createApp({
             }
           } catch (e) {
             // Close dialog if open
-            try { this.$q.dialog().hide() } catch (err) {}
+            try { this.$q.dialog().hide() } catch (err) { }
             // Non-fatal: recovery may not be available in some deployments
             console.warn('Recovery endpoint call failed', e)
             this.$q.notify({ type: 'negative', message: 'Recovery failed (see console)' })
@@ -549,19 +552,19 @@ window.app = Vue.createApp({
     },
     openAddDialog() {
       this.cyberherdData.ui.editingPubkey = null
-  this.cyberherdData.ui.newMember = { pubkey: '', amount: 0, tracked_event_id: '' }
+      this.cyberherdData.ui.newMember = { pubkey: '', amount: 0, tracked_event_id: '' }
       this.cyberherdData.ui.showMemberDialog = true
     },
-      openEditDialog(pubkey) {
-        this.cyberherdData.ui.editingPubkey = pubkey
-  const curr = (this.cyberherdData.members || []).find(m => m.pubkey === pubkey) || {}
-  this.cyberherdData.ui.newMember = {
-    pubkey,
-    amount: Number(curr.amount || 0),
-    tracked_event_id: (curr.event_id || curr.note || '').toLowerCase()
-  }
-        this.cyberherdData.ui.showMemberDialog = true
-      },
+    openEditDialog(pubkey) {
+      this.cyberherdData.ui.editingPubkey = pubkey
+      const curr = (this.cyberherdData.members || []).find(m => m.pubkey === pubkey) || {}
+      this.cyberherdData.ui.newMember = {
+        pubkey,
+        amount: Number(curr.amount || 0),
+        tracked_event_id: (curr.event_id || curr.note || '').toLowerCase()
+      }
+      this.cyberherdData.ui.showMemberDialog = true
+    },
     closeDialog() {
       this.cyberherdData.ui.showMemberDialog = false
     },
@@ -616,10 +619,10 @@ window.app = Vue.createApp({
       } catch (e) {
         // ignore DOM errors
       }
-  },
+    },
     async recomputeSplits() {
       try {
-  await this._cyberherdFetch('POST', '/api/v1/recompute_splits', this.getAuthKey() || null)
+        await this._cyberherdFetch('POST', '/api/v1/recompute_splits', this.getAuthKey() || null)
         await this.refreshMembers()
         this.$q.notify({ type: 'positive', message: 'Recomputed split targets' })
       } catch (e) {
@@ -629,7 +632,7 @@ window.app = Vue.createApp({
     async fetchZapMonitorStatus() {
       try {
         if (this.cyberherdData.adminAuthFailed) return
-  const res = await this._cyberherdFetch('GET', '/api/v1/zap_monitor_status', this.getAuthKey() || null)
+        const res = await this._cyberherdFetch('GET', '/api/v1/zap_monitor_status', this.getAuthKey() || null)
         if (res.data && res.data.status) {
           this.cyberherdData.zapMonitorStatus = res.data.status
         }
@@ -655,7 +658,7 @@ window.app = Vue.createApp({
       try {
         const ok = confirm('Reset today: deactivate all members and set splits to predefined wallet at 100%?')
         if (!ok) return
-  await this._cyberherdFetch('POST', '/api/v1/manual_reset', this.getAuthKey() || null)
+        await this._cyberherdFetch('POST', '/api/v1/manual_reset', this.getAuthKey() || null)
         await this.refreshMembers()
         this.$q.notify({ type: 'positive', message: 'Cyberherd reset completed' })
       } catch (e) {
@@ -699,13 +702,13 @@ window.app = Vue.createApp({
           this.cyberherdData.form.zap_wallet_alias_auto = true
         }
       }
-    } catch (e) {}
+    } catch (e) { }
     this.fetchSettings()
     this.fetchMembers()
     this.fetchShares()
     this.fetchTodayNotes()
     this.fetchZapMonitorStatus()
-    
+
     // Auto-refresh data every 15 seconds (LNbits standard polling pattern)
     this._pollInterval = setInterval(() => {
       if (!document.hidden) {

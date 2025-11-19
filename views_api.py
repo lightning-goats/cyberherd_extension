@@ -1065,6 +1065,7 @@ async def api_get_settings(request: Request, auth=Depends(auth_wallet_or_admin_d
         "likes_tracking_enabled": getattr(settings, "likes_tracking_enabled", False),
         "minimum_sats": getattr(settings, "minimum_sats", 10),
         "feeder_trigger_sats": getattr(settings, "feeder_trigger_sats", None),
+        "member_allocation_percent": getattr(settings, "member_allocation_percent", 10),
         "send_splits_enabled": getattr(settings, "send_splits_enabled", False),
         "websocket_url": websocket_url,
     }
@@ -1327,6 +1328,18 @@ async def api_put_settings(
         except Exception as e:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST, detail="Invalid feeder_trigger_sats"
+            ) from e
+
+    member_allocation_percent = payload.get("member_allocation_percent")
+    if member_allocation_percent is not None:
+        try:
+            val = int(member_allocation_percent)
+            if val < 1 or val > 100:
+                raise ValueError("Member allocation must be between 1 and 100")
+            settings.member_allocation_percent = val
+        except Exception as e:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST, detail="Invalid member_allocation_percent"
             ) from e
 
     # Handle send_splits_enabled toggle

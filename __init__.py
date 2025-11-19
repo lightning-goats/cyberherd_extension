@@ -400,93 +400,47 @@ async def _start_zap_monitoring_if_enabled(app):
 
 
 async def _warm_start_today_cache_and_recovery(app):
-    """Populate today's note IDs per user into cache for immediate UI display.
+    """Populate today's note IDs per user into cache and recover missed events.
     
-    Note: Automatic recovery removed - users can manually trigger recovery via UI button.
+    Uses force_requery_for_user to:
+    1. Query notes from midnight
+    2. Populate tracked_event_ids
+    3. Query and process engagement events (reposts/reactions)
+    4. Query and process zap receipts
     """
     try:
-        from datetime import datetime, timezone
         from . import crud
-        from .views_api import _get_cached_effective_pubkey, _cache_notes
-        from .services import nostr_helpers
-        from .services.time_utils import get_day_boundaries_utc
+        from .services.subscriptions import force_requery_for_user
         from .utils.common import is_extension_enabled_for_user
 
-        logger.info("Cyberherd warm start: begin prefetch")
+        logger.info("Cyberherd warm start: begin recovery")
         try:
-            rows = await crud.db.fetchall("SELECT * FROM cyberherd.settings")
+            rows = await crud.db.fetchall("SELECT user_id FROM cyberherd.settings")
             logger.info(f"Cyberherd warm start: database query succeeded, got {len(rows or [])} rows")
         except Exception as db_err:
             logger.warning(f"Cyberherd warm start: database query failed: {db_err}")
             rows = []
-        logger.info(f"Cyberherd warm start: found {len(rows)} settings rows")
-
-        # Get day boundaries using UTC-first approach for consistency
-        # Cache key uses UTC date, but 'since' filter uses local_since_ts for user's "today"
-        boundaries = get_day_boundaries_utc()
-        day_key = boundaries.utc_day_str
-        since = int(boundaries.local_since_ts)  # Use local midnight for user's "today"
-        until = int(boundaries.local_until_ts)
-
-        try:
-            from .services import nostr_helpers
-            relay_info = nostr_helpers.get_relay_info()
-            logger.info(f"Cyberherd warm start: nostrclient relays={relay_info.get('relay_count', 0)} connected={relay_info.get('connected_count', 0)}")
-        except Exception:
-            pass
-
+        
         processed = 0
         for r in rows:
             try:
                 uid = r.get("user_id")
+                if not uid:
+                    continue
                 
                 # Check if user has cyberherd extension enabled
                 if not await is_extension_enabled_for_user(uid):
                     continue
 
-                s = await crud.get_settings(uid)
-                tags = [t.lstrip('#').lower() for t in (getattr(s, 'tracked_tags', []) or [])]
-                eff_pub = _get_cached_effective_pubkey(s)
-                logger.info(f"Cyberherd warm start: user={uid} tags={tags} eff_pub_present={bool(eff_pub)}")
-                if tags and eff_pub:
-                    try:
-                        # Include kind 1 (notes) and kind 30311 (long-form content)
-                        events = await nostr_helpers.query_events({"kinds": [1, 30311], "authors": [eff_pub], "since": since, "until": until}, limit=100, timeout=8.0)
-                        ids = []
-                        timestamps = {}  # Store note_id -> created_at timestamp
-                        addresses = dict(getattr(s, 'tracked_event_addresses', {}) or {})
-                        for ev in events or []:
-                            try:
-                                ca = int(ev.get('created_at') or 0)
-                            except Exception:
-                                ca = 0
-                            if not (since <= ca < until):
-                                continue
-                            tag_values = extract_t_tags_from_event(ev)
-                            content = (ev.get('content') or '').lower()
-                            if (set(tags) & tag_values) or any(f"#{tv}" in content for tv in tags):
-                                if isinstance(ev.get('id'), str):
-                                    note_id = ev['id']
-                                    ids.append(note_id)
-                                    timestamps[note_id] = ca  # Store timestamp for this note
-                                    apply_event_address(addresses, ev)
-                        tagset = tuple(sorted(tags))
-                        _cache_notes(app, (day_key, uid, eff_pub, tagset), ids)
-                        _cache_notes(app, (day_key, None, eff_pub, tagset), ids)
-                        
-                        # Update settings with tracked_event_ids (current day only)
-                        if ids:
-                            try:
-                                s.tracked_event_ids = ids
-                                s.tracked_event_timestamps = timestamps
-                                s.tracked_event_addresses = addresses
-                                await crud.upsert_settings(s, uid)
-                                logger.info(f"Warm start: updated tracked_event_ids for user {uid}: {len(ids)} events")
-                                processed += 1
-                            except Exception as e:
-                                logger.error(f"Warm start: failed to update tracked_event_ids for user {uid}: {e}")
-                    except Exception as e:
-                        logger.debug(f"Warm start: note prefetch failed user={uid}: {e}")
+                # Run full recovery for this user
+                # This handles notes, tracked_event_ids population, engagements, and zaps
+                try:
+                    logger.info(f"Cyberherd warm start: triggering recovery for user {uid}")
+                    await force_requery_for_user(app, uid)
+                    processed += 1
+                except Exception as e:
+                    logger.warning(f"Cyberherd warm start: recovery failed for user {uid}: {e}")
+                    
             except Exception as e:
                 logger.debug(f"Warm start: settings row error: {e}")
         

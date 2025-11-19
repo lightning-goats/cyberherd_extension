@@ -565,6 +565,7 @@ def _row_to_settings(row) -> CyberherdSettings:
         minimum_sats=row.get("minimum_sats") or 10,
         nip05_verification_enabled=coerce_bool(row.get("nip05_verification_enabled"), True),
         feeder_trigger_sats=row.get("feeder_trigger_sats"),
+        member_allocation_percent=row.get("member_allocation_percent") or 10,
         send_splits_enabled=coerce_bool(row.get("send_splits_enabled"), False),
         user_id=row.get("user_id"),
     )
@@ -671,6 +672,10 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
         has_nip05_col = await _column_exists("settings", "nip05_verification_enabled")
         if has_nip05_col:
             update_cols.insert(update_cols.index("minimum_sats = :minimum_sats") + 1, "nip05_verification_enabled = :nip05_verification_enabled")
+        # Only include member_allocation_percent if the column exists in this DB
+        has_member_alloc_col = await _column_exists("settings", "member_allocation_percent")
+        if has_member_alloc_col:
+            update_cols.append("member_allocation_percent = :member_allocation_percent")
         if has_templates_col:
             update_cols.append("templates_owner_user = :templates_owner_user")
         sql = f"UPDATE {db.references_schema}settings SET " + ", ".join(update_cols) + " WHERE user_id = :user_id"
@@ -707,6 +712,9 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
         # Only add nip05_verification_enabled param if column exists
         if has_nip05_col:
             params["nip05_verification_enabled"] = int(getattr(settings, "nip05_verification_enabled", True))
+        # Only add member_allocation_percent param if column exists
+        if has_member_alloc_col:
+            params["member_allocation_percent"] = int(getattr(settings, "member_allocation_percent", 10))
         try:
             async with _crud_write_lock:
                 await _execute_with_retry(sql, params)
@@ -848,6 +856,14 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
             sql = f"INSERT INTO {db.references_schema}settings ({', '.join(insert_cols)}) VALUES ({', '.join(placeholders)})"
             feeder_value = getattr(settings, "feeder_trigger_sats", None)
             params["feeder_trigger_sats"] = int(feeder_value) if feeder_value not in (None, "") else None
+        # Check for member_allocation_percent column
+        has_member_alloc_col = await _column_exists("settings", "member_allocation_percent")
+        if has_member_alloc_col:
+            if "member_allocation_percent" not in insert_cols:
+                insert_cols.append("member_allocation_percent")
+            placeholders = [":" + c for c in insert_cols]
+            sql = f"INSERT INTO {db.references_schema}settings ({', '.join(insert_cols)}) VALUES ({', '.join(placeholders)})"
+            params["member_allocation_percent"] = int(getattr(settings, "member_allocation_percent", 10))
         try:
             async with _crud_write_lock:
                 await _execute_with_retry(sql, params)
