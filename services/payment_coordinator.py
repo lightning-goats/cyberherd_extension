@@ -572,35 +572,37 @@ class PaymentCoordinatorService:
                     f"Proceeding with headbutt processing..."
                 )
             
-            # Check for duplicate processing using payment hash as event ID
+            # Check/claim duplicate processing using payment hash as event ID
             event_id_raw = getattr(payment, "payment_hash", None) or getattr(payment, "checking_id", None)
             event_id = self._normalize_payment_hash(event_id_raw)
 
-            # First check persisted processed_events table (guards against duplicate posts across restarts)
-            try:
-                # Only call persistence API if we have an event_id string
-                raw_processed = (
-                    await crud.is_payment_processed(cast(str, self.user_id), event_id)
-                    if event_id
-                    else False
-                )
-            except Exception:
-                # If persistence layer unavailable in tests/mocks, assume not processed
-                raw_processed = False
+            # Atomically claim the payment hash BEFORE processing to avoid races
+            # with other detection paths. register_processed_event performs a
+            # serialized check+insert under a write lock and returns True iff
+            # this process inserted a new row (i.e., claimed the hash).
+            if event_id:
+                try:
+                    claimed = await crud.register_processed_event(
+                        cast(str, self.user_id),
+                        event_id,
+                        note_id=target_note_id,
+                        pubkey=zapper_pubkey,
+                        event_type="payment_zap",
+                    )
+                except Exception:
+                    claimed = False
 
-            # Only treat a True bool as already processed; mocks returning MagicMock should not short-circuit
-            is_already_processed = True if isinstance(raw_processed, bool) and raw_processed else False
-            if is_already_processed:
-                pid_preview = event_id[:16] + "..." if event_id else "unknown"
-                nid_preview = target_note_id[:8] + "..." if isinstance(target_note_id, str) else "unknown"
-                ppk_preview = zapper_pubkey[:8] + "..." if isinstance(zapper_pubkey, str) else "unknown"
-                logger.debug(
-                    f"🔄 Duplicate payment detected (persisted): payment_hash={pid_preview}, note={nid_preview}, pubkey={ppk_preview} Skipping."
-                )
-                self.last_error = None
-                return True
-            
-            # Trigger headbutt admission for zap
+                if not claimed:
+                    pid_preview = event_id[:16] + "..."
+                    nid_preview = target_note_id[:8] + "..." if isinstance(target_note_id, str) else "unknown"
+                    ppk_preview = zapper_pubkey[:8] + "..." if isinstance(zapper_pubkey, str) else "unknown"
+                    logger.debug(
+                        f"🔄 Duplicate payment detected (persisted): payment_hash={pid_preview}, note={nid_preview}, pubkey={ppk_preview} Skipping."
+                    )
+                    self.last_error = None
+                    return True
+
+            # Trigger headbutt admission for zap (we have claimed the payment hash)
             try:
                 result = await trigger_headbutt_from_zap(
                     user_id=cast(str, self.user_id),
@@ -613,20 +615,9 @@ class PaymentCoordinatorService:
             except Exception as e:
                 logger.error(f"Error triggering headbutt from payment-based zap: {e}")
                 result = None
-            
+
             if result:
-                # Mark payment as processed to prevent duplicates
-                try:
-                    if event_id:
-                        await crud.register_processed_event(
-                            cast(str, self.user_id),
-                            event_id,
-                            "payment_zap"
-                        )
-                        logger.debug(f"Registered payment {event_id[:16]}... as processed")
-                except Exception as e:
-                    logger.warning(f"Failed to register processed payment: {e}")
-                
+                # We already registered the payment hash as claimed above; update state
                 self.last_zap_at = int(time.time())
                 logger.info(
                     f"✅ Payment-based zap processed: {amount_sats} sats from {zapper_pubkey[:8]}... "

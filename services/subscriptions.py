@@ -667,42 +667,16 @@ async def force_requery_for_user(app, user_id: str) -> list[str]:
                 logger.error(f"Failed to query engagement events for recovery: {e}")
                 _record_helper_query(False, str(e))
         
-        # Query zap receipts (kind 9735) for effective pubkey
-        # Note: Zaps are addressed to the pubkey, not necessarily the note (though they tag the note)
-        # We query all zaps to the user's pubkey since midnight and let process_zap_receipt_for_tracked_notes filter them
+        # Zap receipts (kind 9735) recovery intentionally DISABLED
+        # Rationale: Payment-based detection is now the single authoritative
+        # path for zap processing. To avoid duplicate processing we do not
+        # query or process kind 9735 receipts during recovery. Payment-based
+        # recovery (via PaymentCoordinator) and stored processed_events are
+        # used instead.
         if effective_pubkey:
-            logger.debug(f"Querying zap receipts for pubkey {effective_pubkey[:8]}...")
-            
-            filters = {
-                "kinds": [9735],
-                "#p": [effective_pubkey],
-                "since": since_ts,
-                "limit": 1000
-            }
-            
-            try:
-                zap_events = await nostr_helpers.query_events(filters, limit=1000, timeout=10.0)
-                _record_helper_query(True)
-                
-                logger.info(f"Found {len(zap_events)} zap receipts for user {user_id} recovery")
-                
-                # Process each zap receipt
-                for event in zap_events:
-                    try:
-                        await process_zap_receipt_for_tracked_notes(
-                            user_id=user_id,
-                            event=event,
-                            app=app
-                        )
-                        event_id = event.get("id")
-                        if event_id:
-                            processed_ids.append(event_id)
-                    except Exception as e:
-                        logger.warning(f"Failed to process zap receipt {event.get('id')} during recovery: {e}")
-                        
-            except Exception as e:
-                logger.error(f"Failed to query zap receipts for recovery: {e}")
-                _record_helper_query(False, str(e))
+            logger.debug(
+                f"User {user_id}: Skipping 9735 zap receipt recovery query for pubkey {effective_pubkey[:8]}..."
+            )
         
         # Payment-based recovery as fallback for missed zaps
         # This catches zaps that have payment.extra["nostr"] data but weren't

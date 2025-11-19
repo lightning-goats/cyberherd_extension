@@ -505,9 +505,14 @@ class NostrWebSocketMonitor:
                 await process_reaction_for_tracked_notes(self.user_id, event, self.app)
             
             elif kind == 9735:
-                # Zap receipt
-                logger.debug(f"User {self.user_id}: Processing zap receipt {event_id[:8]}...")
-                await process_zap_receipt_for_tracked_notes(self.user_id, event, self.app)
+                # Zap receipts are ignored in realtime: zap subscriptions were
+                # intentionally disabled. Payments are the single authoritative
+                # detection path. Log and ignore any incoming 9735 events to
+                # avoid dual-processing if a relay or external component still
+                # sends them.
+                logger.debug(
+                    f"User {self.user_id}: Ignoring incoming kind 9735 event {event_id[:8]}... (zap processing disabled in WS)"
+                )
             
             else:
                 logger.debug(
