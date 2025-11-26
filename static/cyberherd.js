@@ -507,28 +507,8 @@ window.app = Vue.createApp({
               const summary = msgs.length ? msgs.join(', ') : 'Recovery completed'
               this.$q.notify({ type: 'positive', message: summary })
 
-              // Prepare pretty JSON and simple HTML-escape to safely embed inside dialog
-              const pretty = JSON.stringify(d, null, 2) || ''
-              const escaped = pretty.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+              this.$q.notify({ type: 'positive', message: summary })
 
-              // Render a compact friendly dialog with an expandable details (<details>) element
-              this.$q.dialog({
-                component: {
-                  template: `
-                    <div style="padding:12px; max-width:680px; font-family: Arial, sans-serif;">
-                      <div style="margin-bottom:8px; font-weight:600;">Recovery summary</div>
-                      <div style="margin-bottom:12px; color:#333">${summary}</div>
-                      <div style="margin-bottom:8px; color:#666; font-size:0.9em">If you need more information, expand the details below.</div>
-                      <details style="border-top:1px solid #eee; padding-top:8px">
-                        <summary style="cursor:pointer;">Show diagnostics details</summary>
-                        <pre style="white-space:pre-wrap; background:#f9f9f9; padding:10px; border-radius:4px; max-height:360px; overflow:auto;">${escaped}</pre>
-                      </details>
-                    </div>
-                  `
-                },
-                persistent: true,
-                ok: true
-              })
             } else {
               this.$q.notify({ type: 'positive', message: 'Recovery completed' })
             }

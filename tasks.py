@@ -25,7 +25,6 @@ from .services.nostr_websocket_monitor import (
     trigger_immediate_refresh,
 )
 from . import crud as crud_module
-from .views_api import _clear_cached_notes_for_user
 from .utils.common import parse_bool_env, utc_now
 
 # Conditional import for cyberherd_messaging
@@ -149,9 +148,9 @@ async def process_incoming_payment(payment: Any, app: Any | None = None) -> None
     """Dispatcher invoked by invoice listener for LNbits payments.
 
     Note:
-    - Payment-based zap detection is enabled as a realtime path for immediate processing.
-    - Kind 9735 Nostr subscriptions provide the primary detection path.
-    - This payment-based path acts as immediate fallback before kind 9735 arrives.
+    - Payment-based zap detection is the PRIMARY and AUTHORITATIVE path for zap processing.
+    - Kind 9735 Nostr subscriptions have been disabled to prevent race conditions.
+    - This ensures "at-most-once" processing by relying on the single source of truth (payments).
     """
     try:
         wallet_id = getattr(payment, "wallet_id", None)
@@ -345,12 +344,7 @@ async def midnight_reset_job(app: Any | None = None):
                     error_msg = f"Failed to reset tracked events for user {user_id[:12]}...: {e}"
                     logger.warning(f"CyberHerd midnight reset: {error_msg}")
                     errors.append(error_msg)
-                # Clear cached today notes similar to manual reset behaviour
-                if app is not None:
-                    try:
-                        _clear_cached_notes_for_user(app, user_id=user_id)
-                    except Exception as e:
-                        logger.debug(f"CyberHerd midnight reset: note cache clear skipped for user {user_id[:12]}...: {e}")
+
                 # Restart kind 1/30311 note subscriptions so the new day begins fresh
                 try:
                     restarted = await _restart_kind1_subscriptions_for_user(user_id, app)

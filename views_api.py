@@ -308,80 +308,6 @@ async def _compute_feeder_difference_for_user(
         return None
 
 
-_NOTES_CACHE_TTL_SECONDS = 60 * 5  # expire cached day lookups after five minutes
-
-
-def _ensure_notes_cache_container(app) -> dict:
-    """Return (and initialize) the request.app/state cache store."""
-    target = getattr(app, "state", app)
-    cache = getattr(target, "cyberherd_today_notes_cache", None)
-    if not isinstance(cache, dict):
-        cache = {}
-        try:
-            setattr(target, "cyberherd_today_notes_cache", cache)
-        except Exception:
-            # On failure we still return the in-memory dict for this call
-            pass
-    return cache
-
-
-def _get_cached_notes(request, cache_key):
-    """Fetch cached note ids for the provided key if fresh."""
-    try:
-        app = getattr(request, "app", request)
-        cache = _ensure_notes_cache_container(app)
-        entry = cache.get(cache_key)
-        if not entry:
-            return None
-        ts, values = entry
-        if not isinstance(ts, (int, float)) or time.monotonic() - ts > _NOTES_CACHE_TTL_SECONDS:
-            try:
-                del cache[cache_key]
-            except Exception:
-                pass
-            return None
-        # Return a new list copy to avoid external mutation of cached tuple
-        return list(values)
-    except Exception:
-        return None
-
-
-def _cache_notes(request, cache_key, note_ids):
-    """Store note ids for the provided cache key with TTL."""
-    try:
-        app = getattr(request, "app", request)
-        cache = _ensure_notes_cache_container(app)
-        # Deduplicate while preserving order; filter out falsey entries
-        cleaned = []
-        seen = set()
-        for note_id in note_ids or []:
-            if not note_id:
-                continue
-            normalized = str(note_id)
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            cleaned.append(normalized)
-        cache[cache_key] = (time.monotonic(), tuple(cleaned))
-    except Exception:
-        pass
-
-
-def _clear_cached_notes_for_user(app, user_id=None):
-    """Remove cache entries belonging to the given user (or None)."""
-    try:
-        cache = _ensure_notes_cache_container(app)
-        targets = [
-            key
-            for key in list(cache.keys())
-            if isinstance(key, tuple) and len(key) >= 2 and key[1] == user_id
-        ]
-        for key in targets:
-            cache.pop(key, None)
-    except Exception:
-        pass
-
-
 def _get_cached_effective_pubkey(settings):
     """Return a previously computed effective pubkey when available."""
     try:
@@ -563,13 +489,7 @@ async def api_manual_reset(
     except Exception as e:
         logger.warning(f"Manual reset: failed to reset tracked events: {e}")
     
-    # 5. Clear cached notes for this user
-    try:
-        _clear_cached_notes_for_user(request.app, user_id=user_id)
-    except Exception as e:
-        logger.debug(f"Manual reset: note cache clear skipped: {e}")
-    
-    # 6. Reset splits to predefined wallet at 100%
+    # 5. Reset splits to predefined wallet at 100%
     try:
         settings = await crud.get_settings(user_id)
         if settings and settings.source_wallet:
@@ -1471,9 +1391,8 @@ async def api_put_settings(
     try:
         eff_after = _get_cached_effective_pubkey(settings)
         if eff_after and eff_after != eff_before and getattr(settings, "zap_tracking_enabled", False):
-            # Clear previously cached entries for this user/old pubkey immediately (cheap)
-            _clear_cached_notes_for_user(request.app, user_id=user_id)
             # Temporarily disabled to prevent timeout issues
+            pass
             # import asyncio
             # async def _bg_key_changed_recovery():
             #     try:
@@ -1582,27 +1501,6 @@ async def api_put_settings(
         logger.debug(
             "Cyberherd PUT settings: effective pubkey present=%s", bool(eff)
         )
-    except Exception:
-        pass
-    # Clear today's notes cache only when relevant settings change
-    try:
-        st = getattr(request.app, "state", request.app)
-        if hasattr(st, "cyberherd_note_cache"):
-            # If the nostr key was cleared, remove user-specific cached entries as well
-            if eff_before and not getattr(settings, "nostr_private_key", None) and not getattr(settings, "nostr_pubkey_override", None):
-                _clear_cached_notes_for_user(request.app, user_id=user_id)
-            else:
-                # Reset cache if tags changed (affects matching)
-                try:
-                    tags_after_norm = sorted([
-                        t.lstrip("#").lower()
-                        for t in (getattr(settings, "tracked_tags", []) or [])
-                        if isinstance(t, str)
-                    ])
-                except Exception:
-                    tags_after_norm = []
-                if tags_after_norm != tags_before_norm:
-                    st.cyberherd_note_cache = {}
     except Exception:
         pass
 
@@ -1797,107 +1695,70 @@ async def api_get_today_cyberherd_notes(request: Request, auth=Depends(auth_wall
     except Exception:
         pass
 
-    from datetime import datetime, timezone
+    # Return tracked_event_ids from settings (maintained by subscription system)
+    # This reflects the notes that are actively being monitored for engagements
+    tracked_ids = getattr(s, "tracked_event_ids", []) or []
     
-    # Use UTC date for cache key consistency (matches _append_today in subscriptions.py)
-    # This ensures cache keys don't change during DST transitions
-    utc_now = datetime.now(timezone.utc)
-    day_key = utc_now.date().isoformat()  # UTC date string (e.g., "2025-11-08")
+    # Normalize to list of strings
+    today_ids = []
+    for note_id in tracked_ids:
+        if isinstance(note_id, str):
+            today_ids.append(note_id.strip().lower())
     
-    cache_key = (day_key, user_id, eff_pub, tuple(sorted(tags_lower)))
     debug_mode = request.query_params.get("debug") is not None
-    # Fast-path cache hit (unless debug requested)
-    cached = _get_cached_notes(request, cache_key)
-    if cached is not None and not debug_mode:
-        return {"note_ids": cached}
-
-    # Obtain (or create) a lock so only one coroutine performs the network query
-    state = getattr(request.app, "state", request.app)
-    lock = getattr(state, "cyberherd_today_notes_lock", None)
-    # Discard bogus mock objects; only treat a real asyncio.Lock as valid
-    if not isinstance(lock, asyncio.Lock):
-        try:
-            lock = asyncio.Lock()
-            setattr(state, "cyberherd_today_notes_lock", lock)
-        except Exception:
-            lock = None
-
-    async def _query_and_cache():
-        # Return tracked_event_ids from settings (maintained by subscription system)
-        # This reflects the notes that are actively being monitored for engagements
-        tracked_ids = getattr(s, "tracked_event_ids", []) or []
+    if debug_mode:
+        # For debugging: also try broader queries to diagnose the issue
+        from .services import nostr_helpers  # type: ignore
+        # Use UTC-first time calculation (authoritative)
+        midnight_utc, midnight_local, midnight_timestamp, until_timestamp = crud.get_utc_day_boundaries()
         
-        # Normalize to list of strings
-        today_ids = []
-        for note_id in tracked_ids:
-            if isinstance(note_id, str):
-                today_ids.append(note_id.strip().lower())
-        
-        _cache_notes(request, cache_key, today_ids)
-        if debug_mode:
-            # For debugging: also try broader queries to diagnose the issue
-            from .services import nostr_helpers  # type: ignore
-            # Use UTC-first time calculation (authoritative)
-            midnight_utc, midnight_local, midnight_timestamp, until_timestamp = crud.get_utc_day_boundaries()
-            
-            # Build expanded tag list (original + lowercase) mirroring crud logic
-            expanded_filter_tags = []
-            _seen = set()
-            for _t in tags + tags_lower:
-                if _t and _t not in _seen:
-                    expanded_filter_tags.append(_t)
-                    _seen.add(_t)
+        # Build expanded tag list (original + lowercase) mirroring crud logic
+        expanded_filter_tags = []
+        _seen = set()
+        for _t in tags + tags_lower:
+            if _t and _t not in _seen:
+                expanded_filter_tags.append(_t)
+                _seen.add(_t)
 
-            # Debug queries - include kind 1 (notes) and kind 30311 (long-form content)
-            debug_queries = [
-                ("all_today", {
-                    "kinds": [1, 30311],
-                    "since": midnight_timestamp,
-                    "authors": [eff_pub] if eff_pub else [],
-                }),
-                ("cyberherd_any", {
-                    "kinds": [1, 30311],
-                    "#t": expanded_filter_tags,
-                    "limit": 10
-                }),
-                ("author_recent", {
-                    "kinds": [1, 30311],
-                    "authors": [eff_pub] if eff_pub else [],
-                    "limit": 20
-                })
-            ]
-            
-            debug_results = {}
-            for query_name, query_filter in debug_queries:
-                try:
-                    debug_events = await nostr_helpers.query_events(query_filter, limit=20, timeout=4.0)
-                    debug_results[query_name] = {
-                        "count": len(debug_events or []),
-                        "events": debug_events[:5] if debug_events else []
-                    }
-                except Exception as e:
-                    debug_results[query_name] = {"error": str(e), "count": 0}
-            
-            return {
-                "note_ids": today_ids,
-                "debug": {
-                    "effective_pubkey": eff_pub,
-                    "tracked_tags": tags,
-                    "cache_key": str(cache_key),
-                    "queries": debug_results
+        # Debug queries - include kind 1 (notes) and kind 30311 (long-form content)
+        debug_queries = [
+            ("all_today", {
+                "kinds": [1, 30311],
+                "since": midnight_timestamp,
+                "authors": [eff_pub] if eff_pub else [],
+            }),
+            ("cyberherd_any", {
+                "kinds": [1, 30311],
+                "#t": expanded_filter_tags,
+                "limit": 10
+            }),
+            ("author_recent", {
+                "kinds": [1, 30311],
+                "authors": [eff_pub] if eff_pub else [],
+                "limit": 20
+            })
+        ]
+        
+        debug_results = {}
+        for query_name, query_filter in debug_queries:
+            try:
+                debug_events = await nostr_helpers.query_events(query_filter, limit=20, timeout=4.0)
+                debug_results[query_name] = {
+                    "count": len(debug_events or []),
+                    "events": debug_events[:5] if debug_events else []
                 }
+            except Exception as e:
+                debug_results[query_name] = {"error": str(e), "count": 0}
+        
+        return {
+            "note_ids": today_ids,
+            "debug": {
+                "effective_pubkey": eff_pub,
+                "tracked_tags": tags,
+                "queries": debug_results
             }
-        return {"note_ids": today_ids}
-
-    if lock is not None:
-        async with lock:
-            # Re-check cache inside lock
-            cached2 = _get_cached_notes(request, cache_key)
-            if cached2 is not None and not debug_mode:
-                return {"note_ids": cached2}
-            return await _query_and_cache()
-    else:
-        return await _query_and_cache()
+        }
+    return {"note_ids": today_ids}
 
 
 # ------------------------- Missing UI Endpoints -------------------------

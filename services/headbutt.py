@@ -589,7 +589,7 @@ class EnhancedHeadbuttService:
             return []
         try:
             # This logic is duplicated from views_api.py for service-layer use
-            from ..views_api import _cache_notes, _get_cached_notes, _get_effective_pubkey, _get_user_private_key
+            from ..views_api import _get_effective_pubkey, _get_user_private_key
             from .time_utils import get_day_boundaries_utc
 
             s = await self.db.get_settings(self.user_id)
@@ -607,9 +607,8 @@ class EnhancedHeadbuttService:
             # Use neutral cache key shape consistent with views_api/subscriptions
             cache_key = (day_key, None, eff_pub, tuple(sorted(tags)))
 
-            cached_notes = _get_cached_notes(self.app, cache_key)
-            if cached_notes is not None:
-                return cached_notes
+            # Cache check removed - relying on direct query or settings
+
 
             # Use local midnight for user's "today" (consistent with subscriptions.py)
             since = int(boundaries.local_since_ts)
@@ -644,7 +643,7 @@ class EnhancedHeadbuttService:
             ids = [m[0] for m in matched[:10]]
 
             logger.info(f"📋 Found {len(ids)} today's #CyberHerd notes for user {self.user_id}: {[i[:16]+'...' for i in ids]}")
-            _cache_notes(self.app, cache_key, ids)
+            # Cache update removed
             return ids
         except Exception as e:
             logger.error(f"Error getting today's cyberherd notes: {e}", exc_info=True)

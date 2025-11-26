@@ -33,6 +33,28 @@ from .subscriptions import (
 # Module-level app reference (set when first monitor is created)
 _app_instance = None
 
+# Subscription lookback window in seconds for engagement events (kind 6/7)
+# Engagement events use short lookback since we only care about recent interactions
+SUBSCRIPTION_LOOKBACK_SECONDS = 30
+
+
+def _get_midnight_timestamp() -> int:
+    """Get UTC epoch timestamp for the start of the current LOCAL day.
+    
+    This ensures note subscriptions (kind 1/30311) capture all events from
+    today, eliminating any timing gaps. Uses the same time utility pattern
+    as subscriptions.py for consistency.
+    
+    Returns:
+        UTC epoch timestamp for midnight local time today
+    """
+    try:
+        from .subscriptions import _local_midnight_timestamp
+        return _local_midnight_timestamp()
+    except Exception:
+        # Fallback: use current time minus 24 hours if helper unavailable
+        return int(time.time()) - (24 * 60 * 60)
+
 
 class NostrWebSocketMonitor:
     """Per-user Nostr event monitor using WebSocket connection.
@@ -76,6 +98,15 @@ class NostrWebSocketMonitor:
         
         # Reconnection task
         self.reconnect_task = None
+        
+        # Event deduplication: Track recently processed event IDs to prevent
+        # duplicate processing when lookback window overlaps with real-time events
+        # Keys are event IDs, values are timestamps when they were processed
+        self.processed_event_ids: dict[str, float] = {}
+        # How long to keep processed event IDs in memory (5 minutes)
+        self.dedup_ttl_seconds = 300
+        # Last cleanup time for processed event IDs
+        self.last_dedup_cleanup = time.time()
         
         logger.debug(f"🔌 NostrWebSocketMonitor created for user {user_id}")
     
@@ -354,7 +385,8 @@ class NostrWebSocketMonitor:
                     filter_dict = {
                         "kinds": engagement_kinds,  # Only enabled types
                         "#e": tracked_note_ids,  # Match events referencing ANY tracked note
-                        "since": int(time.time()),  # Only new events (real-time)
+                        # Use lookback window to catch events published during connection/subscription setup
+                        "since": int(time.time()) - SUBSCRIPTION_LOOKBACK_SECONDS,
                     }
                     
                     # Send REQ message
@@ -379,6 +411,7 @@ class NostrWebSocketMonitor:
                     logger.debug(
                         f"✅ User {self.user_id}: Created engagement subscription "
                         f"({'/'.join(engagement_types)}) for {len(tracked_note_ids)} tracked note(s) "
+                        f"with {SUBSCRIPTION_LOOKBACK_SECONDS}s lookback window "
                         f"(sub_id: {sub_id})"
                     )
                 else:
@@ -395,10 +428,17 @@ class NostrWebSocketMonitor:
                 sub_id = self._get_new_subid()
                 
                 # Build filter for user's new notes
+                # IMPORTANT: Use midnight timestamp to capture ALL notes from today
+                # This is more robust than a short lookback window and aligns with
+                # the "today's notes" concept used throughout cyberherd
+                midnight_ts = _get_midnight_timestamp()
+                
                 filter_dict = {
                     "kinds": [1, 30311],  # Regular notes and long-form content
                     "authors": [effective_pubkey],  # Only from this user
-                    "since": int(time.time()),  # Only new events (real-time)
+                    # Subscribe from midnight today to ensure we never miss notes
+                    # Deduplication prevents duplicate processing of stored events
+                    "since": midnight_ts,
                 }
                 
                 # Add tag filter if user is tracking specific hashtags
@@ -424,16 +464,17 @@ class NostrWebSocketMonitor:
                     "last_event_at": None,
                     "closed": False,
                 }
-                
+
                 logger.debug(
                     f"✅ User {self.user_id}: Created notes subscription (kind 1/30311) "
                     f"for pubkey {effective_pubkey[:8]}... "
                     f"{'with ' + str(len(tracked_tags)) + ' tag filter(s)' if tracked_tags else 'all tags'} "
+                    f"since midnight ({midnight_ts}) "
                     f"(sub_id: {sub_id})"
                 )
             else:
                 logger.debug(f"User {self.user_id}: No effective pubkey, skipping note subscription")
-            
+
             # 3) Zap receipts (kind 9735) subscription intentionally DISABLED
             # Previously we created a broad subscription for kind 9735 addressed to
             # the user's effective pubkey. To avoid relying on nostr zap receipts
@@ -482,6 +523,31 @@ class NostrWebSocketMonitor:
         try:
             event_id = event.get("id", "unknown")
             kind = event.get("kind")
+            
+            # Deduplication: Check if we've already processed this event recently
+            # This prevents duplicate processing when lookback window overlaps with real-time
+            current_time = time.time()
+            if event_id in self.processed_event_ids:
+                logger.debug(
+                    f"User {self.user_id}: Skipping duplicate event {event_id[:8]}... "
+                    f"(already processed {int(current_time - self.processed_event_ids[event_id])}s ago)"
+                )
+                return
+            
+            # Mark event as processed
+            self.processed_event_ids[event_id] = current_time
+            
+            # Periodic cleanup of old processed event IDs (every 60 seconds)
+            if current_time - self.last_dedup_cleanup > 60:
+                cutoff = current_time - self.dedup_ttl_seconds
+                old_ids = [eid for eid, ts in self.processed_event_ids.items() if ts < cutoff]
+                for eid in old_ids:
+                    del self.processed_event_ids[eid]
+                if old_ids:
+                    logger.debug(
+                        f"User {self.user_id}: Cleaned up {len(old_ids)} old processed event IDs"
+                    )
+                self.last_dedup_cleanup = current_time
             
             if kind in (1, 30311):
                 # Kind 1: Regular note

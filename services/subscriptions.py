@@ -117,7 +117,7 @@ def _hex_to_npub(pubkey: str) -> str | None:
 def _would_event_be_tracked(event: dict, eff_pub: str | None, tags: list[str]) -> bool:
     """Return True if the provided event would be considered tracked for the
     given effective pubkey and tracked tags. This mirrors the matching logic
-    in _append_today but without cache writes.
+    in _append_today.
     """
     try:
         if not eff_pub:
@@ -379,8 +379,8 @@ def _event_matches_tracked_tags(event: dict, tags_norm: list[str]) -> bool:
     return False
 
 
-async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, tags: list[str], event: dict, app=None) -> bool:
-    """Append event id into today's cache entries (user-specific + neutral) if matches:
+async def _append_today(user_id: str | None, eff_pub: str | None, tags: list[str], event: dict, app=None) -> bool:
+    """Append event id into tracked_event_ids if matches:
     - Author equals eff_pub
     - Contains any tracked tag (t-tag equals or '#tag' in content)
     - created_at is within current LOCAL day (user's "today")
@@ -390,7 +390,6 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
     TIME HANDLING (UTC-FIRST):
     - Gets boundaries using get_day_boundaries_utc() for consistency
     - Checks event.created_at against LOCAL day boundaries (user's "today" concept)
-    - Cache key uses UTC date for storage consistency
     """
     eid = event.get("id")
     if not eid:
@@ -479,6 +478,19 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
 
                 if eid not in current_tracked or addresses_changed:
                     settings.tracked_event_ids = updated_tracked
+                    
+                    # Store event timestamp for optimized recovery scanning
+                    timestamps = dict(getattr(settings, 'tracked_event_timestamps', {}) or {})
+                    if eid not in timestamps:
+                        created_at = 0
+                        try:
+                            created_at = int(event.get("created_at") or 0)
+                        except Exception:
+                            pass
+                        if created_at > 0:
+                            timestamps[eid] = created_at
+                            settings.tracked_event_timestamps = timestamps
+
                     if pruned_addresses is not None:
                         settings.tracked_event_addresses = pruned_addresses
                     await crud.upsert_settings(settings, user_id)
@@ -508,23 +520,7 @@ async def _append_today(cache: dict, user_id: str | None, eff_pub: str | None, t
         except Exception as e:
             logger.warning(f"Failed to auto-add event {eid} to tracked_event_ids: {e}")
 
-    # UTC-FIRST: Cache key uses UTC date for storage consistency
-    # This ensures cache keys don't change during DST transitions
-    # and are consistent across different user timezones
-    day = boundaries.utc_day_str  # Use UTC date string (e.g., "2025-10-04")
-    tagset = tuple(sorted(tags_norm))
-    
-    # Cache keys format: (utc_date, user_id, eff_pub, tagset)
-    # The UTC date ensures storage consistency while the local day check
-    # (above) ensures users see their "today" notes correctly
-    keys = [
-        (day, user_id, eff_pub, tagset),
-        (day, None, eff_pub, tagset),  # neutral key for unauthenticated lookups
-    ]
-    for k in keys:
-        note_ids = _get_cache_note_ids(cache, k, create=True)
-        if eid not in note_ids:
-            note_ids.append(eid)
+    # Cache logic removed - relying on DB as single source of truth
     return True
 
 
@@ -561,6 +557,10 @@ async def force_requery_for_user(app, user_id: str) -> list[str]:
             return []
         
         _record_availability_check(True)
+        
+        # Track newly detected note IDs in memory to pass to subsequent steps
+        # This avoids race conditions where DB updates aren't immediately visible
+        newly_detected_ids = set()
         
         # Get time boundaries for today (UTC-first approach)
         boundaries = _get_today_boundaries_utc()
@@ -612,6 +612,8 @@ async def force_requery_for_user(app, user_id: str) -> list[str]:
                         note_id = note.get("id")
                         if note_id:
                             processed_ids.append(note_id)
+                            # Add to local set of currently tracked IDs for immediate use
+                            newly_detected_ids.add(note_id)
                     except Exception as e:
                         logger.warning(f"Failed to process note {note.get('id')} during recovery: {e}")
                         
@@ -620,16 +622,20 @@ async def force_requery_for_user(app, user_id: str) -> list[str]:
                 _record_helper_query(False, str(e))
         
         # Query engagement events (reposts and reactions) for tracked notes
-        tracked_event_ids = getattr(settings, 'tracked_event_ids', []) or []
-        if not tracked_event_ids:
+        # Combine existing tracked IDs with newly detected ones to ensure we query for
+        # everything, even if the DB update from process_note_for_tracked_tags isn't visible yet.
+        existing_tracked = getattr(settings, 'tracked_event_ids', []) or []
+        all_tracked_ids = list(set(existing_tracked) | newly_detected_ids)
+        
+        if not all_tracked_ids:
             logger.info(f"No tracked events for user {user_id}, skipping engagement recovery")
         else:
-            logger.debug(f"Querying engagement for {len(tracked_event_ids)} tracked notes")
+            logger.debug(f"Querying engagement for {len(all_tracked_ids)} tracked notes")
             
             # Build filters for reposts and reactions
             filters = {
                 "kinds": [6, 7],  # reposts and reactions
-                "#e": tracked_event_ids,
+                "#e": all_tracked_ids,
                 "since": since_ts,
                 "limit": 1000
             }
@@ -685,6 +691,11 @@ async def force_requery_for_user(app, user_id: str) -> list[str]:
             from ..services.payment_coordinator import get_payment_coordinator
             monitor = get_payment_coordinator(app=app, db=crud, user_id=user_id)
             logger.info(f"Triggering payment-based zap recovery for user {user_id}")
+            
+            # Update settings object in memory with latest tracked IDs for payment recovery
+            # This ensures payment recovery sees the notes we just detected
+            settings.tracked_event_ids = all_tracked_ids
+            
             payment_result = await monitor._recover_missed_payment_zaps(settings)
             if payment_result:
                 scanned = payment_result.get("scanned", 0)
@@ -934,7 +945,7 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                 f"tracked_tags: {tags} user_id={user_id}"
             )
             cache = _get_cache(app)
-            result = await _append_today(cache, user_id, eff_pub, tags, event, app)
+            result = await _append_today(user_id, eff_pub, tags, event, app)
             if result:
                 logger.info(f"✅ New tracked note detected: {eid[:16]}... for user {user_id}")
             else:

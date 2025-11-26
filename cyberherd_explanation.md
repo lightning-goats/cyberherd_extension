@@ -4,7 +4,7 @@
 
 The #CyberHerd is a community of Nostr users who collectively support the ⚡Lightning Goats⚡ project. As a herd member, you'll receive a share of all payments sent to feed the goats every time the feeder is triggered!
 
-**Important: The CyberHerd resets every night at midnight UTC.** All memberships and accumulated zap amounts are cleared, giving everyone a fresh start each day. This means:
+**Important: The CyberHerd resets every night at midnight (Local Time).** All memberships and accumulated zap amounts are cleared, giving everyone a fresh start each day. This means:
 - All members are removed from the herd
 - All accumulated zap amounts reset to zero
 - New daily #CyberHerd note is posted for that day's membership
@@ -81,7 +81,7 @@ Once you're a CyberHerd member, you have **flexible zapping options** to increas
 
 ## How Payouts Work
 
-**Daily Reset Notice**: Remember that the CyberHerd resets every night at midnight UTC, so all accumulated zaps and memberships start fresh each day.
+**Daily Reset Notice**: Remember that the CyberHerd resets every night at midnight (Local Time), so all accumulated zaps and memberships start fresh each day.
 
 When the Lightning Goats feeder activates (around 850 sats), payments are automatically split:
 
@@ -276,11 +276,11 @@ The CyberHerd works automatically behind the scenes:
 5. **Explore flexible zapping**: Once a member, zap ANY Lightning Goats note to increase your payout share and headbutt protection
 6. **Monitor the herd**: Check current members to plan your strategy
 7. **Stay active**: Regular zaps to Lightning Goats content build up your total contribution and payout share
-8. **Daily renewal**: Remember the herd resets at midnight UTC - you'll need to rejoin each day using that day's #CyberHerd note
+8. **Daily renewal**: Remember the herd resets at midnight (Local Time) - you'll need to rejoin each day using that day's #CyberHerd note
 
 ## Important Notes
 
-- **Daily Reset**: The CyberHerd resets every night at midnight UTC - all memberships and zap amounts are cleared (opt-in, configurable)
+- **Daily Reset**: The CyberHerd resets every night at midnight (Local Time) - all memberships and zap amounts are cleared (opt-in, configurable)
 - **Today's note only**: Only the current day's #CyberHerd tagged note is valid for joining (older notes don't work)
 - **Requirements**: NIP-05 identifier (configurable, can be disabled) and working Lightning address required
 - **Content scope**: Only zaps to Lightning Goats authored notes qualify for membership and payouts

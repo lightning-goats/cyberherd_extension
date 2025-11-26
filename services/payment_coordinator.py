@@ -952,6 +952,25 @@ class PaymentCoordinatorService:
                 from ..utils.common import utc_now_timestamp
                 since_ts = utc_now_timestamp() - 86400
 
+            # OPTIMIZATION: If we have timestamps for tracked events, start scanning
+            # from the earliest event timestamp. This avoids scanning payments that
+            # occurred before the notes even existed.
+            timestamps = getattr(settings, 'tracked_event_timestamps', {}) or {}
+            earliest_ts = None
+            for nid in tracked_notes:
+                ts = timestamps.get(nid)
+                if ts:
+                    if earliest_ts is None or ts < earliest_ts:
+                        earliest_ts = ts
+            
+            if earliest_ts:
+                # Ensure we don't go further back than midnight (sanity check, though notes shouldn't be before midnight)
+                # Actually, if a note was created before midnight (e.g. timezone edge case), we should respect its timestamp.
+                # But tracked_event_ids are supposed to be "today's" notes.
+                # Let's just use the earliest timestamp, it's safer and more precise.
+                since_ts = earliest_ts
+                logger.info(f"Recovery start time set to earliest event timestamp: {since_ts}")
+
             # Lazy import of payments helper to avoid circular imports at module load
             try:
                 from lnbits.core.services.payments import get_payments
