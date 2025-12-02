@@ -23,6 +23,7 @@ from .services.payment_coordinator import (
 from .services.nostr_websocket_monitor import (
     start_monitor_for_user,
     trigger_immediate_refresh,
+    clear_monitor_cache_for_user,
 )
 from . import crud as crud_module
 from .utils.common import parse_bool_env, utc_now
@@ -253,6 +254,15 @@ async def _restart_kind1_subscriptions_for_user(
     except Exception as exc:
         logger.warning(
             f"CyberHerd midnight reset: failed to ensure monitor for user {uid_short}: {exc}"
+        )
+
+    # Clear in-memory deduplication cache to ensure notes from the new day
+    # are processed even if they were just seen (preventing race conditions)
+    try:
+        await clear_monitor_cache_for_user(user_id)
+    except Exception as exc:
+        logger.warning(
+            f"CyberHerd midnight reset: failed to clear monitor cache for user {uid_short}: {exc}"
         )
 
     try:

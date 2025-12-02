@@ -2174,17 +2174,27 @@ async def _bootstrap_cyberherd_tables():
     ]
     # Ensure processed_events table exists for idempotent runtime self-heal
     # This table tracks processed payments to prevent duplicate member_increase posts
+    # NOTE: The unique constraint is on (user_id, event_hash, note_id) to allow
+    # the same event to be tracked for multiple different notes (e.g., a repost
+    # that mentions two tracked notes should create two separate rows)
     stmts.append(
         f"""
         CREATE TABLE IF NOT EXISTS {db.references_schema}processed_events (
             user_id TEXT NOT NULL,
             event_hash TEXT NOT NULL,
-            note_id TEXT,
+            note_id TEXT DEFAULT '',
             pubkey TEXT,
             processed_at INTEGER NOT NULL,
-            event_type TEXT,
-            UNIQUE(user_id, event_hash)
+            event_type TEXT
         );
+        """
+    )
+    # Add unique index on the triple (user_id, event_hash, note_id)
+    # Using COALESCE to handle NULL note_ids as empty strings
+    stmts.append(
+        f"""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_events_unique_triple 
+        ON {db.references_schema}processed_events(user_id, event_hash, COALESCE(note_id, ''));
         """
     )
     stmts.append(
@@ -2819,12 +2829,14 @@ async def get_monitoring_totals(user_id: str) -> dict[str, int]:
     return totals
 
 
-async def is_payment_processed(user_id: str, payment_hash: str) -> bool:
-    """Check if a payment has already been processed.
+async def is_payment_processed(user_id: str, payment_hash: str, note_id: str | None = None) -> bool:
+    """Check if a payment/event has already been processed.
     
     Args:
         user_id: User ID to scope the check.
-        payment_hash: Payment hash to check.
+        payment_hash: Payment hash or event ID to check.
+        note_id: Optional note ID. If provided, checks for the specific (event, note) pair.
+                 If not provided, checks if event was processed for ANY note.
     
     Returns:
         True if payment was already processed, False otherwise.
@@ -2833,20 +2845,35 @@ async def is_payment_processed(user_id: str, payment_hash: str) -> bool:
         return False
     
     try:
-        row = await db.fetchone(
-            f"SELECT 1 FROM {db.references_schema}processed_events WHERE user_id = :user_id AND event_hash = :event_hash",
-            {"user_id": user_id, "event_hash": payment_hash},
-        )
+        if note_id is not None:
+            # Check for specific (event, note) pair
+            # Use COALESCE to handle both NULL and empty string note_id values
+            row = await db.fetchone(
+                f"SELECT 1 FROM {db.references_schema}processed_events WHERE user_id = :user_id AND event_hash = :event_hash AND COALESCE(note_id, '') = :note_id",
+                {"user_id": user_id, "event_hash": payment_hash, "note_id": note_id or ''},
+            )
+        else:
+            # Check if event was processed for any note (backward compatible behavior)
+            row = await db.fetchone(
+                f"SELECT 1 FROM {db.references_schema}processed_events WHERE user_id = :user_id AND event_hash = :event_hash",
+                {"user_id": user_id, "event_hash": payment_hash},
+            )
         return row is not None
     except Exception as e:
         msg = str(e).lower()
         if any(t in msg for t in ("undefinedtable", "does not exist", "no such table")):
             try:
                 await _bootstrap_cyberherd_tables()
-                row = await db.fetchone(
-                    f"SELECT 1 FROM {db.references_schema}processed_events WHERE user_id = :user_id AND event_hash = :event_hash",
-                    {"user_id": user_id, "event_hash": payment_hash},
-                )
+                if note_id is not None:
+                    row = await db.fetchone(
+                        f"SELECT 1 FROM {db.references_schema}processed_events WHERE user_id = :user_id AND event_hash = :event_hash AND COALESCE(note_id, '') = :note_id",
+                        {"user_id": user_id, "event_hash": payment_hash, "note_id": note_id or ''},
+                    )
+                else:
+                    row = await db.fetchone(
+                        f"SELECT 1 FROM {db.references_schema}processed_events WHERE user_id = :user_id AND event_hash = :event_hash",
+                        {"user_id": user_id, "event_hash": payment_hash},
+                    )
                 return row is not None
             except Exception:
                 return False
@@ -2865,7 +2892,8 @@ async def register_processed_payment(
     Args:
         user_id: User ID to scope the record.
         payment_hash: Payment hash to register.
-        note_id: Optional note ID for reference.
+        note_id: Optional note ID for reference. Used in unique constraint to allow
+                 the same event to be processed for multiple different notes.
         pubkey: Optional pubkey for reference.
         event_type: Optional classification for the processed event (e.g., "zap").
     
@@ -2875,29 +2903,33 @@ async def register_processed_payment(
     if not user_id or not payment_hash:
         return False
 
+    # Normalize note_id: convert None to empty string for consistent unique constraint handling
+    normalized_note_id = note_id or ''
+
     # Use a write lock to serialize the check-and-insert to reliably determine
     # whether we actually inserted a new row or the row already existed.
     try:
         async with _crud_write_lock:
             try:
-                # Check existence first
+                # Check existence first - include note_id in the check for the new schema
+                # Use COALESCE to handle both NULL and empty string note_id values
                 row = await db.fetchone(
-                    f"SELECT 1 FROM {db.references_schema}processed_events WHERE user_id = :user_id AND event_hash = :event_hash",
-                    {"user_id": user_id, "event_hash": payment_hash},
+                    f"SELECT 1 FROM {db.references_schema}processed_events WHERE user_id = :user_id AND event_hash = :event_hash AND COALESCE(note_id, '') = :note_id",
+                    {"user_id": user_id, "event_hash": payment_hash, "note_id": normalized_note_id},
                 )
                 if row:
                     return False  # Already existed
 
                 # Not present — insert and report True
+                # The unique constraint is now on (user_id, event_hash, note_id)
                 await db.execute(
                     f"""INSERT INTO {db.references_schema}processed_events (user_id, event_hash, note_id, pubkey, processed_at, event_type)
                     VALUES (:user_id, :event_hash, :note_id, :pubkey, :processed_at, :event_type)
-                    ON CONFLICT(user_id, event_hash) DO NOTHING
                     """,
                     {
                         "user_id": user_id,
                         "event_hash": payment_hash,
-                        "note_id": note_id,
+                        "note_id": normalized_note_id,
                         "pubkey": _normalize_hex(pubkey) or pubkey,
                         "processed_at": int(time.time()),
                         "event_type": event_type,
@@ -2906,6 +2938,9 @@ async def register_processed_payment(
                 return True
             except Exception as e:
                 msg = str(e).lower()
+                # Check for unique constraint violation (already exists)
+                if any(t in msg for t in ("unique constraint", "duplicate key", "unique_violation")):
+                    return False  # Already existed (race condition)
                 if any(
                     t in msg
                     for t in (
@@ -2921,27 +2956,30 @@ async def register_processed_payment(
                         await _bootstrap_cyberherd_tables()
                         # After bootstrap, perform the check-insert again
                         row = await db.fetchone(
-                            f"SELECT 1 FROM {db.references_schema}processed_events WHERE user_id = :user_id AND event_hash = :event_hash",
-                            {"user_id": user_id, "event_hash": payment_hash},
+                            f"SELECT 1 FROM {db.references_schema}processed_events WHERE user_id = :user_id AND event_hash = :event_hash AND COALESCE(note_id, '') = :note_id",
+                            {"user_id": user_id, "event_hash": payment_hash, "note_id": normalized_note_id},
                         )
                         if row:
                             return False
                         await db.execute(
                             f"""INSERT INTO {db.references_schema}processed_events (user_id, event_hash, note_id, pubkey, processed_at, event_type)
                             VALUES (:user_id, :event_hash, :note_id, :pubkey, :processed_at, :event_type)
-                            ON CONFLICT(user_id, event_hash) DO NOTHING
                             """,
                             {
                                 "user_id": user_id,
                                 "event_hash": payment_hash,
-                                "note_id": note_id,
+                                "note_id": normalized_note_id,
                                 "pubkey": _normalize_hex(pubkey) or pubkey,
                                 "processed_at": int(time.time()),
                                 "event_type": event_type,
                             },
                         )
                         return True
-                    except Exception:
+                    except Exception as retry_e:
+                        # Check for unique constraint violation on retry
+                        retry_msg = str(retry_e).lower()
+                        if any(t in retry_msg for t in ("unique constraint", "duplicate key", "unique_violation")):
+                            return False
                         return False
                 # If other DB errors occurred, return False to indicate not newly registered
                 return False
@@ -3005,14 +3043,20 @@ async def clear_processed_events_for_user(user_id: str | None):
             logger.warning(f"Failed clearing processed_events for user {user_id}: {e}")
 
 
-async def is_event_processed(user_id: str, event_hash: str) -> bool:
+async def is_event_processed(user_id: str, event_hash: str, note_id: str | None = None) -> bool:
     """Alias for is_payment_processed with clearer naming for nostr events.
 
     This exists to make calling code explicit about processing Nostr events
     (reposts/reactions) vs invoice payments while reusing the same persisted
     processed_events table.
+    
+    Args:
+        user_id: User ID to scope the check.
+        event_hash: Event ID to check.
+        note_id: Optional note ID. If provided, checks for the specific (event, note) pair.
+                 If not provided, checks if event was processed for ANY note.
     """
-    return await is_payment_processed(user_id, event_hash)
+    return await is_payment_processed(user_id, event_hash, note_id=note_id)
 
 
 async def register_processed_event(

@@ -41,6 +41,11 @@ from lnbits.extensions.cyberherd.services.nostr_helpers import (
     lookup_metadata,
     lookup_relays,
 )
+from lnbits.extensions.cyberherd.services.subscriptions import (
+    _get_cache,
+    _get_cache_note_ids,
+)
+from lnbits.extensions.cyberherd.services.time_utils import get_day_boundaries_utc
 from lnbits.extensions.cyberherd.services.headbutt import (
     _normalize_event_id as normalize_event_id,
 )
@@ -1698,6 +1703,32 @@ async def api_get_today_cyberherd_notes(request: Request, auth=Depends(auth_wall
     # Return tracked_event_ids from settings (maintained by subscription system)
     # This reflects the notes that are actively being monitored for engagements
     tracked_ids = getattr(s, "tracked_event_ids", []) or []
+    
+    # Merge with in-memory cache to ensure immediate visibility
+    # This satisfies the requirement to use the same in-memory variable as the writer
+    try:
+        boundaries = get_day_boundaries_utc()
+        day = boundaries.utc_day_str
+        tagset = tuple(sorted([t.lstrip('#').lower() for t in tags if t]))
+        # Check both user-specific and neutral keys
+        cache_keys = [
+            (day, None, eff_pub, tagset),
+            (day, user_id, eff_pub, tagset),
+        ]
+        cache = _get_cache(request.app)
+        cached_ids = set()
+        for key in cache_keys:
+            ids = _get_cache_note_ids(cache, key)
+            cached_ids.update(ids)
+        
+        # Merge unique IDs
+        tracked_set = set(tracked_ids) | cached_ids
+        tracked_ids = list(tracked_set)
+        logger.debug(f"Merged tracked_ids from DB ({len(getattr(s, 'tracked_event_ids', []))}) and cache ({len(cached_ids)}) -> total {len(tracked_ids)}")
+    except Exception as e:
+        logger.warning(f"Failed to merge from in-memory cache: {e}")
+
+    logger.info(f"DEBUG: api_get_today_cyberherd_notes user={user_id} tracked_ids_len={len(tracked_ids)} ids={tracked_ids}")
     
     # Normalize to list of strings
     today_ids = []

@@ -39,6 +39,7 @@ cyberherd_ext: APIRouter = APIRouter(prefix="/cyberherd", tags=["cyberherd"])
 
 # Keep track of background tasks
 scheduled_tasks: list = []
+_APP_REF = None
 
 
 def cyberherd_stop():
@@ -64,9 +65,18 @@ def cyberherd_start():
         async def _start_websocket_monitors():
             try:
                 from .services.websocket_monitor_tasks import handle_websocket_monitors
-                # Get app reference from LNbits - we need it for event processing
-                # For now, pass None and monitors will work without app-specific features
-                await handle_websocket_monitors(None)
+                # Wait for app reference to be available (set by init_extension)
+                # This ensures monitors have access to app state for cache updates
+                retries = 0
+                while _APP_REF is None and retries < 30:
+                    await asyncio.sleep(1)
+                    retries += 1
+                
+                if _APP_REF is None:
+                    logger.warning("Cyberherd: _APP_REF still None after waiting, starting monitors without app context")
+                
+                # Use the captured global app reference
+                await handle_websocket_monitors(_APP_REF)
             except asyncio.CancelledError:
                 logger.info("Cyberherd: WebSocket monitor task cancelled")
                 raise
@@ -166,6 +176,9 @@ def init_extension(app):
         logger.info("=" * 50)
     except Exception:
         print("CYBERHERD: init_extension called (logger failed)")
+    
+    global _APP_REF
+    _APP_REF = app
     
     _init_db(app)
     _attach_metadata(app)

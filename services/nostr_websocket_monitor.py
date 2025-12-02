@@ -38,22 +38,7 @@ _app_instance = None
 SUBSCRIPTION_LOOKBACK_SECONDS = 30
 
 
-def _get_midnight_timestamp() -> int:
-    """Get UTC epoch timestamp for the start of the current LOCAL day.
-    
-    This ensures note subscriptions (kind 1/30311) capture all events from
-    today, eliminating any timing gaps. Uses the same time utility pattern
-    as subscriptions.py for consistency.
-    
-    Returns:
-        UTC epoch timestamp for midnight local time today
-    """
-    try:
-        from .subscriptions import _local_midnight_timestamp
-        return _local_midnight_timestamp()
-    except Exception:
-        # Fallback: use current time minus 24 hours if helper unavailable
-        return int(time.time()) - (24 * 60 * 60)
+
 
 
 class NostrWebSocketMonitor:
@@ -110,6 +95,15 @@ class NostrWebSocketMonitor:
         
         logger.debug(f"🔌 NostrWebSocketMonitor created for user {user_id}")
     
+    def clear_processed_cache(self):
+        """Clear the in-memory processed event deduplication cache.
+        
+        This is required during midnight reset to ensure that notes from the new day
+        are re-processed and added to tracked_event_ids even if they were just seen.
+        """
+        self.processed_event_ids.clear()
+        logger.debug(f"User {self.user_id}: Cleared processed event deduplication cache")
+
     def _is_shutting_down(self) -> bool:
         """Return True if the monitor (or LNbits) is shutting down."""
         return self.shutdown or not settings.lnbits_running
@@ -428,17 +422,17 @@ class NostrWebSocketMonitor:
                 sub_id = self._get_new_subid()
                 
                 # Build filter for user's new notes
-                # IMPORTANT: Use midnight timestamp to capture ALL notes from today
-                # This is more robust than a short lookback window and aligns with
-                # the "today's notes" concept used throughout cyberherd
-                midnight_ts = _get_midnight_timestamp()
+                # We use a short lookback window (real-time) similar to engagement events.
+                # Historical events (from earlier today) are handled by:
+                # 1. force_requery_for_user() called on connection
+                # 2. periodic_event_recovery() called hourly
+                # This avoids issues with "since" filters being too far in the past.
                 
                 filter_dict = {
                     "kinds": [1, 30311],  # Regular notes and long-form content
                     "authors": [effective_pubkey],  # Only from this user
-                    # Subscribe from midnight today to ensure we never miss notes
-                    # Deduplication prevents duplicate processing of stored events
-                    "since": midnight_ts,
+                    # Real-time subscription with short lookback
+                    "since": int(time.time()) - SUBSCRIPTION_LOOKBACK_SECONDS,
                 }
                 
                 # Add tag filter if user is tracking specific hashtags
@@ -469,7 +463,7 @@ class NostrWebSocketMonitor:
                     f"✅ User {self.user_id}: Created notes subscription (kind 1/30311) "
                     f"for pubkey {effective_pubkey[:8]}... "
                     f"{'with ' + str(len(tracked_tags)) + ' tag filter(s)' if tracked_tags else 'all tags'} "
-                    f"since midnight ({midnight_ts}) "
+                    f"since now-{SUBSCRIPTION_LOOKBACK_SECONDS}s "
                     f"(sub_id: {sub_id})"
                 )
             else:
@@ -789,3 +783,15 @@ async def trigger_immediate_refresh(user_id: str):
         await monitor.refresh_subscriptions_now()
     else:
         logger.debug(f"No active monitor for user {user_id}, skipping refresh")
+
+
+async def clear_monitor_cache_for_user(user_id: str):
+    """Clear the in-memory deduplication cache for a user's monitor.
+    
+    Args:
+        user_id: LNbits user ID
+    """
+    monitor = _active_monitors.get(user_id)
+    if monitor:
+        monitor.clear_processed_cache()
+

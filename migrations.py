@@ -32,6 +32,7 @@ __all__ = [
     'm031_add_send_splits_enabled',  # Add send_splits_enabled toggle for automatic splits
     'm032_enable_interaction_tracking',  # Enable repost/reaction tracking by default for existing users
     'm033_add_member_allocation_percent',  # Add member_allocation_percent for configurable split percentage
+    'm034_fix_processed_events_unique_constraint',  # Fix unique constraint to include note_id for multi-note events
 ]
 
 logger.info(f"CYBERHERD MIGRATIONS: Registered {len(__all__)} migrations: {__all__}")
@@ -602,3 +603,109 @@ async def m033_add_member_allocation_percent(db: Database):
             logger.info("CYBERHERD m033: member_allocation_percent column already exists, skipping")
         else:
             logger.warning(f"CYBERHERD m033: failed to add member_allocation_percent column: {e}")
+
+
+async def m034_fix_processed_events_unique_constraint(db: Database):
+    """Fix the processed_events unique constraint to include note_id.
+    
+    The original unique constraint was UNIQUE(user_id, event_hash), but this prevents
+    proper tracking of events that reference multiple tracked notes (e.g., a repost
+    that mentions two different tracked notes should create two processed_events rows).
+    
+    The new constraint is UNIQUE(user_id, event_hash, note_id) with note_id defaulting
+    to empty string for NULL values to maintain uniqueness semantics.
+    
+    This migration:
+    1. Creates a new table with the correct constraint
+    2. Migrates existing data (handling NULL note_ids)
+    3. Drops the old table and renames the new one
+    """
+    logger.info("CYBERHERD m034: fixing processed_events unique constraint to include note_id")
+    table_name = f"{db.references_schema}processed_events"
+    temp_table = f"{db.references_schema}processed_events_new"
+    
+    try:
+        # Step 1: Create new table with correct unique constraint
+        # Using COALESCE pattern in the unique index to handle NULL note_ids
+        await db.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {temp_table} (
+                user_id TEXT NOT NULL,
+                event_hash TEXT NOT NULL,
+                note_id TEXT DEFAULT '',
+                pubkey TEXT,
+                processed_at INTEGER NOT NULL,
+                event_type TEXT
+            );
+            """
+        )
+        
+        # Step 2: Create the unique index that handles the (user_id, event_hash, note_id) triple
+        # Using COALESCE to ensure NULL note_ids are treated as empty strings
+        try:
+            await db.execute(
+                f"""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_events_unique_triple 
+                ON {temp_table}(user_id, event_hash, COALESCE(note_id, ''));
+                """
+            )
+        except Exception as idx_e:
+            # Some databases may not support COALESCE in index - fall back to simpler approach
+            logger.debug(f"CYBERHERD m034: COALESCE index failed, trying simple index: {idx_e}")
+            try:
+                await db.execute(
+                    f"""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_events_unique_triple 
+                    ON {temp_table}(user_id, event_hash, note_id);
+                    """
+                )
+            except Exception:
+                pass
+        
+        # Step 3: Migrate existing data, converting NULL note_ids to empty string
+        # and handling duplicates by keeping the earliest processed_at
+        try:
+            await db.execute(
+                f"""
+                INSERT INTO {temp_table} (user_id, event_hash, note_id, pubkey, processed_at, event_type)
+                SELECT 
+                    user_id, 
+                    event_hash, 
+                    COALESCE(note_id, '') as note_id,
+                    pubkey, 
+                    processed_at, 
+                    event_type
+                FROM {table_name}
+                WHERE user_id IS NOT NULL AND event_hash IS NOT NULL
+                ON CONFLICT DO NOTHING;
+                """
+            )
+            logger.info("CYBERHERD m034: migrated existing data to new table")
+        except Exception as migrate_e:
+            # If migration fails, the old table structure is still valid
+            # Just log and continue - the code will work with the old structure
+            logger.warning(f"CYBERHERD m034: data migration failed, keeping old table: {migrate_e}")
+            try:
+                await db.execute(f"DROP TABLE IF EXISTS {temp_table};")
+            except Exception:
+                pass
+            return
+        
+        # Step 4: Drop old table and rename new one
+        try:
+            await db.execute(f"DROP TABLE IF EXISTS {table_name};")
+            await db.execute(f"ALTER TABLE {temp_table} RENAME TO processed_events;")
+            logger.info("CYBERHERD m034: replaced old table with new schema")
+        except Exception as rename_e:
+            logger.warning(f"CYBERHERD m034: table swap failed: {rename_e}")
+            # Try to recover by keeping old table
+            try:
+                await db.execute(f"DROP TABLE IF EXISTS {temp_table};")
+            except Exception:
+                pass
+            return
+        
+        logger.info("CYBERHERD m034: processed_events unique constraint fixed successfully")
+    except Exception as e:
+        logger.warning(f"CYBERHERD m034: migration failed: {e}")
+

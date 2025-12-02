@@ -55,6 +55,16 @@ _helper_diagnostics = {
     'last_failure_reason': None,
 }
 
+# Lock for serializing updates to tracked_event_ids per user to prevent race conditions
+_user_update_locks: dict[str, asyncio.Lock] = {}
+_user_locks_mutex = asyncio.Lock()
+
+async def _get_user_lock(user_id: str) -> asyncio.Lock:
+    async with _user_locks_mutex:
+        if user_id not in _user_update_locks:
+            _user_update_locks[user_id] = asyncio.Lock()
+        return _user_update_locks[user_id]
+
 def get_helper_diagnostics() -> dict:
     """Get diagnostics for nostr_helpers interactions.
     
@@ -443,82 +453,91 @@ async def _append_today(user_id: str | None, eff_pub: str | None, tags: list[str
         # Extract event's tags for logging
         event_t_tags = [t[1] for t in event.get('tags', []) if isinstance(t, list) and len(t) >= 2 and t[0] == 't']
         content_preview = (event.get('content', '') or '')[:100]
-        logger.debug(
-            f"🏷️ Skipping event {eid[:16]}... with t-tags {event_t_tags} content_preview='{content_preview}' "
-            f"(not matching tracked tags {tags_norm}) user_id={user_id}"
-        )
-        return False
-
+        logger.debug(f"🏷️ Skipping event {eid[:16]}... with t-tags {event_t_tags} content_preview='{content_preview}'")
     # Auto-add detected note event IDs to tracked_event_ids for repost/reaction tracking
-    if app is not None and user_id is not None:
-        try:
-            from .. import crud
+    if user_id is not None:
+        # Acquire lock to prevent read-modify-write race conditions
+        lock = await _get_user_lock(user_id)
+        async with lock:
+            try:
+                from .. import crud
 
-            settings = await crud.get_settings(user_id)
-            if settings:
-                current_tracked = getattr(settings, 'tracked_event_ids', []) or []
-                updated_tracked = current_tracked if eid in current_tracked else current_tracked + [eid]
-                is_long_form = False
-                try:
-                    is_long_form = int(event.get("kind") or 0) == 30311
-                except Exception:
-                    is_long_form = event.get("kind") == 30311
+                # Re-fetch settings inside lock to ensure we have the latest state
+                settings = await crud.get_settings(user_id)
+                if settings:
+                    current_tracked = getattr(settings, 'tracked_event_ids', []) or []
+                    updated_tracked = current_tracked if eid in current_tracked else current_tracked + [eid]
+                    is_long_form = False
+                    try:
+                        is_long_form = int(event.get("kind") or 0) == 30311
+                    except Exception:
+                        is_long_form = event.get("kind") == 30311
 
-                pruned_addresses = None
-                addresses_changed = False
-                if is_long_form:
-                    addresses = dict(getattr(settings, 'tracked_event_addresses', {}) or {})
-                    apply_event_address(addresses, event)
-                    pruned_addresses = {
-                        nid: addr for nid, addr in addresses.items() if nid in updated_tracked
-                    }
-                    addresses_changed = pruned_addresses != (
-                        getattr(settings, 'tracked_event_addresses', {}) or {}
-                    )
+                    pruned_addresses = None
+                    addresses_changed = False
+                    if is_long_form:
+                        addresses = dict(getattr(settings, 'tracked_event_addresses', {}) or {})
+                        apply_event_address(addresses, event)
+                        pruned_addresses = {
+                            nid: addr for nid, addr in addresses.items() if nid in updated_tracked
+                        }
+                        addresses_changed = pruned_addresses != (
+                            getattr(settings, 'tracked_event_addresses', {}) or {}
+                        )
 
-                if eid not in current_tracked or addresses_changed:
-                    settings.tracked_event_ids = updated_tracked
-                    
-                    # Store event timestamp for optimized recovery scanning
-                    timestamps = dict(getattr(settings, 'tracked_event_timestamps', {}) or {})
-                    if eid not in timestamps:
-                        created_at = 0
+                    if eid not in current_tracked or addresses_changed:
+                        settings.tracked_event_ids = updated_tracked
+                        
+                        # Store event timestamp for optimized recovery scanning
+                        timestamps = dict(getattr(settings, 'tracked_event_timestamps', {}) or {})
                         try:
                             created_at = int(event.get("created_at") or 0)
+                            if created_at > 0:
+                                timestamps[eid] = created_at
+                                settings.tracked_event_timestamps = timestamps
                         except Exception:
                             pass
-                        if created_at > 0:
-                            timestamps[eid] = created_at
-                            settings.tracked_event_timestamps = timestamps
 
-                    if pruned_addresses is not None:
-                        settings.tracked_event_addresses = pruned_addresses
-                    await crud.upsert_settings(settings, user_id)
-                    _dbg(f"Auto-added/updated event {eid} metadata for user {user_id}")
-                    if eid not in current_tracked:
-                        try:
-                            logger.info(
-                                f"🎯 Auto-added tracked event id={eid} for user={user_id} (note author={eff_pub}). "
-                                f"Total tracked events: {len(updated_tracked)}. Triggering immediate subscription refresh..."
-                            )
-                        except Exception:
-                            pass
+                        if is_long_form and pruned_addresses is not None:
+                            settings.tracked_event_addresses = pruned_addresses
+
+                        await crud.upsert_settings(settings, user_id)
+                        _dbg(f"Auto-added/updated event {eid} metadata for user {user_id}")
                         
-                        # Trigger immediate WebSocket subscription refresh for this user
-                        try:
-                            from .nostr_websocket_monitor import trigger_immediate_refresh
-                            await trigger_immediate_refresh(user_id)
-                            logger.info(
-                                f"✅ WebSocket subscriptions refreshed immediately for user={user_id} "
-                                f"after adding tracked event {eid}. Kind 6/7 subscriptions updated."
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to trigger immediate WebSocket refresh for user {user_id}: {e}. "
-                                f"Will be picked up by periodic refresh loop within 60 seconds."
-                            )
-        except Exception as e:
-            logger.warning(f"Failed to auto-add event {eid} to tracked_event_ids: {e}")
+                        # Update in-memory cache to ensure immediate UI visibility
+                        if app is not None:
+                            try:
+                                day = boundaries.utc_day_str
+                                tagset = tuple(sorted([t.lstrip('#').lower() for t in tags if t]))
+                                cache_keys = [
+                                    (day, None, eff_pub, tagset),
+                                    (day, user_id, eff_pub, tagset),
+                                ]
+                                cache = _get_cache(app)
+                                for key in cache_keys:
+                                    note_ids = _get_cache_note_ids(cache, key, create=True)
+                                    if eid not in note_ids:
+                                        note_ids.append(eid)
+                                logger.debug(f"✅ Added event {eid[:16]}... to in-memory cache for user {user_id}")
+                            except Exception as e:
+                                logger.warning(f"Failed to update in-memory cache: {e}")
+                        else:
+                            logger.debug(f"⚠️ App instance missing in _append_today - skipping in-memory cache update for {eid[:16]}...")
+
+                        if eid not in current_tracked:
+                            # Trigger immediate refresh of subscriptions to include the new note
+                            # This ensures we start tracking zaps/reposts for this note immediately
+                            try:
+                                from .nostr_websocket_monitor import trigger_immediate_refresh
+                                await trigger_immediate_refresh(user_id)
+                                logger.info(
+                                    f"✅ WebSocket subscriptions refreshed immediately for user={user_id} "
+                                    f"after adding tracked event {eid}. Kind 6/7 subscriptions updated."
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to trigger immediate subscription refresh: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to auto-add event {eid} to tracked_event_ids: {e}")
 
     # Cache logic removed - relying on DB as single source of truth
     return True
@@ -1008,27 +1027,16 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                     # and we want to process each one independently.
                     already_processed = False
                     try:
-                        from .. import crud
-                        try:
-                            # Check if we have a record for this specific (event_id, note_id) pair
-                            # The database stores tuples of (user_id, event_hash, note_id, ...)
-                            row = await crud.db.fetchone(
-                                f"SELECT 1 FROM {crud.db.references_schema}processed_events "
-                                f"WHERE user_id = :user_id AND event_hash = :event_hash AND note_id = :note_id",
-                                {"user_id": user_id, "event_hash": eid, "note_id": target_id},
+                        # Use the updated crud.is_event_processed which now supports note_id parameter
+                        already_processed = await crud.is_event_processed(user_id, eid, note_id=target_id)
+                        if already_processed:
+                            logger.debug(
+                                f"Skipping repost event {eid[:16]}... for note {target_id[:16]}... "
+                                f"because this (event, note) pair was already processed"
                             )
-                            already_processed = row is not None
-                            if already_processed:
-                                logger.debug(
-                                    f"Skipping repost event {eid[:16]}... for note {target_id[:16]}... "
-                                    f"because this (event, note) pair was already processed"
-                                )
-                                continue  # Skip this target, try next one
-                        except Exception:
-                            # If check fails, continue to attempt processing
-                            pass
+                            continue  # Skip this target, try next one
                     except Exception:
-                        # Import failed; this is non-fatal — continue processing
+                        # If check fails, continue to attempt processing
                         pass
 
                     result = await _trigger_repost_headbutt(user_id, pubkey, target_id, eid, app, recovery_mode=recovery_mode)
@@ -1124,23 +1132,14 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                     # and we want to process each one independently.
                     already_processed = False
                     try:
-                        from .. import crud
-                        try:
-                            # Check if we have a record for this specific (event_id, note_id) pair
-                            row = await crud.db.fetchone(
-                                f"SELECT 1 FROM {crud.db.references_schema}processed_events "
-                                f"WHERE user_id = :user_id AND event_hash = :event_hash AND note_id = :note_id",
-                                {"user_id": user_id, "event_hash": eid, "note_id": reacted_id},
+                        # Use the updated crud.is_event_processed which now supports note_id parameter
+                        already_processed = await crud.is_event_processed(user_id, eid, note_id=reacted_id)
+                        if already_processed:
+                            logger.info(
+                                f"⏭️ Skipping reaction event {eid[:16]}... for note {reacted_id[:16]}... "
+                                f"because this (event, note) pair was already processed"
                             )
-                            already_processed = row is not None
-                            if already_processed:
-                                logger.info(
-                                    f"⏭️ Skipping reaction event {eid[:16]}... for note {reacted_id[:16]}... "
-                                    f"because this (event, note) pair was already processed"
-                                )
-                                continue  # Skip this target, try next one
-                        except Exception:
-                            pass
+                            continue  # Skip this target, try next one
                     except Exception:
                         pass
 
@@ -1597,29 +1596,14 @@ async def process_repost_for_tracked_notes(user_id: str, event: dict, app=None):
             logger.debug(f"Repost tracking not enabled for user {user_id}")
             return
         
-        # Deduplication: skip if already processed
-        event_id = (event.get("id") or "").strip().lower()
-        if event_id:
-            try:
-                if await crud.is_event_processed(user_id, event_id):
-                    logger.debug(f"Repost {event_id[:8]}... already processed for user {user_id}")
-                    return
-            except Exception:
-                pass
+        # NOTE: We intentionally do NOT do wrapper-level deduplication here.
+        # The in-memory deduplication in _process_event() handles same-session dedup,
+        # and the per-(event_id, note_id) checks in process_event_for_user() handle
+        # persistence-level dedup. Wrapper-level dedup was too aggressive and would
+        # prevent processing events that reference multiple tracked notes.
         
         # Process the event using the main logic
         await process_event_for_user(user_id, event, settings, app, recovery_mode=False)
-        
-        # Mark as processed after successful processing
-        if event_id:
-            try:
-                await crud.register_processed_event(
-                    user_id,
-                    event_id,
-                    event_type="repost"
-                )
-            except Exception as e:
-                logger.debug(f"Failed to register processed repost {event_id[:8]}...: {e}")
         
     except Exception as e:
         logger.error(f"Error processing repost for user {user_id}: {e}")
@@ -1649,29 +1633,14 @@ async def process_reaction_for_tracked_notes(user_id: str, event: dict, app=None
             logger.debug(f"Reaction tracking not enabled for user {user_id}")
             return
         
-        # Deduplication: skip if already processed
-        event_id = (event.get("id") or "").strip().lower()
-        if event_id:
-            try:
-                if await crud.is_event_processed(user_id, event_id):
-                    logger.debug(f"Reaction {event_id[:8]}... already processed for user {user_id}")
-                    return
-            except Exception:
-                pass
+        # NOTE: We intentionally do NOT do wrapper-level deduplication here.
+        # The in-memory deduplication in _process_event() handles same-session dedup,
+        # and the per-(event_id, note_id) checks in process_event_for_user() handle
+        # persistence-level dedup. Wrapper-level dedup was too aggressive and would
+        # prevent processing events that reference multiple tracked notes.
         
         # Process the event using the main logic
         await process_event_for_user(user_id, event, settings, app, recovery_mode=False)
-        
-        # Mark as processed after successful processing
-        if event_id:
-            try:
-                await crud.register_processed_event(
-                    user_id,
-                    event_id,
-                    event_type="reaction"
-                )
-            except Exception as e:
-                logger.debug(f"Failed to register processed reaction {event_id[:8]}...: {e}")
         
     except Exception as e:
         logger.error(f"Error processing reaction for user {user_id}: {e}")
