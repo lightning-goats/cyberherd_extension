@@ -103,20 +103,22 @@ def compute_member_share_percentages(
 ) -> Dict[str, int]:
     """Compute per-member share percentages for the member allocation block.
 
-    Share allocation is simple:
+    Every active CyberHerd member with qualifying activity (zaps or engagement)
+    receives a minimum of 1% since the splits extension requires whole percentages.
+
+    Share allocation:
+    - Every qualifying member (has zaps OR engagement) gets at least 1%
     - Members with kind 6 (repost) or kind 7 (reaction) receive exactly 1%
       (having both kind 6 AND kind 7 still gives only 1%, not 2%)
-    - Members with zaps (kind 9735) receive a proportional share of the
-      remaining pool based on their zap amount
+    - Members with zaps receive a proportional share of the remaining pool
+      (after reserving 1% minimums), with a guaranteed minimum of 1%
     - Members with BOTH engagement AND zaps receive 1% for engagement PLUS
-      their proportional zap share
+      their proportional zap share (minimum 1%)
 
-    For example, with member_total=10 and 3 members where 2 have engagement:
-    - Engagement allocation = 2% (1% each for the 2 engaged members)
-    - Zap pool = 8% (distributed proportionally by zap amount)
-
-    The splits extension requires whole percentages, so every member must
-    receive at least 1%. Members with only engagement (no zaps) get exactly 1%.
+    For example, with member_total=10 and 3 zappers (no engagement):
+    - Reserved minimums = 3% (1% per qualifying member)
+    - Zap pool = 7% (distributed proportionally by zap amount)
+    - Each zapper gets: 1% minimum + their proportional share of 7%
 
     Args:
         members: Iterable of member row dictionaries. Only active members
@@ -173,31 +175,39 @@ def compute_member_share_percentages(
     if safe_total <= 0 or not active_records:
         return shares
 
-    # --- Step 1: Grant 1% to each member with engagement (kind 6 or 7) ---
-    # Engagement gives exactly 1%, regardless of having kind 6, kind 7, or both.
-    engaged_members = [r for r in active_records if r["has_engagement"]]
-    engagement_allocation = len(engaged_members)  # 1% per engaged member
+    # Identify qualifying members (have engagement OR have zaps)
+    qualifying_members = [r for r in active_records if r["has_engagement"] or r["amount"] > 0]
+    
+    if not qualifying_members:
+        return shares
 
-    # Cap engagement allocation to safe_total
-    if engagement_allocation > safe_total:
-        # More engaged members than available percentage - distribute evenly
-        even_percents = _proportional_percentages([1] * len(engaged_members), total=safe_total)
-        for record, pct in zip(engaged_members, even_percents):
+    num_qualifying = len(qualifying_members)
+
+    # --- Step 1: Guarantee minimum 1% for each qualifying member ---
+    # If we can't give everyone 1%, distribute evenly
+    if num_qualifying > safe_total:
+        even_percents = _proportional_percentages([1] * num_qualifying, total=safe_total)
+        for record, pct in zip(qualifying_members, even_percents):
             shares[record["pubkey"]] = pct
         return shares
 
-    # Grant 1% to each engaged member
-    for record in engaged_members:
+    # Grant each qualifying member their guaranteed 1% minimum
+    for record in qualifying_members:
         shares[record["pubkey"]] = 1
 
+    # Calculate remaining pool after reserving minimums
+    remaining_pool = safe_total - num_qualifying
+    if remaining_pool <= 0:
+        # Everyone gets exactly 1%, no extra to distribute
+        return shares
+
     # --- Step 2: Distribute remaining pool proportionally by zap amount ---
-    zap_pool = safe_total - engagement_allocation
     zappers = [r for r in active_records if r["amount"] > 0]
     total_zap_amount = sum(r["amount"] for r in zappers)
 
-    if zap_pool > 0 and zappers and total_zap_amount > 0:
+    if zappers and total_zap_amount > 0:
         weights = [record["amount"] for record in zappers]
-        zap_percents = _proportional_percentages(weights, total=zap_pool)
+        zap_percents = _proportional_percentages(weights, total=remaining_pool)
         for record, pct in zip(zappers, zap_percents):
             shares[record["pubkey"]] = shares.get(record["pubkey"], 0) + pct
 
