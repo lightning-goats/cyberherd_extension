@@ -103,18 +103,20 @@ def compute_member_share_percentages(
 ) -> Dict[str, int]:
     """Compute per-member share percentages for the member allocation block.
 
-    The member allocation is split into two pools:
-    - 90% of member_total (zap pool): Distributed proportionally by zap amount
-    - 10% of member_total (engagement bonus pool): Split evenly among members
-      with kind 6 (repost) or kind 7 (reaction) events
+    Share allocation is simple:
+    - Members with kind 6 (repost) or kind 7 (reaction) receive exactly 1%
+      (having both kind 6 AND kind 7 still gives only 1%, not 2%)
+    - Members with zaps (kind 9735) receive a proportional share of the
+      remaining pool based on their zap amount
+    - Members with BOTH engagement AND zaps receive 1% for engagement PLUS
+      their proportional zap share
 
-    For example, with member_total=10:
-    - Zap pool = 9% (distributed by zap amount)
-    - Bonus pool = 1% (split evenly among members with kind 6/7 engagement)
+    For example, with member_total=10 and 3 members where 2 have engagement:
+    - Engagement allocation = 2% (1% each for the 2 engaged members)
+    - Zap pool = 8% (distributed proportionally by zap amount)
 
-    Members with BOTH zaps AND engagement receive their proportional zap share
-    PLUS their share of the bonus pool. Having both kind 6 AND kind 7 does NOT
-    give double bonus - maximum 1 share of the bonus pool per member.
+    The splits extension requires whole percentages, so every member must
+    receive at least 1%. Members with only engagement (no zaps) get exactly 1%.
 
     Args:
         members: Iterable of member row dictionaries. Only active members
@@ -164,8 +166,6 @@ def compute_member_share_percentages(
             {
                 "pubkey": pubkey,
                 "amount": amount,
-                "has_kind_6": has_kind_6,
-                "has_kind_7": has_kind_7,
                 "has_engagement": has_kind_6 or has_kind_7,
             }
         )
@@ -173,93 +173,33 @@ def compute_member_share_percentages(
     if safe_total <= 0 or not active_records:
         return shares
 
-    # Identify members with engagement (kind 6 or kind 7)
+    # --- Step 1: Grant 1% to each member with engagement (kind 6 or 7) ---
+    # Engagement gives exactly 1%, regardless of having kind 6, kind 7, or both.
     engaged_members = [r for r in active_records if r["has_engagement"]]
-    has_any_engagement = len(engaged_members) > 0
+    engagement_allocation = len(engaged_members)  # 1% per engaged member
 
-    # Identify zappers (members with amount > 0)
+    # Cap engagement allocation to safe_total
+    if engagement_allocation > safe_total:
+        # More engaged members than available percentage - distribute evenly
+        even_percents = _proportional_percentages([1] * len(engaged_members), total=safe_total)
+        for record, pct in zip(engaged_members, even_percents):
+            shares[record["pubkey"]] = pct
+        return shares
+
+    # Grant 1% to each engaged member
+    for record in engaged_members:
+        shares[record["pubkey"]] = 1
+
+    # --- Step 2: Distribute remaining pool proportionally by zap amount ---
+    zap_pool = safe_total - engagement_allocation
     zappers = [r for r in active_records if r["amount"] > 0]
     total_zap_amount = sum(r["amount"] for r in zappers)
 
-    if not has_any_engagement:
-        # No kind 6/7 activity at all: entire member_total is distributed
-        # proportionally by zap amount (no bonus pool needed).
-        if zappers and total_zap_amount > 0:
-            weights = [record["amount"] for record in zappers]
-            percents = _proportional_percentages(weights, total=safe_total)
-            for record, pct in zip(zappers, percents):
-                shares[record["pubkey"]] = pct
-        return shares
-
-    # Split member_total into zap pool (90%) and engagement bonus pool (10%)
-    # For member_total=10: zap_pool=9, bonus_pool=1
-    # For member_total=100: zap_pool=90, bonus_pool=10
-    bonus_pool = max(1, safe_total // 10)  # At least 1% for the bonus pool
-    zap_pool = safe_total - bonus_pool
-
-    # --- Step 1: Distribute the zap pool proportionally by zap amount ---
-    if zappers and total_zap_amount > 0 and zap_pool > 0:
+    if zap_pool > 0 and zappers and total_zap_amount > 0:
         weights = [record["amount"] for record in zappers]
         zap_percents = _proportional_percentages(weights, total=zap_pool)
         for record, pct in zip(zappers, zap_percents):
             shares[record["pubkey"]] = shares.get(record["pubkey"], 0) + pct
-
-    # --- Step 2: Distribute the bonus pool evenly among engaged members ---
-    # Each engaged member gets ONE share of the bonus pool, regardless of
-    # whether they have kind 6, kind 7, or both.
-    num_engaged = len(engaged_members)
-    if num_engaged > 0 and bonus_pool > 0:
-        # Split bonus_pool evenly among engaged members
-        bonus_percents = _proportional_percentages([1] * num_engaged, total=bonus_pool)
-        for record, bonus_pct in zip(engaged_members, bonus_percents):
-            shares[record["pubkey"]] = shares.get(record["pubkey"], 0) + bonus_pct
-
-    # --- Step 3: Ensure minimum 1% for eligible members when possible ---
-    # This handles edge cases where rounding might leave someone at 0%.
-    # Eligible members: have zap amount > 0 OR have engagement.
-    try:
-        total_assigned = sum(max(0, int(v or 0)) for v in shares.values())
-        if total_assigned > 0 and safe_total > 0:
-            eligible_pubkeys: List[str] = []
-            for record in active_records:
-                if record["amount"] > 0 or record["has_engagement"]:
-                    eligible_pubkeys.append(record["pubkey"])
-            # Deduplicate while preserving order
-            seen: Set[str] = set()
-            eligible_pubkeys = [
-                pk for pk in eligible_pubkeys
-                if not (pk in seen or seen.add(pk))
-            ]
-
-            if eligible_pubkeys and len(eligible_pubkeys) <= safe_total:
-                to_boost = [pk for pk in eligible_pubkeys if shares.get(pk, 0) == 0]
-                if to_boost:
-                    extra_needed = len(to_boost)
-                    # Grant +1 to each zero-share eligible member
-                    for pk in to_boost:
-                        shares[pk] = shares.get(pk, 0) + 1
-                    # Trim from largest shareholders to stay at safe_total
-                    trim_needed = (total_assigned + extra_needed) - safe_total
-                    if trim_needed > 0:
-                        donors: List[str] = [
-                            pk for pk, pct in shares.items()
-                            if pk not in to_boost and pct > 1
-                        ]
-                        capacity = sum(shares[pk] - 1 for pk in donors)
-                        if capacity >= trim_needed and donors:
-                            donors_sorted = sorted(
-                                donors, key=lambda pk: shares[pk], reverse=True
-                            )
-                            idx = 0
-                            while trim_needed > 0 and donors_sorted:
-                                pk = donors_sorted[idx]
-                                if shares[pk] > 1:
-                                    shares[pk] -= 1
-                                    trim_needed -= 1
-                                idx = (idx + 1) % len(donors_sorted)
-    except Exception:
-        # Never let safety adjustments break share computation.
-        pass
 
     return shares
 
