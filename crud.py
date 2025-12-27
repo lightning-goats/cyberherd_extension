@@ -2980,12 +2980,23 @@ async def register_processed_payment(
                         retry_msg = str(retry_e).lower()
                         if any(t in retry_msg for t in ("unique constraint", "duplicate key", "unique_violation")):
                             return False
-                        return False
-                # If other DB errors occurred, return False to indicate not newly registered
-                return False
-    except Exception:
-        # In case lock acquisition or unexpected errors occur, fail safe as not-new
-        return False
+                        # Re-raise other errors during retry
+                        raise retry_e
+                
+                # Re-raise other DB errors
+                raise e
+    except Exception as e:
+        # Re-raise unexpected errors to be handled by caller (e.g. retry or log as failure)
+        # Exception: unique/duplicate errors caught above return False, this block catches lock errors etc
+        # But if we caught and re-raised 'e' above, it will be caught here.
+        # Check if it was one of our re-raised DB errors
+        msg = str(e).lower()
+        if any(t in msg for t in ("unique constraint", "duplicate key", "unique_violation")):
+             return False
+        
+        # If it was a generic DB error we re-raised, propagate it up to let payment processor know it failed
+        # rather than silently swallowing it as a "duplicate" (return False)
+        raise e
 
 
 async def clear_processed_zaps_for_user(user_id: str | None):

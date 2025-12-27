@@ -45,6 +45,10 @@ except Exception:  # pragma: no cover - messaging extension optional at import t
         return None
 
 
+
+# Module-level lock to synchronize headbutt processing across service instances
+_HEADBUTT_LOCK = asyncio.Lock()
+
 _METADATA_CACHE: dict[str, dict[str, Any]] = {}
 _METADATA_REFRESH_SECONDS = parse_int_env("CYBERHERD_METADATA_REFRESH_SECONDS", 3600)
 _NIP05_REFRESH_SECONDS = parse_int_env("CYBERHERD_NIP05_REFRESH_SECONDS", 10800)
@@ -440,7 +444,6 @@ class EnhancedHeadbuttService:
             messaging_module, "make_messages", None
         )
         self.send_cyberherd_update = None
-        self._lock = asyncio.Lock()
         self._last_bump_ts = 0.0
         self.app: Any = app
         self.user_id = user_id
@@ -747,7 +750,7 @@ class EnhancedHeadbuttService:
         return successful
 
     async def attempt_headbutt(self, attacker: Any) -> dict[str, Any] | None:
-        async with self._lock:
+        async with _HEADBUTT_LOCK:
             if self._in_cooldown():
                 logger.info("AdmissionGuard cooldown: in_cooldown=True")
                 return None
