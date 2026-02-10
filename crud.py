@@ -1548,17 +1548,18 @@ async def add_new_active_member(member_data: dict, user_id: str | None = None):
         return
 
     logger.info(f"cyberherd: add_new_active_member called for pubkey: {normalized_pubkey[:8]}... user_id: {user_id}")
-    # Normalize values
-    # Ensure amounts are stored in satoshis. If callers pass millisatoshis
-    # (values >= 1_000_000), convert to sats by dividing by 1000.
+    # Normalize values — callers are expected to pass amounts in satoshis.
     raw_amount = member_data.get("amount") or 0
     try:
         amt_val = int(raw_amount)
     except Exception:
         amt_val = 0
-    if amt_val >= 1_000_000:
-        # Likely millisatoshis -> convert to sats
-        amt_val = amt_val // 1000
+    if amt_val >= 21_000_000:
+        logger.warning(
+            "cyberherd: add_new_active_member received unusually large amount "
+            "%s for pubkey %s — verify caller passes satoshis, not millisats",
+            amt_val, normalized_pubkey[:8],
+        )
 
     # Normalize lud16: strip and lowercase for consistent storage
     raw_lud16 = member_data.get("lud16") or ""
@@ -1814,13 +1815,17 @@ async def update_and_activate_member(
     except Exception:
         pass
 
-    # Normalize amount_increase to satoshis (accept msat input defensively)
+    # Callers are expected to pass amount_increase in satoshis.
     try:
         ai = int(amount_increase or 0)
     except Exception:
         ai = 0
-    if ai >= 1_000_000:
-        ai = ai // 1000
+    if ai >= 21_000_000:
+        logger.warning(
+            "cyberherd: update_and_activate_member received unusually large "
+            "amount_increase %s for pubkey %s — verify caller passes satoshis",
+            ai, normalized_pubkey[:8],
+        )
 
     nip05_normalized: str | None = None
     if nip05:
