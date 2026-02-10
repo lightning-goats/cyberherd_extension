@@ -57,11 +57,26 @@ _helper_diagnostics = {
 
 # Lock for serializing updates to tracked_event_ids per user to prevent race conditions
 _user_update_locks: dict[str, asyncio.Lock] = {}
-_user_locks_mutex = asyncio.Lock()
+_user_locks_mutex: asyncio.Lock | None = None
+_USER_LOCKS_MAX_SIZE = 1000
+
+
+def _get_user_locks_mutex() -> asyncio.Lock:
+    global _user_locks_mutex
+    if _user_locks_mutex is None:
+        _user_locks_mutex = asyncio.Lock()
+    return _user_locks_mutex
 
 async def _get_user_lock(user_id: str) -> asyncio.Lock:
-    async with _user_locks_mutex:
+    async with _get_user_locks_mutex():
         if user_id not in _user_update_locks:
+            # Evict unlocked entries when registry is too large
+            if len(_user_update_locks) >= _USER_LOCKS_MAX_SIZE:
+                to_remove = [
+                    k for k, v in _user_update_locks.items() if not v.locked()
+                ][:len(_user_update_locks) // 4]
+                for k in to_remove:
+                    _user_update_locks.pop(k, None)
             _user_update_locks[user_id] = asyncio.Lock()
         return _user_update_locks[user_id]
 

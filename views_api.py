@@ -535,19 +535,15 @@ async def api_get_diagnostics(
     request: Request,
     include_state: bool = Query(False),
     include_routes: bool = Query(False),
-    auth=Depends(auth_wallet_or_admin_dep),
+    wallet_info: WalletTypeInfo = Depends(require_invoice_key),
 ):
     """Aggregate diagnostics for CyberHerd services.
 
     Returns a payload combining settings, zap monitor status, nostr diagnostics,
     and optional FastAPI route/state summaries for the authenticated user.
     """
-    # Resolve user scope from auth payload
-    user_id = None
-    if auth["type"] == "wallet":
-        user_id = auth["value"].wallet.user
-    elif auth["type"] == "admin":
-        user_id = auth["value"].id
+    # Resolve user scope from authenticated wallet
+    user_id = wallet_info.wallet.user
 
     diagnostics: dict[str, Any] = {
         "timestamp": time.time(),

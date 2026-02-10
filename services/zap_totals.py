@@ -28,7 +28,15 @@ MAX_BATCH_SIZE = 500
 MAX_BATCH_LOOPS = 20
 
 _lock_registry: Dict[Tuple[str, str], asyncio.Lock] = {}
-_lock_registry_lock = asyncio.Lock()
+_lock_registry_lock: asyncio.Lock | None = None
+_LOCK_REGISTRY_MAX_SIZE = 5000
+
+
+def _get_lock_registry_lock() -> asyncio.Lock:
+    global _lock_registry_lock
+    if _lock_registry_lock is None:
+        _lock_registry_lock = asyncio.Lock()
+    return _lock_registry_lock
 
 
 class ZapTotalsError(Exception):
@@ -47,9 +55,16 @@ def _normalise_pubkey(value: str) -> str:
 
 
 async def _get_key_lock(key: Tuple[str, str]) -> asyncio.Lock:
-    async with _lock_registry_lock:
+    async with _get_lock_registry_lock():
         lock = _lock_registry.get(key)
         if lock is None:
+            # Evict unlocked entries when registry is too large
+            if len(_lock_registry) >= _LOCK_REGISTRY_MAX_SIZE:
+                to_remove = [
+                    k for k, v in _lock_registry.items() if not v.locked()
+                ][:len(_lock_registry) // 4]
+                for k in to_remove:
+                    _lock_registry.pop(k, None)
             lock = asyncio.Lock()
             _lock_registry[key] = lock
         return lock

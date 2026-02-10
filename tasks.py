@@ -395,8 +395,6 @@ async def midnight_reset_job(app: Any | None = None):
                 errors.append(error_msg)
     except Exception as e:  # pragma: no cover
         logger.error(f"CyberHerd midnight reset job failed: {e}")
-    except Exception as e:  # pragma: no cover
-        logger.error(f"CyberHerd midnight reset job failed: {e}")
         errors.append(f"Job failed: {e}")
     
     # Final summary log

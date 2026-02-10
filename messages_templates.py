@@ -4,12 +4,6 @@ This file intentionally contains a reduced, focused set of templates used by the
 extension's messaging adapter. Keep these templates small and easy to maintain.
 """
 
-"""Compact set of message templates ported from the middleware messages module.
-
-This file intentionally contains a reduced, focused set of templates used by the
-extension's messaging adapter. Keep these templates small and easy to maintain.
-"""
-
 
 cyber_herd: dict[int, str] = {
     0: (
@@ -292,10 +286,6 @@ __all__ = [
     "headbutt_info",
     "headbutt_success",
     "member_increase",
-    "feeding_regular",
-    "feeding_bonus",
-    "feeding_remainder",
-    "feeding_fallback",
     "thank_you_variations",
     "variations",
 ]

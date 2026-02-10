@@ -75,8 +75,8 @@ async def is_extension_enabled_for_user(user_id: str, extension_id: str = 'cyber
         user_extensions = await get_user_active_extensions_ids(user_id)
         return extension_id in user_extensions
     except Exception:
-        # If we can't check, assume it's enabled (backward compatibility)
-        return True
+        # If we can't check, fail closed for safety
+        return False
 
 
 def get_nip19_decoder():
@@ -346,25 +346,26 @@ def truncate_id(id_str: str | None, length: int = 16) -> str:
 
 # ==================== Validation Utilities ====================
 
+import re as _re
+
+_HEX_RE = _re.compile(r'^[0-9a-fA-F]+$')
+
+
 def is_valid_hex_string(s: str, required_length: int | None = None) -> bool:
     """Check if a string is valid hexadecimal.
-    
+
     Args:
         s: String to validate
         required_length: If specified, check for exact length
-        
+
     Returns:
         True if valid hex (and correct length if specified)
     """
-    if not isinstance(s, str):
+    if not isinstance(s, str) or not s:
         return False
     if required_length is not None and len(s) != required_length:
         return False
-    try:
-        int(s, 16)
-        return True
-    except ValueError:
-        return False
+    return bool(_HEX_RE.match(s))
 
 
 def is_valid_event_id(event_id: str | None) -> bool:

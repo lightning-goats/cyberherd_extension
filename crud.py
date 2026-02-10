@@ -18,7 +18,14 @@ from .utils.common import extract_t_tags_from_event, utc_now, coerce_bool
 
 db = Database("ext_cyberherd")
 # Serialize critical write operations in this module to reduce sqlite locking
-_crud_write_lock = asyncio.Lock()
+_crud_write_lock: asyncio.Lock | None = None
+
+
+def _get_crud_write_lock() -> asyncio.Lock:
+    global _crud_write_lock
+    if _crud_write_lock is None:
+        _crud_write_lock = asyncio.Lock()
+    return _crud_write_lock
 
 
 def _sanitize_private_key(raw_value) -> tuple[str | None, int]:
@@ -716,7 +723,7 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
         if has_member_alloc_col:
             params["member_allocation_percent"] = int(getattr(settings, "member_allocation_percent", 10))
         try:
-            async with _crud_write_lock:
+            async with _get_crud_write_lock():
                 await _execute_with_retry(sql, params)
         except Exception as e:
             import traceback
@@ -865,7 +872,7 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
             sql = f"INSERT INTO {db.references_schema}settings ({', '.join(insert_cols)}) VALUES ({', '.join(placeholders)})"
             params["member_allocation_percent"] = int(getattr(settings, "member_allocation_percent", 10))
         try:
-            async with _crud_write_lock:
+            async with _get_crud_write_lock():
                 await _execute_with_retry(sql, params)
         except Exception as e:
             import traceback
@@ -1033,7 +1040,7 @@ async def recompute_member_payouts(user_id: str | None = None) -> dict[str, floa
     shares_percent = compute_member_share_percentages(members, member_total)
 
     results: dict[str, float] = {}
-    async with _crud_write_lock:
+    async with _get_crud_write_lock():
         for row in members:
             pubkey = (row.get("pubkey") or "").strip().lower()
             if not pubkey:
@@ -2909,7 +2916,7 @@ async def register_processed_payment(
     # Use a write lock to serialize the check-and-insert to reliably determine
     # whether we actually inserted a new row or the row already existed.
     try:
-        async with _crud_write_lock:
+        async with _get_crud_write_lock():
             try:
                 # Check existence first - include note_id in the check for the new schema
                 # Use COALESCE to handle both NULL and empty string note_id values

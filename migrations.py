@@ -366,7 +366,60 @@ async def m025_migrate_legacy_userids(db: Database):
             )
         except Exception as e:
             logger.info(f"CyberHerd m025: could not enumerate legacy settings rows: {e}")
-    return
+            return
+
+    if not rows:
+        logger.info("CyberHerd m025: no legacy settings rows to migrate")
+        return
+
+    migrated = 0
+    for row in rows:
+        source_wallet = row.get("source_wallet") if isinstance(row, dict) else row[1]
+        rid = row.get("rid") if isinstance(row, dict) else row[0]
+        if not source_wallet:
+            continue
+        # Resolve owning user via core wallets table
+        try:
+            user_rows = await db.fetchall(
+                'SELECT "user" FROM wallets WHERE id = :wallet_id',
+                {"wallet_id": source_wallet},
+            )
+        except Exception:
+            try:
+                user_rows = await db.fetchall(
+                    'SELECT "user" FROM public.wallets WHERE id = :wallet_id',
+                    {"wallet_id": source_wallet},
+                )
+            except Exception:
+                continue
+        if not user_rows:
+            continue
+        user_id = user_rows[0].get("user") if isinstance(user_rows[0], dict) else user_rows[0][0]
+        if not user_id:
+            continue
+        # Check if user already has a settings row
+        try:
+            existing = await db.fetchall(
+                f"SELECT 1 FROM {settings_table} WHERE user_id = :uid LIMIT 1",
+                {"uid": user_id},
+            )
+        except Exception:
+            existing = []
+        if existing:
+            continue
+        # Update the legacy row
+        try:
+            await db.execute(
+                f"UPDATE {settings_table} SET user_id = :uid WHERE rowid = :rid",
+                {"uid": user_id, "rid": rid},
+            )
+            migrated += 1
+        except Exception as e:
+            logger.warning(f"CyberHerd m025: failed to migrate row {rid}: {e}")
+
+    logger.info(f"CyberHerd m025: migrated {migrated} legacy settings rows")
+
+
 async def m027_add_feeder_trigger_sats(db: Database):
     """Add feeder_trigger_sats column to settings for external feeder logic."""
     table_name = f"{db.references_schema}settings"

@@ -13,7 +13,14 @@ from .pubkey import resolve_effective_pubkey
 DEFAULT_LEADERBOARD_LIMIT = 10
 
 _watchers: dict[str, list[asyncio.Queue]] = {}
-_watchers_lock = asyncio.Lock()
+_watchers_lock: asyncio.Lock | None = None
+
+
+def _get_watchers_lock() -> asyncio.Lock:
+    global _watchers_lock
+    if _watchers_lock is None:
+        _watchers_lock = asyncio.Lock()
+    return _watchers_lock
 
 
 def _normalize_pubkey(value: str | None) -> str | None:
@@ -97,13 +104,13 @@ async def get_leaderboard_entries(user_id: str, limit: int = DEFAULT_LEADERBOARD
 
 async def register_leaderboard_watcher(user_id: str) -> asyncio.Queue:
     queue: asyncio.Queue = asyncio.Queue(maxsize=5)
-    async with _watchers_lock:
+    async with _get_watchers_lock():
         _watchers.setdefault(user_id, []).append(queue)
     return queue
 
 
 async def unregister_leaderboard_watcher(user_id: str, queue: asyncio.Queue):
-    async with _watchers_lock:
+    async with _get_watchers_lock():
         watchers = _watchers.get(user_id)
         if not watchers:
             return
@@ -114,7 +121,7 @@ async def unregister_leaderboard_watcher(user_id: str, queue: asyncio.Queue):
 
 
 async def _broadcast_local(user_id: str, payload: dict):
-    async with _watchers_lock:
+    async with _get_watchers_lock():
         watchers = list(_watchers.get(user_id, []))
     for queue in watchers:
         try:

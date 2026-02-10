@@ -17,7 +17,7 @@ class CyberherdSettings(BaseModel):
     tracked_event_timestamps: dict[str, int] = Field(default_factory=dict)  # note_id -> created_at timestamp
     tracked_event_addresses: dict[str, str] = Field(default_factory=dict)  # note_id -> a-tag (for kind 30311 replies)
     # hex-encoded nostr private key (32 bytes hex) used to publish notes
-    nostr_private_key: Optional[str] = None
+    nostr_private_key: Optional[str] = Field(default=None, repr=False)
     # optional hex-encoded public key override to watch for #CyberHerd notes
     nostr_pubkey_override: Optional[str] = None
     # computed effective pubkey (cached for performance)
@@ -82,7 +82,7 @@ class MemberPut(BaseModel):
     amount: Optional[int] = None
     zap_request: Optional[dict] = None
     note: Optional[str] = None
-    relays: Optional[object] = None
+    relays: Optional[list[str] | str] = None
     reply_relay: Optional[str] = None
 
 

@@ -15,6 +15,9 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import ipaddress
+import socket
+
 import httpx
 
 from loguru import logger
@@ -46,16 +49,68 @@ except Exception:  # pragma: no cover - messaging extension optional at import t
 
 
 
-# Module-level lock to synchronize headbutt processing across service instances
-_HEADBUTT_LOCK = asyncio.Lock()
+# Lock to synchronize headbutt processing across service instances (lazy init)
+_HEADBUTT_LOCK: asyncio.Lock | None = None
+
+
+def _get_headbutt_lock() -> asyncio.Lock:
+    global _HEADBUTT_LOCK
+    if _HEADBUTT_LOCK is None:
+        _HEADBUTT_LOCK = asyncio.Lock()
+    return _HEADBUTT_LOCK
 
 _METADATA_CACHE: dict[str, dict[str, Any]] = {}
+_METADATA_CACHE_MAX_SIZE = 10000
 _METADATA_REFRESH_SECONDS = parse_int_env("CYBERHERD_METADATA_REFRESH_SECONDS", 3600)
 _NIP05_REFRESH_SECONDS = parse_int_env("CYBERHERD_NIP05_REFRESH_SECONDS", 10800)
 
 
 def _now() -> float:
     return time.time()
+
+
+# Blocked top-level domains that should never be used for NIP-05 lookups
+_BLOCKED_DOMAINS = {"localhost", "localhost.localdomain", "local"}
+
+
+def _is_safe_nip05_domain(domain: str) -> bool:
+    """Validate that a NIP-05 domain does not resolve to private/internal IPs.
+
+    Returns True only when the domain resolves to at least one public IP address.
+    This prevents SSRF attacks where a user-controlled NIP-05 identifier
+    (e.g. user@evil.internal) causes the server to make HTTP requests to
+    internal services, cloud metadata endpoints, etc.
+    """
+    if not domain or not isinstance(domain, str):
+        return False
+    domain = domain.strip().lower()
+    if not domain:
+        return False
+    # Block obviously internal hostnames
+    if domain in _BLOCKED_DOMAINS or domain.endswith(".local") or domain.endswith(".internal"):
+        return False
+    # Try to parse as a raw IP address first
+    try:
+        addr = ipaddress.ip_address(domain)
+        return addr.is_global
+    except ValueError:
+        pass
+    # Resolve the domain and check all returned addresses
+    try:
+        infos = socket.getaddrinfo(domain, 443, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, OSError):
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        ip_str = info[4][0]
+        try:
+            addr = ipaddress.ip_address(ip_str)
+            if not addr.is_global:
+                return False
+        except ValueError:
+            return False
+    return True
 
 
 def _sanitize_metadata_payload(data: dict[str, Any] | None) -> dict[str, Any]:
@@ -83,6 +138,14 @@ def _metadata_cache_get(pubkey: str) -> dict[str, Any] | None:
 
 
 def _metadata_cache_store(pubkey: str, data: dict[str, Any], *, fetched_at: float | None = None) -> dict[str, Any]:
+    # Evict oldest entries when cache exceeds max size
+    if len(_METADATA_CACHE) >= _METADATA_CACHE_MAX_SIZE and pubkey not in _METADATA_CACHE:
+        oldest_keys = sorted(
+            _METADATA_CACHE,
+            key=lambda k: _METADATA_CACHE[k].get("fetched_at", 0),
+        )[:len(_METADATA_CACHE) // 4]
+        for k in oldest_keys:
+            _METADATA_CACHE.pop(k, None)
     entry = _METADATA_CACHE.setdefault(pubkey, {})
     entry["data"] = _sanitize_metadata_payload(data)
     entry["fetched_at"] = fetched_at if fetched_at is not None else _now()
@@ -107,6 +170,8 @@ async def _verify_nip05_relaxed(pubkey: str, nip05: str) -> tuple[Optional[bool]
     username_raw, domain = identity.split("@", 1)
     username_raw = username_raw.strip()
     domain = domain.strip()
+    if not _is_safe_nip05_domain(domain):
+        return False, "unsafe_domain"
     username_lower = username_raw.lower()
     identity_lower = identity.lower()
     if not username_raw or not domain:
@@ -750,7 +815,7 @@ class EnhancedHeadbuttService:
         return successful
 
     async def attempt_headbutt(self, attacker: Any) -> dict[str, Any] | None:
-        async with _HEADBUTT_LOCK:
+        async with _get_headbutt_lock():
             if self._in_cooldown():
                 logger.info("AdmissionGuard cooldown: in_cooldown=True")
                 return None
@@ -793,8 +858,8 @@ class EnhancedHeadbuttService:
             )
             if is_repost or is_reaction:
                 # For reposts and reactions, set amount to 0
-                    if not (is_repost and is_reaction):
-                        attacker.amount = 0
+                if not (is_repost and is_reaction):
+                    attacker.amount = 0
 
             is_existing_member = any(
                 m.get("pubkey") == attacker.pubkey for m in active_members
@@ -2043,7 +2108,7 @@ class EnhancedHeadbuttService:
                 'amount': 0,  # Reposts don't have amounts
                 'picture': '',
                 'relays': '',
-                'metadata_last_checked_at': int(datetime.now().timestamp()),  # Local time
+                'metadata_last_checked_at': int(datetime.now(timezone.utc).timestamp()),
                 'is_active': 1,
             }
             
