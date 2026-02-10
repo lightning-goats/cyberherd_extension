@@ -2304,7 +2304,7 @@ async def api_put_member(
     was_active = bool(row.get("is_active"))
     # Member exists - activate them
     logger.info(f"cyberherd: activating member {pubkey[:8]}...")
-    await crud.update_and_activate_member(pubkey, 0, 0.0, user_id)
+    await crud.update_and_activate_member(pubkey, 0, user_id)
     
     # Adjust amount if provided (increase by delta)
     if payload.amount is not None:
@@ -2324,7 +2324,6 @@ async def api_put_member(
             await crud.update_and_activate_member(
                 pubkey,
                 increase_amt,
-                0.0,
                 user_id,
                 event_id=event_for_storage,
             )
@@ -2503,7 +2502,7 @@ async def api_activate_member(
     try:
         user_id = wallet_info.wallet.user
         # zero increase just forces is_active=1 via update_and_activate_member
-        await crud.update_and_activate_member(pubkey, 0, 0.0, user_id)
+        await crud.update_and_activate_member(pubkey, 0, user_id)
         
         return {"ok": True}
     except Exception as e:

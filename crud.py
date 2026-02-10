@@ -1034,9 +1034,11 @@ async def recompute_member_payouts(user_id: str | None = None) -> dict[str, floa
         zap_wallet = getattr(settings, "zap_wallet", None)
     except Exception as exc:
         logger.debug(f"cyberherd: recompute_member_payouts could not load settings: {exc}")
+        settings = None
         zap_wallet = None
 
-    member_total = 10 if zap_wallet else 100
+    member_allocation_percent = getattr(settings, "member_allocation_percent", 10 if zap_wallet else 100)
+    member_total = member_allocation_percent if zap_wallet else 100
     shares_percent = compute_member_share_percentages(members, member_total)
 
     results: dict[str, float] = {}
@@ -1757,18 +1759,16 @@ async def add_new_active_member(member_data: dict, user_id: str | None = None):
 async def update_and_activate_member(
     pubkey: str,
     amount_increase: int,
-    payouts_increase: float,
     user_id: str | None = None,
     event_id: str | None = None,
     kinds: str | list | tuple | set | None = None,
     nip05: str | None = None,
 ):
     """Update and activate a cyberherd member for a specific user.
-    
+
     Args:
         pubkey: The pubkey of the member to update.
         amount_increase: Amount to add to the member's total.
-        payouts_increase: Payout amount to add.
         user_id: User ID to filter by. If None, operation is skipped for security.
         event_id: Optional tracked event id (nostr e-tag) for threading.
     """
@@ -1840,7 +1840,6 @@ async def update_and_activate_member(
     update_sql = f"""
         UPDATE {table_name}
         SET amount = amount + :amount_increase,
-            payouts = payouts + :payouts_increase,
             is_active = 1,
             metadata_last_checked_at = :ts,
             event_id = COALESCE(:event_id, event_id),
@@ -1849,7 +1848,6 @@ async def update_and_activate_member(
         """
     params = {
         "amount_increase": ai,
-        "payouts_increase": payouts_increase,
         "ts": int(time.time()),
         "pubkey": normalized_pubkey,
         "user_id": user_id,

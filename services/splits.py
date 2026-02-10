@@ -167,17 +167,7 @@ async def update_split_targets_proportional(
     shares_map = compute_member_share_percentages(eligible_members, member_total)
 
     targets: list[Target] = []
-    if zap_wallet:
-        zap_wallet_percent = 100 - member_allocation_percent
-        targets.append(
-            Target(
-                id=urlsafe_short_hash(),
-                wallet=zap_wallet,
-                source=source_wallet,
-                percent=zap_wallet_percent,
-                alias=zap_wallet_alias,
-            )
-        )
+    member_percent_used = 0
 
     for row in eligible_members:
         share_percent = int(shares_map.get(row["pubkey"], 0))
@@ -186,6 +176,7 @@ async def update_split_targets_proportional(
         lud16 = (row.get("lud16") or "").strip()
         if not lud16:
             continue
+        member_percent_used += share_percent
         alias = row.get("display_name") or "Anon"
         targets.append(
             Target(
@@ -195,6 +186,22 @@ async def update_split_targets_proportional(
                 percent=share_percent,
                 alias=alias,
             )
+        )
+
+    if zap_wallet:
+        # Give the zap wallet its base share plus any unallocated member
+        # percentage (from rounding or skipped members) so that the total
+        # across all targets always sums to 100%.
+        zap_wallet_percent = 100 - member_percent_used
+        targets.insert(
+            0,
+            Target(
+                id=urlsafe_short_hash(),
+                wallet=zap_wallet,
+                source=source_wallet,
+                percent=zap_wallet_percent,
+                alias=zap_wallet_alias,
+            ),
         )
 
     await split_set_targets(source_wallet, targets)

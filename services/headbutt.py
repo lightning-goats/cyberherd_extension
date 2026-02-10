@@ -463,12 +463,8 @@ def _normalize_event_id(value: Any) -> str | None:
     return None
 
 
-def calculate_payout(amount: float) -> float:
-    # 1% of decimated amount with a cap; mirror middleware rough behavior
-    try:
-        return round(min((int(amount) // 10) * 0.01, 1.0), 2)
-    except Exception:
-        return 0.0
+
+
 
 
 class EnhancedHeadbuttService:
@@ -932,32 +928,18 @@ class EnhancedHeadbuttService:
                 
                 increase_amount = attacker.amount  # The amount of this specific zap
 
-                # Determine a small payouts bump for reposts/reactions based on
-                # the member's existing total so interactions still contribute.
-                try:
-                    existing_amount = int((existing_member or {}).get('amount', 0) or 0)
-                except Exception:
-                    existing_amount = 0
-
-                # Calculate payout increase:
-                # - For reactions (kind 7): Fixed 1 sat increase
-                # - For reposts (kind 6): Fixed 1 sat increase (same as reactions)
-                # - For zaps (amount>0): Calculate from zap amount
+                # Payouts are fully recomputed by recompute_member_payouts()
+                # inside update_and_activate_member, so no per-event payout
+                # calculation is needed here — just update the amount.
                 if int(increase_amount or 0) == 0:
-                    # This is a repost or reaction (no zap amount)
-                    # Both get the same 1 sat payout increase
-                    payouts_increase = 1.0
                     event_type_name = "reaction" if is_reaction_event else "repost"
-                    logger.info(f"💰 {event_type_name.capitalize()} (kind {'7' if is_reaction_event else '6'}) for existing member: fixed 1 sat payout increase")
+                    logger.info(f"💰 {event_type_name.capitalize()} (kind {'7' if is_reaction_event else '6'}) for existing member")
                 else:
-                    # Zaps use their own amount for payout calculation
-                    payouts_increase = calculate_payout(float(increase_amount))
-                    logger.info(f"💰 Zap for existing member: {payouts_increase} sat payout increase from {increase_amount} sat zap")
+                    logger.info(f"💰 Zap for existing member: {increase_amount} sat zap")
 
                 await self.db.update_and_activate_member(
                     attacker.pubkey,
                     int(increase_amount or 0),
-                    payouts_increase,
                     user_id=self.user_id,
                     kinds=getattr(attacker, 'kinds', None),
                 )
@@ -1300,32 +1282,18 @@ class EnhancedHeadbuttService:
             # Add or update attacker as active (reuse existing handler where possible)
             existing = await self.db.get_cyberherd_member_by_pubkey(attacker.pubkey, user_id=self.user_id)
             
-            # Calculate payouts based on event type
-            # Reactions (kind 7) and Reposts (kind 6) both get fixed 1 sat
-            # Zaps use amount-based calculation
-            attacker_kinds = getattr(attacker, 'kinds', []) or []
-            is_reaction = 7 in attacker_kinds
-            is_repost = 6 in attacker_kinds
-            
-            if is_reaction or is_repost:
-                payouts = 1.0  # Fixed 1 sat for reactions and reposts
-                event_type = "reaction" if is_reaction else "repost"
-                logger.info(f"💰 Headbutt via {event_type} (kind {'7' if is_reaction else '6'}): fixed 1 sat payout")
-            else:
-                payouts = calculate_payout(float(getattr(attacker, "amount", 0) or 0))
-                logger.info(f"💰 Headbutt via zap: {payouts} sat payout from amount {getattr(attacker, 'amount', 0)}")
-            
+            # Payouts are fully recomputed by recompute_member_payouts()
+            # inside update_and_activate_member / add_new_active_member.
             if existing:
                 await self.db.update_and_activate_member(
                     attacker.pubkey,
                     int(getattr(attacker, "amount", 0) or 0),
-                    payouts,
                     user_id=self.user_id,
                     kinds=getattr(attacker, "kinds", None),
                 )
                 return "reactivated"
             else:
-                await self._add_new_member(attacker, payouts)
+                await self._add_new_member(attacker)
                 return "new"
         except Exception as e:
             logger.error(f"Error in _handle_successful_headbutt: {e}")
@@ -1740,29 +1708,15 @@ class EnhancedHeadbuttService:
 
     async def _handle_attacker_admission(self, attacker: Any) -> str:
         existing = await self.db.get_cyberherd_member_by_pubkey(attacker.pubkey, user_id=self.user_id)
-        
-        # Calculate payouts based on event type
-        # Reactions (kind 7) and Reposts (kind 6) both get fixed 1 sat
-        # Zaps use amount-based calculation
-        attacker_kinds = getattr(attacker, 'kinds', []) or []
-        is_reaction = 7 in attacker_kinds
-        is_repost = 6 in attacker_kinds
-        
-        if is_reaction or is_repost:
-            payouts = 1.0  # Fixed 1 sat for reactions and reposts
-            event_type = "reaction" if is_reaction else "repost"
-            logger.info(f"💰 New member via {event_type} (kind {'7' if is_reaction else '6'}): fixed 1 sat payout")
-        else:
-            payouts = calculate_payout(float(attacker.amount))
-            logger.info(f"💰 New member via zap: {payouts} sat payout from amount {attacker.amount}")
-        
+
+        # Payouts are fully recomputed by recompute_member_payouts()
+        # inside update_and_activate_member / add_new_active_member.
         if existing:
             if not getattr(attacker, "nip05", None):
                 attacker.nip05 = (existing or {}).get("nip05")
             await self.db.update_and_activate_member(
                 attacker.pubkey,
                 attacker.amount,
-                payouts,
                 user_id=self.user_id,
                 kinds=getattr(attacker, 'kinds', None),
                 nip05=getattr(attacker, "nip05", None),
@@ -1861,7 +1815,7 @@ class EnhancedHeadbuttService:
 
             setattr(attacker, "metadata_last_checked_at", metadata_timestamp)
 
-            await self._add_new_member(attacker, payouts)
+            await self._add_new_member(attacker)
             return "new"
 
     def _select_template_key_for_headbutt(
@@ -1950,7 +1904,7 @@ class EnhancedHeadbuttService:
 
     # If nothing matched, return the base key as a safe fallback
 
-    async def _add_new_member(self, member: Any, payouts: float):
+    async def _add_new_member(self, member: Any):
         kinds_str = None
         try:
             kinds = getattr(member, "kinds", None)
@@ -1971,7 +1925,7 @@ class EnhancedHeadbuttService:
             "nprofile": getattr(member, "nprofile", None),
             "lud16": getattr(member, "lud16", None),
             "nip05": getattr(member, "nip05", None),
-            "payouts": float(payouts or 0.0),
+            "payouts": 0.0,  # recompute_member_payouts() sets the real value
             "amount": int(getattr(member, "amount", 0) or 0),
             "picture": getattr(member, "picture", None),
             # Try to persist any relays present on the member object (from lookup)
