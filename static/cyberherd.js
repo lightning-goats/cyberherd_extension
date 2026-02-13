@@ -23,10 +23,6 @@ window.app = Vue.createApp({
           midnight_reset_enabled: false,
           nip05_verification_enabled: true,
           // zap_monitor_mode deprecated (always 'payment')
-          nostr_private_key: '',
-          nostr_private_key_mask: '',
-          nostr_private_key_set: false,
-          effective_nostr_pubkey: '',
           effective_nostr_pubkey: '',
           effective_nostr_npub: ''
         },
@@ -56,7 +52,8 @@ window.app = Vue.createApp({
           showMemberDialog: false,
           editingPubkey: null,
           newMember: { pubkey: '', amount: 0, tracked_event_id: '' },
-          nostrclientAvailable: true
+          nostrclientAvailable: true,
+          bunkerStatus: { installed: false, has_key: false, pubkey: null, has_permissions: false }
         },
         adminAuthFailed: false
       },
@@ -201,12 +198,23 @@ window.app = Vue.createApp({
           // Prefer server-provided tracked_event_ids; fall back to legacy manual_event_ids
           tracked_event_ids: data.tracked_event_ids || data.manual_event_ids || [],
           // deprecated field ignored; server always returns 'payment'
-          nostr_private_key_set: !!data.nostr_private_key_set,
-          nostr_private_key_mask: data.nostr_private_key_mask || '',
-          nostr_private_key: '',
           effective_nostr_pubkey: data.effective_nostr_pubkey || '',
           effective_nostr_npub: data.effective_nostr_npub || ''
         })
+
+        // Fetch bunker status (use direct request to avoid _cyberherdFetch 404 base-swap)
+        try {
+          const authKey = this.getAuthKey()
+          if (authKey) {
+            const base = this.cyberherdApiBase()
+            const bunkerRes = await LNbits.api.request('GET', `${base}/api/v1/bunker_status`, authKey)
+            if (bunkerRes && bunkerRes.data) {
+              this.cyberherdData.ui.bunkerStatus = bunkerRes.data
+            }
+          }
+        } catch (e) {
+          // bunker status fetch is optional; ignore errors
+        }
 
         // Sync tracked event IDs (migrating legacy manual_event_ids if present)
         if (Array.isArray(data.tracked_event_ids) && data.tracked_event_ids.length) {
@@ -276,16 +284,6 @@ window.app = Vue.createApp({
           // zap_monitor_mode removed
         }
 
-        // Nostr key handling:
-        // - non-empty string => set/replace
-        // - null => clear on server
-        // - empty string => keep existing (omit from payload)
-        if (this.cyberherdData.form.nostr_private_key === null) {
-          payload.nostr_private_key = null
-        } else if (this.cyberherdData.form.nostr_private_key !== '') {
-          payload.nostr_private_key = this.cyberherdData.form.nostr_private_key
-        }
-
         // Follow LNbits patterns (splitpayments/tpos): don't pre-validate via a
         // separate endpoint. Save settings directly using the selected wallet's
         // admin key.
@@ -308,9 +306,6 @@ window.app = Vue.createApp({
           if (Object.prototype.hasOwnProperty.call(ed, 'effective_nostr_pubkey')) {
             this.cyberherdData.form.effective_nostr_pubkey = ed.effective_nostr_pubkey || ''
             this.cyberherdData.form.effective_nostr_npub = ed.effective_nostr_npub || ''
-            this.cyberherdData.form.nostr_private_key_set = !!ed.effective_nostr_pubkey
-            // Clear the input so we don't keep secrets in memory/UI after save
-            this.cyberherdData.form.nostr_private_key = ''
           }
         } catch (e) { }
         await this.refreshMembers()
@@ -360,15 +355,6 @@ window.app = Vue.createApp({
         console.error('Failed to save toggle settings', e)
         LNbits.utils.notifyApiError(e)
       }
-    },
-    clearNostrPrivateKey() {
-      // Mark for clearing on next save
-      this.cyberherdData.form.nostr_private_key = null
-      this.cyberherdData.form.nostr_private_key_set = false
-      this.cyberherdData.form.nostr_private_key_mask = ''
-      this.cyberherdData.form.effective_nostr_pubkey = ''
-      this.cyberherdData.form.effective_nostr_npub = ''
-      this.$q.notify({ type: 'info', message: 'Nostr private key will be cleared on Save.' })
     },
     // removed validateSourceWallet pre-check; not needed in standard patterns
     async fetchMembers() {

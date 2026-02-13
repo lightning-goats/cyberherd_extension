@@ -93,20 +93,29 @@
 
           <div class="row items-center q-col-gutter-sm q-mt-sm">
             <div class="col-12">
-              <q-badge v-if="cyberherdData.form.nostr_private_key_set" color="green-6" text-color="white"
-                class="q-mr-sm"><span v-text="'Key set: ' + cyberherdData.form.nostr_private_key_mask"></span></q-badge>
-              <q-badge v-else color="orange-6" text-color="white" class="q-mr-sm">No private key set</q-badge>
+              <q-badge v-if="cyberherdData.ui.bunkerStatus && cyberherdData.ui.bunkerStatus.installed && cyberherdData.ui.bunkerStatus.has_key && cyberherdData.ui.bunkerStatus.has_permissions"
+                color="blue" text-color="white" class="q-mr-sm">Bunker: ACTIVE</q-badge>
+              <q-badge v-else-if="cyberherdData.ui.bunkerStatus && cyberherdData.ui.bunkerStatus.installed && cyberherdData.ui.bunkerStatus.has_key"
+                color="orange-6" text-color="white" class="q-mr-sm">Bunker: NO PERMS</q-badge>
+              <q-badge v-else-if="cyberherdData.ui.bunkerStatus && cyberherdData.ui.bunkerStatus.installed"
+                color="grey" text-color="white" class="q-mr-sm">Bunker: NO KEY</q-badge>
+              <template v-if="!(cyberherdData.ui.bunkerStatus && cyberherdData.ui.bunkerStatus.installed && cyberherdData.ui.bunkerStatus.has_key && cyberherdData.ui.bunkerStatus.has_permissions)">
+                <q-badge color="orange-6" text-color="white" class="q-mr-sm">Configure nsecbunker to enable signing</q-badge>
+              </template>
             </div>
-            <div class="col-12 col-md-8">
-              <q-input filled dense v-model.trim="cyberherdData.form.nostr_private_key"
-                label="Set/replace nostr private key (hex)" hint="Leave empty to keep current; Save to apply" />
-            </div>
-            <div class="col-12 col-md-4">
-              <q-btn color="grey-8" flat class="q-mt-sm" @click="clearNostrPrivateKey">Clear key</q-btn>
-            </div>
+            <template v-if="cyberherdData.ui.bunkerStatus && cyberherdData.ui.bunkerStatus.installed && cyberherdData.ui.bunkerStatus.has_key && cyberherdData.ui.bunkerStatus.has_permissions">
+              <div class="col-12">
+                <span class="text-caption text-blue">Signing handled by nsecbunker</span>
+              </div>
+            </template>
+            <template v-else>
+              <div class="col-12">
+                <span class="text-caption text-orange">Configure nsecbunker extension to enable Nostr signing</span>
+              </div>
+            </template>
             <div class="col-12">
-              <q-input filled dense readonly :model-value="cyberherdData.form.effective_nostr_pubkey"
-                label="Effective watch pubkey (hex)" hint="derived from private key" />
+              <q-input filled dense readonly :model-value="(cyberherdData.ui.bunkerStatus && cyberherdData.ui.bunkerStatus.pubkey) || cyberherdData.form.effective_nostr_pubkey"
+                label="Effective watch pubkey (hex)" hint="derived from pubkey override or nsecbunker" />
             </div>
           </div>
 
@@ -248,5 +257,5 @@
 
 {% block scripts %}
 {{ window_vars(user) }}
-<script src="/cyberherd/static/cyberherd.js?v=20250925"></script>
+<script src="/cyberherd/static/cyberherd.js?v=20260213"></script>
 {% endblock %}

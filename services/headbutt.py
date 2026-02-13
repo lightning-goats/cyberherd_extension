@@ -653,7 +653,7 @@ class EnhancedHeadbuttService:
             return []
         try:
             # This logic is duplicated from views_api.py for service-layer use
-            from ..views_api import _get_effective_pubkey, _get_user_private_key
+            from ..views_api import _get_effective_pubkey
             from .time_utils import get_day_boundaries_utc
 
             s = await self.db.get_settings(self.user_id)
@@ -1381,10 +1381,8 @@ class EnhancedHeadbuttService:
                 logger.warning(f"cyberherd: make_messages failed for {event_type}: {e}")
                 msg_generated = None
 
-            from ..views_api import _get_user_private_key
             from . import messaging as ch_msg
 
-            private_key = await _get_user_private_key(self.user_id)
             websocket_topic = await self._get_websocket_topic()
 
             e_tags = [note_id] if note_id else None
@@ -1497,17 +1495,18 @@ class EnhancedHeadbuttService:
             except Exception:
                 chosen_relay = None
 
+            herd_wallet_id = getattr(settings, 'herd_wallet', None) if settings else None
             published = await ch_msg.publish_event_message(
                 event_type,
                 owner_user_id=self.user_id,
                 values=values,
                 e_tags=e_tags,
                 p_tags=p_tags,
-                private_key=private_key,
                 websocket_topic=websocket_topic,
                 reply_to_30311_event=reply_event_id,
                 reply_to_30311_a_tag=reply_a_tag,
                 reply_relay=chosen_relay,
+                wallet_id=herd_wallet_id,
             )
             # Log publish outcome and a bit of the generated content where available
             try:
@@ -2019,17 +2018,18 @@ class EnhancedHeadbuttService:
             except Exception:
                 chosen_relay = None
 
+            herd_wallet_id = getattr(settings, 'herd_wallet', None) if settings else None
             success = await ch_msg.publish_event_message(
                 template_key,
                 owner_user_id=self.user_id,
                 values=values,
                 e_tags=e_tags,
                 p_tags=p_tags,
-                private_key=getattr(settings, "nostr_private_key", None) if settings else None,
                 websocket_topic=websocket_topic,
                 reply_to_30311_event=reply_event_id,
                 reply_to_30311_a_tag=reply_a_tag,
                 reply_relay=chosen_relay,
+                wallet_id=herd_wallet_id,
             )
             if success:
                 logger.info(f"cyberherd: {template_key} message published")

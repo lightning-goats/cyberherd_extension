@@ -856,17 +856,17 @@ async def publish_shared_template(
     values: dict | None = None,
     e_tags: list[str] | None = None,
     p_tags: list[str] | None = None,
-    private_key: Any | None = None,
     websocket_topic: str = "cyberherd",
     message_type: str | None = None,
     reply_to_30311_event: str | None = None,
     reply_to_30311_a_tag: str | None = None,
     reply_relay: str | None = None,
+    wallet_id: str,
 ) -> bool:
     """Convenience wrapper to render+publish a template from the shared store.
 
     Returns False if the template doesn't exist or publishing fails.
-    
+
     Args:
         owner_user_id: User ID whose templates to use
         category: Template category (used for template lookup)
@@ -874,13 +874,13 @@ async def publish_shared_template(
         values: Values to format the template with
         e_tags: Event tags for threading
         p_tags: Pubkey tags
-        private_key: Nostr private key for signing
         websocket_topic: WebSocket topic/wallet ID to broadcast to (default: "cyberherd")
-        message_type: Semantic event name for websocket (e.g., "headbutt_success"). 
-                     If None, uses category. This allows storage categories to differ 
+        message_type: Semantic event name for websocket (e.g., "headbutt_success").
+                     If None, uses category. This allows storage categories to differ
                      from websocket type names.
         reply_to_30311_event: Optional event ID of the kind 30311 note being replied to
         reply_to_30311_a_tag: Optional `a` tag address for the kind 30311 note
+        wallet_id: Wallet ID for nsecbunker signing (mandatory)
     """
     if not _messaging_available or _msg_crud is None or _msg is None:
         logger.debug("Messaging not available, skipping shared template publication")
@@ -923,10 +923,10 @@ async def publish_shared_template(
             values=values_dict,
             e_tags=e_tags,
             p_tags=p_tags,
-            private_key=private_key,
             reply_to_30311_event=reply_to_30311_event,
             reply_to_30311_a_tag=reply_to_30311_a_tag,
             reply_relay=reply_relay,
+            wallet_id=wallet_id,
         )
         if ok:
             logger.info(f"cyberherd: message published successfully via cyberherd_messaging extension")
@@ -958,11 +958,11 @@ async def publish_shared_template(
                 values=values_dict,
                 e_tags=e_tags,
                 p_tags=p_tags,
-                private_key=private_key,
                 return_websocket_message=True,
                 reply_to_30311_event=reply_to_30311_event,
                 reply_to_30311_a_tag=reply_to_30311_a_tag,
                 reply_relay=reply_relay,
+                wallet_id=wallet_id,
             )
 
             if isinstance(websocket_result, tuple):
@@ -1025,23 +1025,23 @@ async def try_publish_note(
     *,
     e_tags: list[str] | None = None,
     p_tags: list[str] | None = None,
-    private_key: Any | None = None,
     websocket_topic: str = "cyberherd",
     reply_to_30311_event: str | None = None,
     reply_to_30311_a_tag: str | None = None,
     mirror_to_websocket: bool = True,
     reply_relay: str | None = None,
+    wallet_id: str,
 ) -> bool:
     """Publish a note using the shared messaging extension services.
-    
+
     Args:
         content: The note content to publish
         e_tags: Event tags for threading
         p_tags: Pubkey tags
-        private_key: Nostr private key for signing
         websocket_topic: WebSocket topic/wallet ID to broadcast to (default: "cyberherd")
         reply_to_30311_event: Optional event ID of the kind 30311 note being replied to
         reply_to_30311_a_tag: Optional `a` tag address for the kind 30311 note
+        wallet_id: Wallet ID for nsecbunker signing (mandatory)
     """
     if not _messaging_available or _msg is None:
         logger.debug("Messaging not available, skipping note publication")
@@ -1068,10 +1068,10 @@ async def try_publish_note(
                 content,
                 e_tags=e_tags,
                 p_tags=p_tags,
-                private_key_hex=private_key,
                 reply_to_30311_event=reply_to_30311_event,
                 reply_to_30311_a_tag=reply_to_30311_a_tag,
                 reply_relay=reply_relay,
+                wallet_id=wallet_id,
             )
             if ok:
                 logger.info(f"cyberherd: note published successfully")
@@ -1192,27 +1192,27 @@ async def publish_event_message(
     values: Optional[dict] = None,
     e_tags: Optional[list[str]] = None,
     p_tags: Optional[list[str]] = None,
-    private_key: Optional[Any] = None,
     websocket_topic: str = "cyberherd",
     reply_to_30311_event: str | None = None,
     reply_to_30311_a_tag: str | None = None,
     reply_relay: str | None = None,
+    wallet_id: str,
 ) -> bool:
     """Unified publisher: choose random template key (if multiple), render and publish.
 
     Falls back to make_messages() local content when shared template not found.
     Always mirrors to websocket via publish_shared_template logic.
-    
+
     Args:
         event_type: Type of event to publish
         owner_user_id: User ID whose templates to use
         values: Template values
         e_tags: Event tags for threading
         p_tags: Pubkey tags
-        private_key: Nostr private key for signing
         websocket_topic: WebSocket topic/wallet ID to broadcast to (default: "cyberherd")
         reply_to_30311_event: Optional event ID for kind 30311 threading
         reply_to_30311_a_tag: Optional `a` tag address for kind 30311 threading
+        wallet_id: Wallet ID for nsecbunker signing (mandatory)
     """
     values = values or {}
 
@@ -1261,14 +1261,15 @@ async def publish_event_message(
                 content_str,
                 e_tags=e_tags,
                 p_tags=p_tags,
-                private_key=private_key,
+
                 websocket_topic=websocket_topic,
                 reply_to_30311_event=reply_to_30311_event,
                 reply_to_30311_a_tag=reply_to_30311_a_tag,
                 mirror_to_websocket=False,
                 reply_relay=reply_relay,
+                wallet_id=wallet_id,
             )
-            
+
             # Explicitly send websocket message with semantic event_type
             broadcasted = False
             if _msg is not None:
@@ -1304,7 +1305,7 @@ async def publish_event_message(
                         logger.info(f"cyberherd: unknown event type message broadcasted to websocket (type={event_type})")
                 except Exception as e:
                     logger.warning(f"cyberherd: unknown event type websocket broadcast failed: {e}")
-            
+
             return nostr_ok or broadcasted
         except Exception:
             return False
@@ -1323,12 +1324,13 @@ async def publish_event_message(
                     values=values,
                     e_tags=e_tags,
                     p_tags=p_tags,
-                    private_key=private_key,
+    
                     websocket_topic=websocket_topic,
                     message_type=event_type,  # Use semantic event_type for websocket
                     reply_to_30311_event=reply_to_30311_event,
                     reply_to_30311_a_tag=reply_to_30311_a_tag,
                     reply_relay=reply_relay,
+                    wallet_id=wallet_id,
                 )
                 if ok:
                     return True
@@ -1355,14 +1357,14 @@ async def publish_event_message(
             content_str,
             e_tags=e_tags,
             p_tags=p_tags,
-            private_key=private_key,
             websocket_topic=websocket_topic,
             reply_to_30311_event=reply_to_30311_event,
             reply_to_30311_a_tag=reply_to_30311_a_tag,
             mirror_to_websocket=False,
             reply_relay=reply_relay,
+            wallet_id=wallet_id,
         )
-        
+
         # Explicitly send websocket message with semantic event_type
         # (instead of relying on try_publish_note's generic "nostr_message" type)
         broadcasted = False

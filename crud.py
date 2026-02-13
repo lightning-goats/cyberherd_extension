@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import string
 import time
 from datetime import datetime, timezone
 import asyncio
@@ -10,8 +9,6 @@ from typing import Any
 from loguru import logger
 
 from lnbits.db import Database # type: ignore
-from lnbits.helpers import decrypt_internal_message, encrypt_internal_message # type: ignore
-
 from .models import CyberherdSettings, LegacyCyberherdMember
 from .services.shares import compute_member_share_percentages
 from .utils.common import extract_t_tags_from_event, utc_now, coerce_bool
@@ -26,28 +23,6 @@ def _get_crud_write_lock() -> asyncio.Lock:
     if _crud_write_lock is None:
         _crud_write_lock = asyncio.Lock()
     return _crud_write_lock
-
-
-def _sanitize_private_key(raw_value) -> tuple[str | None, int]:
-    """Normalize decrypted nostr keys to 64 lower-case hex characters."""
-    if raw_value is None:
-        return None, 0
-
-    candidate = raw_value
-    if isinstance(candidate, bytes):
-        candidate = candidate.decode("utf-8", errors="ignore")
-
-    if not isinstance(candidate, str):
-        return None, 0
-
-    cleaned = "".join(ch for ch in candidate if ch in string.hexdigits).lower()
-    if cleaned.startswith("0x"):
-        cleaned = cleaned[2:]
-
-    if len(cleaned) >= 64:
-        return cleaned[:64], len(cleaned)
-
-    return None, len(cleaned)
 
 
 def get_utc_day_boundaries(days_ago: int = 0) -> tuple[datetime, datetime, int, int]:
@@ -471,37 +446,6 @@ def _row_to_settings(row) -> CyberherdSettings:
     except Exception:
         tracked_list = []
 
-    stored_key = row.get("nostr_private_key")
-    nostr_key: str | None = None
-    sanitized_len = 0
-    if stored_key:
-        decrypted = None
-        try:
-            decrypted = decrypt_internal_message(stored_key)
-        except Exception as exc:
-            logger.warning(f"Cyberherd: Failed to decrypt nostr_private_key: {type(exc).__name__}")
-            if isinstance(stored_key, (bytes, str)):
-                decrypted = stored_key
-
-        nostr_key, sanitized_len = _sanitize_private_key(decrypted)
-        if decrypted is not None and nostr_key is None and sanitized_len not in (0, 64):
-            try:
-                logger.warning(
-                    f"Cyberherd: sanitized nostr key invalid length {sanitized_len} (expected >=64)"
-                )
-            except Exception:
-                pass
-    
-    # Log key status (NEVER log the actual key value - security risk!)
-    try:
-        logger.debug(
-            f"Cyberherd CRUD _row_to_settings: user_id={row.get('user_id')}, source_wallet={row.get('source_wallet')}, "
-            f"zap_wallet={row.get('zap_wallet')}, nostr_key_present={bool(nostr_key)}, "
-            f"nostr_key_length={len(nostr_key) if nostr_key else sanitized_len}, override_present={bool(row.get('nostr_pubkey_override'))}"
-        )
-    except Exception:
-        pass
-
     tracked_events = row.get("tracked_event_ids")
     try:
         if isinstance(tracked_events, str):
@@ -560,7 +504,6 @@ def _row_to_settings(row) -> CyberherdSettings:
         tracked_event_ids=combined_tracked_events,
         tracked_event_timestamps=tracked_timestamps_dict,
         tracked_event_addresses=tracked_addresses_dict,
-        nostr_private_key=nostr_key,
         nostr_pubkey_override=row.get("nostr_pubkey_override"),
         computed_effective_pubkey=row.get("computed_effective_pubkey"),
         zap_tracking_enabled=coerce_bool(row.get("zap_tracking_enabled"), True),
@@ -580,18 +523,6 @@ def _row_to_settings(row) -> CyberherdSettings:
 
 async def upsert_settings(settings: CyberherdSettings, user_id: str | None = None):
     _t0 = time.time()
-    stored_key = (
-        None
-        if getattr(settings, "nostr_private_key", None) is None
-        else encrypt_internal_message(settings.nostr_private_key)
-    )
-    try:
-        # NEVER log stored_key prefix - it contains encrypted secret! Only log metadata
-        logger.debug(
-            f"Cyberherd upsert_settings: stored_key has_value={bool(stored_key)} len={len(stored_key) if stored_key else 0}"
-        )
-    except Exception:
-        pass
     tracked_json = json.dumps(getattr(settings, "tracked_tags", []) or [])
 
     try:
@@ -656,7 +587,6 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
             "tracked_event_ids = :tracked_event_ids",
             "tracked_event_timestamps = :tracked_event_timestamps",
             "tracked_event_addresses = :tracked_event_addresses",
-            "nostr_private_key = :nostr_private_key",
             "nostr_pubkey_override = :nostr_pubkey_override",
             "computed_effective_pubkey = :computed_effective_pubkey",
             "zap_tracking_enabled = :zap_tracking_enabled",
@@ -696,7 +626,6 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
             "tracked_event_ids": json.dumps(getattr(settings, "tracked_event_ids", []) or []),
             "tracked_event_timestamps": json.dumps(getattr(settings, "tracked_event_timestamps", {}) or {}),
             "tracked_event_addresses": json.dumps(getattr(settings, "tracked_event_addresses", {}) or {}),
-            "nostr_private_key": stored_key,
             "nostr_pubkey_override": getattr(settings, "nostr_pubkey_override", None),
             "computed_effective_pubkey": getattr(settings, "computed_effective_pubkey", None),
             "zap_tracking_enabled": int(getattr(settings, "zap_tracking_enabled", False)),
@@ -753,10 +682,9 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
             raise
         try:
             logger.debug(
-                "Cyberherd CRUD upsert (update) user_id=%s source_wallet=%s nostr_key_present=%s override_present=%s",
+                "Cyberherd CRUD upsert (update) user_id=%s source_wallet=%s override_present=%s",
                 user_id,
                 getattr(settings, "source_wallet", None),
-                bool(getattr(settings, "nostr_private_key", None)),
                 bool(getattr(settings, "nostr_pubkey_override", None)),
             )
         except Exception:
@@ -799,7 +727,6 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
             "tracked_event_ids",
             "tracked_event_timestamps",
             "tracked_event_addresses",
-            "nostr_private_key",
             "nostr_pubkey_override",
             "computed_effective_pubkey",
             "zap_tracking_enabled",
@@ -829,7 +756,6 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
             "tracked_event_ids": json.dumps(getattr(settings, "tracked_event_ids", []) or []),
             "tracked_event_timestamps": json.dumps(getattr(settings, "tracked_event_timestamps", {}) or {}),
             "tracked_event_addresses": json.dumps(getattr(settings, "tracked_event_addresses", {}) or {}),
-            "nostr_private_key": stored_key,
             "nostr_pubkey_override": getattr(settings, "nostr_pubkey_override", None),
             "computed_effective_pubkey": getattr(settings, "computed_effective_pubkey", None),
             "zap_tracking_enabled": int(getattr(settings, "zap_tracking_enabled", False)),
@@ -904,10 +830,9 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
                 raise
         try:
             logger.debug(
-                "Cyberherd CRUD upsert (insert) user_id=%s source_wallet=%s nostr_key_present=%s override_present=%s",
+                "Cyberherd CRUD upsert (insert) user_id=%s source_wallet=%s override_present=%s",
                 user_id,
                 getattr(settings, "source_wallet", None),
-                bool(getattr(settings, "nostr_private_key", None)),
                 bool(getattr(settings, "nostr_pubkey_override", None)),
             )
         except Exception:

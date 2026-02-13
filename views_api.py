@@ -27,7 +27,6 @@ from lnbits.decorators import KeyChecker, api_key_query
 from lnbits.core.models import KeyType
 from lnbits.extensions.cyberherd.models import MemberPut
 from lnbits.utils.nostr import (
-    normalize_private_key,
     validate_pub_key,
     hex_to_npub,
 )
@@ -73,21 +72,6 @@ from .utils.common import coerce_bool
 # Legacy underscore-prefixed helpers expected by this module
 _normalize_event_id = normalize_event_id
 _reconnect_nostrclient_ws = reconnect_nostrclient_ws
-
-def _extract_private_key(raw: str | None) -> str | None:
-    """Lightweight extractor for private key-like tokens from freeform input.
-
-    This mirrors previous small helper behaviour used by views: return the
-    provided string stripped, or None for non-string values. More advanced
-    parsing (bech32, 0x prefix) is handled by normalize_private_key later.
-    """
-    if raw is None:
-        return None
-    try:
-        s = str(raw).strip()
-        return s if s else None
-    except Exception:
-        return None
 
 # No compatibility shims required - import targets exist in helper modules
 from lnbits.core.crud import get_wallet_for_key
@@ -152,24 +136,6 @@ except Exception:  # pragma: no cover - extension may be unavailable during boot
         if candidate.startswith("http://"):
             return "ws://" + candidate[len("http://") :]
     
-
-async def _get_user_private_key(user_id: str) -> str | None:
-    """Get the user's Nostr private key from cyberherd settings.
-    
-    Args:
-        user_id: The LNbits user ID
-        
-    Returns:
-        The private key as a hex string, or None if not set
-    """
-    try:
-        settings = await crud.get_settings(user_id)
-        if settings and hasattr(settings, 'nostr_private_key') and settings.nostr_private_key:
-            return settings.nostr_private_key
-    except Exception as e:
-        logger.warning(f"Failed to get private key for user {user_id}: {e}")
-    return None
-
 
 def _extract_tracked_event_id(
     payload: dict | None, zap_request: dict | None = None
@@ -576,9 +542,6 @@ async def api_get_diagnostics(
             "tracked_event_ids_count": len(
                 getattr(settings, "tracked_event_ids", []) or []
             ),
-            "nostr_private_key_set": bool(
-                getattr(settings, "nostr_private_key", None)
-            ),
             "nostr_pubkey_override": getattr(
                 settings, "nostr_pubkey_override", None
             ),
@@ -915,27 +878,18 @@ async def api_get_settings(request: Request, auth=Depends(auth_wallet_or_admin_d
     
     try:
         logger.debug(
-            "Cyberherd GET settings: user_id=%s source_wallet=%s zap_wallet=%s nostr_key_set=%s override_set=%s",
+            "Cyberherd GET settings: user_id=%s source_wallet=%s zap_wallet=%s override_set=%s",
             user_id,
             getattr(settings, "source_wallet", None),
             getattr(settings, "zap_wallet", None),
-            bool(getattr(settings, "nostr_private_key", None)),
             bool(getattr(settings, "nostr_pubkey_override", None)),
         )
     except Exception:
         pass
     # tracked_tags stored as JSON-ish string in DB; ensure it's a list
     tags = settings.tracked_tags if isinstance(settings.tracked_tags, list) else []
-    # mask private key for UI; do not return actual key
-    key = getattr(settings, "nostr_private_key", None)
-    if key:
-        masked = f"{key[:6]}...{key[-6:]}"
-        key_set = True
-    else:
-        masked = ""
-        key_set = False
 
-    # Compute effective nostr pubkey: override if set, else derive from private key
+    # Compute effective nostr pubkey: override if set, else from nsecbunker
     # Unified resolver (uses cached/override/legacy/derived)
     effective_pubkey = resolve_effective_pubkey(settings)
     try:
@@ -969,8 +923,6 @@ async def api_get_settings(request: Request, auth=Depends(auth_wallet_or_admin_d
         "max_members": settings.max_members,
         "tracked_tags": tags,
         "tracked_event_ids": getattr(settings, "tracked_event_ids", []),
-        "nostr_private_key_set": key_set,
-        "nostr_private_key_mask": masked,
         "nostr_pubkey_override": getattr(settings, "nostr_pubkey_override", None),
         "effective_nostr_pubkey": effective_pubkey,
         "effective_nostr_npub": (
@@ -990,6 +942,25 @@ async def api_get_settings(request: Request, auth=Depends(auth_wallet_or_admin_d
         "send_splits_enabled": getattr(settings, "send_splits_enabled", False),
         "websocket_url": websocket_url,
     }
+
+
+@cyberherd_api_router.get("/api/v1/bunker_status")
+async def api_bunker_status(
+    request: Request,
+    wallet_info: WalletTypeInfo = Depends(require_admin_key),
+):
+    """Check nsecbunker signing availability for this user's herd wallet."""
+    user_id = wallet_info.wallet.user
+    settings = await crud.get_settings(user_id)
+    herd_wallet = getattr(settings, "herd_wallet", None)
+    if not herd_wallet:
+        return {"installed": False, "has_key": False, "pubkey": None, "has_permissions": False}
+    try:
+        from lnbits.extensions.cyberherd_messaging.services import check_bunker_status
+
+        return await check_bunker_status(herd_wallet)
+    except ImportError:
+        return {"installed": False, "has_key": False, "pubkey": None, "has_permissions": False}
 
 
 @cyberherd_api_router.put("/api/v1/source_wallet", status_code=HTTPStatus.OK)
@@ -1189,7 +1160,6 @@ async def api_put_settings(
 
     # Capture previous effective pubkey before mutating the key.
     eff_before = _get_cached_effective_pubkey(settings)
-    _handle_nostr_private_key(settings, payload)
     _handle_nostr_pubkey_override(settings, payload)
 
     # Handle zap tracking toggle
@@ -1302,7 +1272,7 @@ async def api_put_settings(
     try:
         duration_ms = int((time.time() - start_ts) * 1000)
         logger.info(
-            f"Cyberherd PUT settings persisted user={user_id} dur_ms={duration_ms} source={getattr(settings, 'source_wallet', None)} zap={getattr(settings, 'zap_wallet', None)} herd={getattr(settings, 'herd_wallet', None)} tags_len={len(getattr(settings, 'tracked_tags', []) or [])} nostr_key={bool(getattr(settings, 'nostr_private_key', None))} override={bool(getattr(settings, 'nostr_pubkey_override', None))} zap_tracking={getattr(settings, 'zap_tracking_enabled', False)} mode=payment"
+            f"Cyberherd PUT settings persisted user={user_id} dur_ms={duration_ms} source={getattr(settings, 'source_wallet', None)} zap={getattr(settings, 'zap_wallet', None)} herd={getattr(settings, 'herd_wallet', None)} tags_len={len(getattr(settings, 'tracked_tags', []) or [])} override={bool(getattr(settings, 'nostr_pubkey_override', None))} zap_tracking={getattr(settings, 'zap_tracking_enabled', False)} mode=payment"
         )
     except Exception:
         pass
@@ -1555,52 +1525,6 @@ async def api_recover_events_status(request: Request, task_id: str, wallet_info:
         pass
 
     return {"task_id": task_id, "status": task}
-
-
-def _handle_nostr_private_key(settings, payload):
-    if "nostr_private_key" in payload:
-        npk = payload.get("nostr_private_key")
-        if npk is None:
-            settings.nostr_private_key = None
-            try:
-                logger.info("Cyberherd: nostr_private_key cleared via settings PUT")
-            except Exception:
-                pass
-        else:
-            if not isinstance(npk, str):
-                raise HTTPException(
-                    status_code=HTTPStatus.BAD_REQUEST,
-                    detail="nostr_private_key must be a string or null",
-                )
-            # sanitize & extract likely key token
-            k = _extract_private_key(str(npk))
-            # Accept 0x-prefixed hex or bech32 nsec; normalize to 64-hex
-            try:
-                if not k:
-                    raise ValueError("empty private key")
-                if k.startswith("0x"):
-                    k = k[2:]
-                k = normalize_private_key(k)
-                if not k:
-                    raise ValueError("normalize_private_key returned empty value")
-            except Exception as e:
-                raise HTTPException(
-                    status_code=HTTPStatus.BAD_REQUEST,
-                    detail="nostr_private_key must be 64-hex or nsec",
-                ) from e
-            # final sanity check
-            if len(k) != 64:
-                raise HTTPException(
-                    status_code=HTTPStatus.BAD_REQUEST,
-                    detail="nostr_private_key must be 64 hex characters",
-                )
-            settings.nostr_private_key = k.lower()
-            try:
-                logger.info(
-                    "Cyberherd: nostr_private_key updated (len=%s)", len(k)
-                )
-            except Exception:
-                pass
 
 
 def _handle_nostr_pubkey_override(settings, payload):
@@ -2126,7 +2050,6 @@ async def api_post_member(
         try:
             from .services import messaging as ch_msg
             owner_user_id = getattr(settings, "templates_owner_user", None)
-            private_key = await _get_user_private_key(user_id)
             member_name = f"nostr:{nprofile}" if nprofile else display_name
 
             # Only publish messages for automated or zap-request driven adds
@@ -2200,9 +2123,9 @@ async def api_post_member(
                         values=values_payload,
                         e_tags=[thread_event_id] if thread_event_id else None,
                         p_tags=[pubkey] if pubkey else None,
-                        private_key=private_key,
                         websocket_topic="cyberherd",
                         reply_relay=relay_hint,
+                        wallet_id=getattr(settings, 'herd_wallet', None),
                     )
                     # If we published for a threaded event (zap/tracked event),
                     # record it as processed so downstream headbutt processing
@@ -2354,9 +2277,6 @@ async def api_put_member(
                     event_type = "new_member" if not was_active else "member_increase"
                     logger.info(f"cyberherd: publishing {event_type} message for {pubkey[:8]}...")
 
-                    # Get the user's private key for signing
-                    private_key = await _get_user_private_key(user_id)
-
                     e_tags = [publish_thread_id] if publish_thread_id else None
                     if not e_tags and zap_request:
                         fallback_event = _normalize_event_id(zap_request.get("id"))
@@ -2427,8 +2347,8 @@ async def api_put_member(
                             values=values,
                             e_tags=e_tags,
                             p_tags=p_tags,
-                            private_key=private_key,
                             reply_relay=relay_hint,
+                            wallet_id=getattr(settings, 'herd_wallet', None),
                         )
                         # Persist processed marker for the thread event so headbutt doesn't duplicate
                         try:
