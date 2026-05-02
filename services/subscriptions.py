@@ -469,6 +469,7 @@ async def _append_today(user_id: str | None, eff_pub: str | None, tags: list[str
         event_t_tags = [t[1] for t in event.get('tags', []) if isinstance(t, list) and len(t) >= 2 and t[0] == 't']
         content_preview = (event.get('content', '') or '')[:100]
         logger.debug(f"🏷️ Skipping event {eid[:16]}... with t-tags {event_t_tags} content_preview='{content_preview}'")
+        return False
     # Auto-add detected note event IDs to tracked_event_ids for repost/reaction tracking
     if user_id is not None:
         # Acquire lock to prevent read-modify-write race conditions
@@ -1756,6 +1757,30 @@ async def process_zap_receipt_for_tracked_notes(user_id: str, event: dict, app=N
                 return
         except Exception:
             pass
+
+        # Only process zaps directed at the configured Lightning Goats pubkey.
+        eff_pub = None
+        try:
+            eff_pub = resolve_effective_pubkey(settings)
+            if isinstance(eff_pub, str):
+                eff_pub = eff_pub.strip().lower()
+        except Exception:
+            eff_pub = None
+
+        recipient_pubkey_norm = (
+            recipient_pubkey.strip().lower() if isinstance(recipient_pubkey, str) else None
+        )
+        if not recipient_pubkey_norm:
+            logger.debug(
+                f"Zap receipt {event_id[:8]}... missing recipient pubkey tag; skipping"
+            )
+            return
+        if eff_pub and recipient_pubkey_norm != eff_pub:
+            logger.info(
+                f"Zap receipt {event_id[:8]}... targets pubkey {recipient_pubkey_norm[:8]}... "
+                f"not effective pubkey {eff_pub[:8]}...; skipping"
+            )
+            return
 
         # Amount: prefer explicit amount tag (msat); fallback to bolt11 decode
         amount_msat = None

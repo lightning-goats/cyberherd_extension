@@ -76,7 +76,7 @@ _reconnect_nostrclient_ws = reconnect_nostrclient_ws
 # No compatibility shims required - import targets exist in helper modules
 from lnbits.core.crud import get_wallet_for_key
 from . import crud, services
-from .crud import clear_processed_zaps_for_user
+from .crud import clear_processed_events_for_user, clear_processed_zaps_for_user
 from .services.splits import reset_splits_to_predefined_wallet
 from .services.payment_coordinator import (
     get_payment_coordinator as get_zap_monitor,
@@ -318,6 +318,101 @@ async def _resolve_user_from_api_key(request: Request) -> str | None:
         return None
 
 
+async def _resolve_owned_wallet_id(
+    value: str | None,
+    *,
+    field_name: str,
+    owner_user_id: str,
+    required: bool = False,
+) -> str | None:
+    """Resolve a wallet id/key and ensure it belongs to the authenticated user."""
+    if value is None:
+        if required:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail=f"Missing '{field_name}'",
+            )
+        return None
+
+    candidate = str(value).strip()
+    if not candidate:
+        if required:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail=f"Missing '{field_name}'",
+            )
+        return None
+
+    wallet = await get_wallet(candidate)
+    if wallet is None:
+        wallet = await get_wallet_for_key(candidate)
+    if wallet is None:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=f"Could not resolve {field_name} as a wallet id or key",
+        )
+
+    wallet_user = getattr(wallet, "user", None)
+    if wallet_user != owner_user_id:
+        raise HTTPException(
+            status_code=HTTPStatus.FORBIDDEN,
+            detail=f"{field_name} does not belong to the authenticated user",
+        )
+
+    wallet_id = getattr(wallet, "id", None)
+    if not wallet_id:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=f"Resolved {field_name} has no wallet id",
+        )
+    return str(wallet_id)
+
+
+def _build_settings_response(
+    settings,
+    *,
+    effective_pubkey: str | None,
+    websocket_url: str | None = None,
+    include_private: bool = False,
+) -> dict[str, Any]:
+    """Build settings response with private wallet fields gated by auth."""
+    tags = settings.tracked_tags if isinstance(settings.tracked_tags, list) else []
+    response: dict[str, Any] = {
+        "max_members": settings.max_members,
+        "tracked_tags": tags,
+        "effective_nostr_pubkey": effective_pubkey,
+        "effective_nostr_npub": (
+            hex_to_npub(effective_pubkey) if effective_pubkey else None
+        ),
+        "nostrclient_required": True,
+        "nostrclient_available": _nostrclient_available(),
+        "zap_tracking_enabled": getattr(settings, "zap_tracking_enabled", False),
+        "midnight_reset_enabled": getattr(settings, "midnight_reset_enabled", True),
+        "nip05_verification_enabled": getattr(settings, "nip05_verification_enabled", True),
+        "zap_monitor_mode": getattr(settings, "zap_monitor_mode", "websocket"),
+        "repost_tracking_enabled": getattr(settings, "repost_tracking_enabled", False),
+        "likes_tracking_enabled": getattr(settings, "likes_tracking_enabled", False),
+        "minimum_sats": getattr(settings, "minimum_sats", 10),
+        "feeder_trigger_sats": getattr(settings, "feeder_trigger_sats", None),
+        "member_allocation_percent": getattr(settings, "member_allocation_percent", 10),
+        "send_splits_enabled": getattr(settings, "send_splits_enabled", False),
+    }
+
+    if include_private:
+        response.update(
+            {
+                "source_wallet": settings.source_wallet,
+                "zap_wallet": settings.zap_wallet,
+                "zap_wallet_alias": settings.zap_wallet_alias,
+                "herd_wallet": settings.herd_wallet,
+                "tracked_event_ids": getattr(settings, "tracked_event_ids", []),
+                "nostr_pubkey_override": getattr(settings, "nostr_pubkey_override", None),
+                "websocket_url": websocket_url,
+            }
+        )
+    return response
+
+
 async def auth_wallet_or_admin(
     request: Request,
     api_key_header: str | None = Depends(lambda request=Depends(lambda: None): None),
@@ -329,11 +424,9 @@ async def auth_wallet_or_admin(
     FastAPI's Security/Depends to correctly resolve API keys and admin
     sessions. Do not call this function directly.
     """
-    # This function intentionally raises to ensure callers use the proper
-    # dependency signature (see auth_wallet_or_admin_dep). If somehow invoked
-    # directly, return a permissive admin placeholder (safe default for tests).
-    user = await check_admin(request)  # type: ignore[arg-type]
-    return {"type": "admin", "value": user}
+    # This function intentionally rejects direct use so callers use the proper
+    # dependency signature (see auth_wallet_or_admin_dep).
+    raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED, detail="authentication required")
 
 
 async def auth_wallet_or_admin_dep(
@@ -419,6 +512,11 @@ async def api_get_source_wallet(
         user_id = auth["value"].wallet.user
     elif auth["type"] == "admin":
         user_id = auth["value"].id
+    else:
+        raise HTTPException(
+            status_code=HTTPStatus.UNAUTHORIZED,
+            detail="wallet key required",
+        )
 
     settings = await crud.get_settings(user_id)
     return {"source_wallet": settings.source_wallet}
@@ -566,7 +664,10 @@ async def api_get_diagnostics(
 
     # Include nostr diagnostics (helpers + subscriptions)
     try:
-        diagnostics["nostr"] = await api_get_nostr_diagnostics(request, auth=auth)
+        diagnostics["nostr"] = await api_get_nostr_diagnostics(
+            request,
+            auth={"type": "wallet", "value": wallet_info},
+        )
     except Exception as e:
         diagnostics["nostr"] = {"error": str(e)}
 
@@ -806,8 +907,18 @@ async def api_pay_members(request: Request, wallet_info: WalletTypeInfo = Depend
     user_id = wallet_info.wallet.user
     settings = await crud.get_settings(user_id)
 
-    herd_wallet = getattr(settings, "herd_wallet", None)
-    target_wallet = getattr(settings, "source_wallet", None)
+    herd_wallet = await _resolve_owned_wallet_id(
+        getattr(settings, "herd_wallet", None),
+        field_name="herd_wallet",
+        owner_user_id=user_id,
+        required=True,
+    )
+    target_wallet = await _resolve_owned_wallet_id(
+        getattr(settings, "source_wallet", None),
+        field_name="source_wallet",
+        owner_user_id=user_id,
+        required=True,
+    )
 
     if not herd_wallet:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="No herd_wallet configured in cyberherd settings")
@@ -870,6 +981,14 @@ async def api_get_settings(request: Request, auth=Depends(auth_wallet_or_admin_d
             user_id = auth["value"].id
 
     settings = await crud.get_settings(user_id)
+    include_private = bool(
+        user_id
+        and (
+            (auth and auth.get("type") in {"wallet", "admin"})
+            or request.headers.get("X-API-KEY")
+            or request.query_params.get("api-key")
+        )
+    )
     
     # DO NOT start zap monitor on every GET request - only start from:
     # 1. Warm start on server startup (__init__.py)
@@ -886,9 +1005,6 @@ async def api_get_settings(request: Request, auth=Depends(auth_wallet_or_admin_d
         )
     except Exception:
         pass
-    # tracked_tags stored as JSON-ish string in DB; ensure it's a list
-    tags = settings.tracked_tags if isinstance(settings.tracked_tags, list) else []
-
     # Compute effective nostr pubkey: override if set, else from nsecbunker
     # Unified resolver (uses cached/override/legacy/derived)
     effective_pubkey = resolve_effective_pubkey(settings)
@@ -915,33 +1031,12 @@ async def api_get_settings(request: Request, auth=Depends(auth_wallet_or_admin_d
     except Exception:
         websocket_url = None
 
-    return {
-        "source_wallet": settings.source_wallet,
-        "zap_wallet": settings.zap_wallet,
-        "zap_wallet_alias": settings.zap_wallet_alias,
-        "herd_wallet": settings.herd_wallet,
-        "max_members": settings.max_members,
-        "tracked_tags": tags,
-        "tracked_event_ids": getattr(settings, "tracked_event_ids", []),
-        "nostr_pubkey_override": getattr(settings, "nostr_pubkey_override", None),
-        "effective_nostr_pubkey": effective_pubkey,
-        "effective_nostr_npub": (
-            hex_to_npub(effective_pubkey) if effective_pubkey else None
-        ),
-        "nostrclient_required": True,
-        "nostrclient_available": _nostrclient_available(),
-        "zap_tracking_enabled": getattr(settings, "zap_tracking_enabled", False),
-        "midnight_reset_enabled": getattr(settings, "midnight_reset_enabled", True),
-        "nip05_verification_enabled": getattr(settings, "nip05_verification_enabled", True),
-        "zap_monitor_mode": getattr(settings, "zap_monitor_mode", "websocket"),
-        "repost_tracking_enabled": getattr(settings, "repost_tracking_enabled", False),
-        "likes_tracking_enabled": getattr(settings, "likes_tracking_enabled", False),
-        "minimum_sats": getattr(settings, "minimum_sats", 10),
-        "feeder_trigger_sats": getattr(settings, "feeder_trigger_sats", None),
-        "member_allocation_percent": getattr(settings, "member_allocation_percent", 10),
-        "send_splits_enabled": getattr(settings, "send_splits_enabled", False),
-        "websocket_url": websocket_url,
-    }
+    return _build_settings_response(
+        settings,
+        effective_pubkey=effective_pubkey,
+        websocket_url=websocket_url,
+        include_private=include_private,
+    )
 
 
 @cyberherd_api_router.get("/api/v1/bunker_status")
@@ -980,14 +1075,18 @@ async def api_set_source_wallet(
             detail="Missing 'source_wallet' in payload",
         )
 
-    # Resolve wallet id either by direct id or by adminkey/inkey
-    wallet = await get_wallet(source)
-    if wallet is None:
-        wallet = await get_wallet_for_key(source)
+    user_id = wallet_info.wallet.user
+    wallet_id = await _resolve_owned_wallet_id(
+        source,
+        field_name="source_wallet",
+        owner_user_id=user_id,
+        required=True,
+    )
+    wallet = await get_wallet(wallet_id)
     if wallet is None:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST,
-            detail="Could not resolve wallet id or key",
+            detail="Could not resolve source_wallet",
         )
 
     # Validate balance: require at least 1 sat (1000 msat) to avoid misconfiguration
@@ -1016,10 +1115,8 @@ async def api_set_source_wallet(
 
     # require authenticated caller
     # Persist per-user settings using authenticated admin wallet
-    user_id = wallet_info.wallet.user
-
     settings = await crud.get_settings(user_id)
-    settings.source_wallet = wallet.id
+    settings.source_wallet = wallet_id
     try:
         await crud.upsert_settings(settings, user_id)
     except Exception as e:
@@ -1030,7 +1127,7 @@ async def api_set_source_wallet(
         except Exception:
             pass
         raise HTTPException(status_code=500, detail="Failed to persist source wallet")
-    return {"source_wallet": wallet.id}
+    return {"source_wallet": wallet_id}
 
 
 @cyberherd_api_router.put("/api/v1/settings")
@@ -1116,13 +1213,25 @@ async def api_put_settings(
     tracked_event_ids = payload.get("tracked_event_ids")
 
     if source is not None:
-        settings.source_wallet = source
+        settings.source_wallet = await _resolve_owned_wallet_id(
+            source,
+            field_name="source_wallet",
+            owner_user_id=user_id,
+        )
     if zap_wallet is not None:
-        settings.zap_wallet = zap_wallet
+        settings.zap_wallet = await _resolve_owned_wallet_id(
+            zap_wallet,
+            field_name="zap_wallet",
+            owner_user_id=user_id,
+        )
     if zap_wallet_alias is not None:
         settings.zap_wallet_alias = zap_wallet_alias
     if herd_wallet is not None:
-        settings.herd_wallet = herd_wallet
+        settings.herd_wallet = await _resolve_owned_wallet_id(
+            herd_wallet,
+            field_name="herd_wallet",
+            owner_user_id=user_id,
+        )
     if maxm is not None:
         try:
             settings.max_members = int(maxm)

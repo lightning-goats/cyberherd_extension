@@ -454,6 +454,12 @@ class PaymentCoordinatorService:
             # Use payment amount, not zap request amount (zap request amount is in millisats string)
             amount_msats = payment.amount or 0
             amount_sats = max(amount_msats // 1000, 0)
+            if amount_sats <= 0:
+                logger.info(
+                    f"Ignoring payment-based zap with non-positive amount: {amount_msats} msat"
+                )
+                self.last_error = "invalid_amount"
+                return False
             
             try:
                 payment_hash = getattr(payment, 'payment_hash', None) or getattr(payment, 'checking_id', None)
@@ -501,15 +507,22 @@ class PaymentCoordinatorService:
                         logger.debug(f"Could not verify note author: {e}")
                         # Continue optimistically if verification fails
                 else:
-                    logger.debug(
-                        f"No author information for note {target_note_id[:8]}... - "
-                        f"allowing zap for existing member {zapper_pubkey[:8]}..."
+                    logger.info(
+                        f"Zap target {target_note_id[:8]}... has no author metadata; "
+                        f"cannot verify Lightning Goats ownership for existing member "
+                        f"{zapper_pubkey[:8]}... - rejecting"
                     )
+                    self.last_error = "missing_note_author"
+                    return False
             else:
                 # New member: enforce strict tracking requirements
                 # Simple rule: If the zapped note is in tracked_event_ids, it's valid
                 # tracked_event_ids only contains notes from TODAY with the required tags
-                tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
+                tracked_notes = {
+                    note_id.strip().lower()
+                    for note_id in (getattr(settings, 'tracked_event_ids', []) or [])
+                    if isinstance(note_id, str) and note_id.strip()
+                }
                 
                 # Check if target note is in tracked events
                 is_tracked = target_note_id in tracked_notes
@@ -544,7 +557,11 @@ class PaymentCoordinatorService:
                             )
 
                         if ensured:
-                            tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
+                            tracked_notes = {
+                                note_id.strip().lower()
+                                for note_id in (getattr(settings, 'tracked_event_ids', []) or [])
+                                if isinstance(note_id, str) and note_id.strip()
+                            }
                             is_tracked = target_note_id in tracked_notes
                             if is_tracked:
                                 logger.info(
@@ -629,6 +646,19 @@ class PaymentCoordinatorService:
                     f"Headbutt processing returned no result for payment zap: "
                     f"{amount_sats} sats from {zapper_pubkey[:8]}..."
                 )
+                if event_id:
+                    try:
+                        await crud.delete_processed_event(
+                            cast(str, self.user_id),
+                            event_id,
+                            note_id=target_note_id,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to release processed marker for failed zap %s: %s",
+                            event_id[:16],
+                            exc,
+                        )
                 return False
             
         except Exception as e:

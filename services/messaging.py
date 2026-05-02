@@ -50,7 +50,13 @@ if TYPE_CHECKING:  # pragma: no cover - optional import for typing only
         MessageBundle = Any  # type: ignore
 
 
-_MEMBERSHIP_EVENTS = {"cyber_herd", "new_member"}
+_MEMBERSHIP_EVENTS = {
+    "cyber_herd",
+    "new_member",
+    "member_increase",
+    "kind_6_repost",
+    "kind_7_reaction",
+}
 
 
 def _coerce_int(value: Any, default: int = 0) -> int:
@@ -74,7 +80,7 @@ def _format_spots_suffix(spots_remaining: int) -> str:
     if spots_remaining > 1:
         return f"\n\n⚡ {spots_remaining} more spots available. ⚡"
     if spots_remaining == 1:
-        return "⚡ 1 more spot available. ⚡"
+        return "\n\n⚡ 1 more spot available. ⚡"
     return ""
 
 
@@ -150,6 +156,50 @@ def _build_websocket_members(event_type: str, values: dict[str, Any] | None) -> 
         return None
 
     return [member]
+
+
+def _build_websocket_values(event_type: str, values: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return a websocket-safe copy of values for membership events.
+
+    Nostr-facing fields like ``name`` and ``member_name`` may intentionally carry
+    nprofile/npub-style identifiers. Websocket clients should receive the
+    human-readable display name instead.
+    """
+    if not isinstance(values, dict):
+        return values
+
+    websocket_values = dict(values)
+    if event_type not in _MEMBERSHIP_EVENTS:
+        return websocket_values
+
+    ch_item = {}
+    try:
+        if isinstance(websocket_values.get("cyber_herd_item"), dict):
+            ch_item = dict(websocket_values["cyber_herd_item"])
+    except Exception:
+        ch_item = {}
+
+    display_name = (
+        ch_item.get("display_name")
+        or websocket_values.get("member_display_name")
+        or websocket_values.get("display_name")
+        or websocket_values.get("member_name")
+        or websocket_values.get("name")
+    )
+    if not display_name:
+        return websocket_values
+
+    display_name = str(display_name)
+    websocket_values["member_display_name"] = display_name
+    websocket_values["member_name"] = display_name
+    websocket_values["display_name"] = display_name
+    websocket_values["name"] = display_name
+
+    if ch_item:
+        ch_item["display_name"] = display_name
+        websocket_values["cyber_herd_item"] = ch_item
+
+    return websocket_values
 
 
 def _build_membership_context(values: dict[str, Any] | None) -> Optional[dict[str, Any]]:
@@ -1004,7 +1054,8 @@ async def publish_shared_template(
 
             # For membership-style events, also expose a minimal members list so
             # websocket clients can drive displayCyberHerdMembers() directly.
-            members = _build_websocket_members(message_type or category, values_dict)
+            websocket_values = _build_websocket_values(message_type or category, values_dict)
+            members = _build_websocket_members(message_type or category, websocket_values)
             if members:
                 payload["members"] = members
 
@@ -1277,12 +1328,13 @@ async def publish_event_message(
                     websocket_message = content_str
                     if isinstance(payload, dict):
                         websocket_message = str(payload.get("message") or websocket_message)
+                    websocket_values = _build_websocket_values(event_type, values)
                     message_obj = {
                         "type": event_type,  # Use semantic event_type for websocket
                         "message": websocket_message,
                         "e_tags": e_tags or [],
                         "p_tags": p_tags or [],
-                        "values": values,
+                        "values": websocket_values,
                         "reply_to_30311_event": reply_to_30311_event,
                         "reply_to_30311_a_tag": reply_to_30311_a_tag,
                         "reply_relay": reply_relay,
@@ -1293,7 +1345,7 @@ async def publish_event_message(
                                 message_obj[extra_key] = payload[extra_key]
 
                     # Attach members list for membership-style events when possible
-                    members = _build_websocket_members(event_type, values)
+                    members = _build_websocket_members(event_type, websocket_values)
                     if members:
                         message_obj["members"] = members
                     res = await _msg.send_to_websocket_clients(
@@ -1373,12 +1425,13 @@ async def publish_event_message(
                 websocket_message = content_str
                 if isinstance(payload, dict):
                     websocket_message = str(payload.get("message") or websocket_message)
+                websocket_values = _build_websocket_values(event_type, values)
                 message_obj = {
                     "type": event_type,  # Use semantic event_type for websocket
                     "message": websocket_message,
                     "e_tags": e_tags or [],
                     "p_tags": p_tags or [],
-                    "values": values,  # Include values for consistency
+                    "values": websocket_values,  # Include websocket-safe values for consistency
                     "reply_to_30311_event": reply_to_30311_event,
                     "reply_to_30311_a_tag": reply_to_30311_a_tag,
                     "reply_relay": reply_relay,
@@ -1389,7 +1442,7 @@ async def publish_event_message(
                             message_obj[extra_key] = payload[extra_key]
 
                 # Attach members list for membership-style events when possible
-                members = _build_websocket_members(event_type, values)
+                members = _build_websocket_members(event_type, websocket_values)
                 if members:
                     message_obj["members"] = members
                 res = await _msg.send_to_websocket_clients(
