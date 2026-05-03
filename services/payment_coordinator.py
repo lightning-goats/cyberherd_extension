@@ -12,7 +12,6 @@ legacy ZapMonitorService name remains available via alias for compatibility.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 from datetime import datetime, timezone
@@ -289,12 +288,12 @@ class PaymentCoordinatorService:
                     if isinstance(nostr_json, dict):
                         zap_request = nostr_json
                         zap_request_source = "nostr"
-                        logger.debug(f"Parsed zap request from payment.extra['nostr'] (dict)")
+                        logger.debug("Parsed zap request from payment.extra['nostr'] (dict)")
                     else:
                         try:
                             zap_request = json.loads(nostr_json)
                             zap_request_source = "nostr"
-                            logger.debug(f"Parsed zap request from payment.extra['nostr']")
+                            logger.debug("Parsed zap request from payment.extra['nostr']")
                         except Exception as e:
                             logger.warning(f"Failed to parse zap request from nostr field: {e}")
 
@@ -323,7 +322,7 @@ class PaymentCoordinatorService:
                         try:
                             zap_request = json.loads(comment)
                             zap_request_source = "comment"
-                            logger.debug(f"Parsed zap request from payment.extra['comment'] (legacy)")
+                            logger.debug("Parsed zap request from payment.extra['comment'] (legacy)")
                         except json.JSONDecodeError:
                             pass  # Not a JSON comment, ignore
 
@@ -1035,7 +1034,6 @@ class PaymentCoordinatorService:
         
         Returns a diagnostic dict with counts and any errors encountered.
         """
-        from ..crud import get_settings as _get_settings  # noqa: F401
         try:
             # Resolve herd wallet from provided settings object
             herd_wallet = getattr(settings, 'herd_wallet', None)

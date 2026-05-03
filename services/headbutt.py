@@ -9,7 +9,6 @@ to manage users and trigger headbutt logic when appropriate.
 import asyncio
 import ast
 import json
-import os
 import re
 import time
 from datetime import datetime, timezone
@@ -25,7 +24,7 @@ from loguru import logger
 from .. import crud
 from . import nostr_helpers
 from .note_metadata import refresh_tracked_event_addresses
-from ..utils.common import parse_int_env, utc_now, extract_t_tags_from_event
+from ..utils.common import parse_int_env, extract_t_tags_from_event
 from bech32 import bech32_decode, convertbits
 
 try:
@@ -666,11 +665,6 @@ class EnhancedHeadbuttService:
 
             # Get day boundaries using UTC-first approach (consistent with subscriptions.py)
             boundaries = get_day_boundaries_utc()
-            # Use UTC date for cache key (consistent with rest of codebase)
-            day_key = boundaries.utc_day_str
-            # Use neutral cache key shape consistent with views_api/subscriptions
-            cache_key = (day_key, None, eff_pub, tuple(sorted(tags)))
-
             # Cache check removed - relying on direct query or settings
 
 
@@ -832,7 +826,6 @@ class EnhancedHeadbuttService:
 
             # Check if pubkey is banned
             try:
-                from .. import crud
                 if await crud.is_pubkey_banned(attacker.pubkey, self.user_id):
                     logger.info(
                         f"AdmissionGuard: rejecting action from banned pubkey "
@@ -1349,7 +1342,6 @@ class EnhancedHeadbuttService:
         # for historical events during recovery as long as they're new (not duplicates).
         try:
             if event_id and self.user_id:
-                from .. import crud
                 try:
                     if await crud.is_event_processed(str(self.user_id), event_id):
                         logger.debug("Skipping publish for event %s because it's already processed", event_id)
@@ -1552,7 +1544,6 @@ class EnhancedHeadbuttService:
                     # Persist processed status so other paths don't republish the same event
                     try:
                         if event_id:
-                            from .. import crud
                             try:
                                 await crud.register_processed_event(
                                     self.user_id,
@@ -2348,7 +2339,6 @@ async def trigger_headbutt_from_zap(
     """
     try:
         # Import here to avoid circular dependencies
-        from .. import crud
         from . import messaging as ch_msg
         
         # Create headbutt service
@@ -2404,7 +2394,6 @@ async def trigger_headbutt_from_repost(
     """
     try:
         # Import here to avoid circular dependencies
-        from .. import crud
         from . import messaging as ch_msg
 
         # Create headbutt service with recovery mode passed through
@@ -2461,7 +2450,6 @@ async def trigger_headbutt_from_reaction(
     """
     try:
         # Import here to avoid circular dependencies
-        from .. import crud
         from . import messaging as ch_msg
 
         # Create headbutt service with recovery mode passed through

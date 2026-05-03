@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -254,6 +255,160 @@ async def test_payment_recovery_scans_when_tracked_ids_empty(monkeypatch):
     assert result["scanned"] == 1
     assert captured["processed"] == 1
     assert captured["settings_override"] is settings
+
+
+@pytest.mark.anyio
+async def test_manual_zap_recovery_runs_when_tracked_ids_empty(monkeypatch):
+    settings = _settings(tracked_event_ids=[])
+    captured = {}
+
+    async def fake_get_settings(user_id):
+        return settings
+
+    async def fake_get_cyberherd_notes_for_settings(settings_arg):
+        captured["settings_arg"] = settings_arg
+        return []
+
+    class FakeZapMonitor:
+        last_zap_at = None
+        last_error = None
+
+        async def diagnose_missed_payment_zaps(self, settings_arg):
+            captured["diag_settings"] = settings_arg
+            return []
+
+        async def _recover_missed_payment_zaps(self, settings_arg):
+            captured["recovery_settings"] = settings_arg
+            return {"scanned": 1, "processed": 1}
+
+    monkeypatch.setattr(views_api.crud, "get_settings", fake_get_settings)
+    monkeypatch.setattr(
+        views_api.crud,
+        "get_cyberherd_notes_for_settings",
+        fake_get_cyberherd_notes_for_settings,
+    )
+    monkeypatch.setattr(
+        views_api,
+        "get_zap_monitor",
+        lambda app=None, db=None, user_id=None: FakeZapMonitor(),
+    )
+
+    request = SimpleNamespace(app=SimpleNamespace())
+    wallet_info = SimpleNamespace(wallet=SimpleNamespace(user="user-id"))
+
+    result = await views_api.api_trigger_zap_recovery(request, wallet_info)
+
+    assert result["tracked_notes_count"] == 0
+    assert result["recovery_method"] == "payment"
+    assert result["recovery_completed"] is True
+    assert captured["settings_arg"] is settings
+    assert captured["diag_settings"] is settings
+    assert captured["recovery_settings"] is settings
+
+
+@pytest.mark.anyio
+async def test_diagnostics_endpoints_reject_anonymous_callers():
+    request = SimpleNamespace(app=SimpleNamespace())
+    auth = {"type": "anonymous", "value": None}
+
+    with pytest.raises(HTTPException) as zap_exc:
+        await views_api.api_get_zap_monitor_status(request, auth=auth)
+    assert zap_exc.value.status_code == 401
+
+    with pytest.raises(HTTPException) as diag_exc:
+        await views_api.api_get_nostr_diagnostics(request, auth=auth)
+    assert diag_exc.value.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_existing_websocket_monitor_gets_late_app_context(monkeypatch):
+    nostr_websocket_monitor._active_monitors.clear()
+    nostr_websocket_monitor._app_instance = None
+    app = SimpleNamespace()
+    monitor = nostr_websocket_monitor.NostrWebSocketMonitor("user-id", app=None)
+    nostr_websocket_monitor._active_monitors["user-id"] = monitor
+
+    async def fake_start(self):
+        self.started = True
+
+    monkeypatch.setattr(
+        nostr_websocket_monitor.NostrWebSocketMonitor,
+        "start",
+        fake_start,
+    )
+
+    returned = await nostr_websocket_monitor.start_monitor_for_user("user-id", app=app)
+
+    assert returned is monitor
+    assert monitor.app is app
+    assert nostr_websocket_monitor._app_instance is app
+    assert monitor.started is True
+    nostr_websocket_monitor._active_monitors.clear()
+
+
+@pytest.mark.anyio
+async def test_websocket_monitor_start_requires_app_context(monkeypatch):
+    nostr_websocket_monitor._active_monitors.clear()
+    nostr_websocket_monitor._app_instance = None
+
+    with pytest.raises(RuntimeError):
+        await nostr_websocket_monitor.start_monitor_for_user("user-id")
+
+
+def test_process_zap_receipt_route_is_registered():
+    paths = {
+        getattr(route, "path", None)
+        for route in views_api.cyberherd_api_router.routes
+    }
+
+    assert "/api/v1/process_zap_receipt" in paths
+
+
+@pytest.mark.anyio
+async def test_process_zap_receipt_does_not_use_zapper_as_target_author(monkeypatch):
+    captured = {}
+
+    class FakeRequest:
+        app = SimpleNamespace()
+
+        async def json(self):
+            return {
+                "zap_receipt_id": "a" * 64,
+                "zapper_pubkey": "b" * 64,
+                "amount_sats": 21,
+                "zapped_event_id": "c" * 64,
+            }
+
+    class FakeZapMonitor:
+        async def _process_payment_for_zap(self, payment, settings_override=None):
+            captured["nostr"] = json.loads(payment.extra["nostr"])
+            captured["settings_override"] = settings_override
+            return True
+
+    monkeypatch.setattr(
+        views_api,
+        "get_zap_monitor",
+        lambda app=None, db=None, user_id=None: FakeZapMonitor(),
+    )
+
+    async def fake_get_settings(user_id):
+        return _settings(herd_wallet="herd-wallet-id")
+
+    monkeypatch.setattr(
+        views_api.crud,
+        "get_settings",
+        fake_get_settings,
+    )
+
+    wallet_info = SimpleNamespace(wallet=SimpleNamespace(user="user-id"))
+
+    response = await views_api.api_process_zap_receipt(FakeRequest(), wallet_info)
+
+    assert response.status_code == 200
+    assert ["e", "c" * 64] in captured["nostr"]["tags"]
+    assert ["p", "b" * 64] not in captured["nostr"]["tags"]
+    assert captured["nostr"]["pubkey"] == "b" * 64
+    assert captured["settings_override"].herd_wallet == "herd-wallet-id"
 
 
 @pytest.mark.anyio

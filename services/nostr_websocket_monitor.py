@@ -26,8 +26,6 @@ from .subscriptions import (
     process_note_for_tracked_tags,
     process_reaction_for_tracked_notes,
     process_repost_for_tracked_notes,
-    # New: process zap receipts (kind 9735)
-    process_zap_receipt_for_tracked_notes,
 )
 
 # Module-level app reference (set when first monitor is created)
@@ -723,17 +721,23 @@ async def start_monitor_for_user(user_id: str, app=None) -> NostrWebSocketMonito
     """
     global _app_instance
     
-    # Store app instance globally if not already set
-    if app and not _app_instance:
+    # Store the latest app instance globally so immediate starts can reuse it.
+    if app:
         _app_instance = app
         logger.debug("Stored app instance for WebSocket monitors")
     
     # Use stored app instance if not provided
     if not app:
         app = _app_instance
+
+    if app is None:
+        raise RuntimeError("WebSocket monitor startup requires app context")
     
     if user_id in _active_monitors:
         monitor = _active_monitors[user_id]
+        if monitor.app is not app:
+            monitor.app = app
+            logger.debug(f"Updated app context for WebSocket monitor user {user_id}")
         await monitor.start()
         return monitor
     

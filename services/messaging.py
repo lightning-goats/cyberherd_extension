@@ -5,10 +5,9 @@ but delegates generic functionality (websocket broadcast and nostr posting)
 to the cyberherd_messaging extension services.
 """
 
-from datetime import datetime, timezone
 import random
 import time
-from typing import Optional, Iterable, Dict, Tuple, List, Any, TYPE_CHECKING
+from typing import Optional, Dict, Tuple, List, Any, TYPE_CHECKING
 
 from loguru import logger
 
@@ -979,9 +978,9 @@ async def publish_shared_template(
             wallet_id=wallet_id,
         )
         if ok:
-            logger.info(f"cyberherd: message published successfully via cyberherd_messaging extension")
+            logger.info("cyberherd: message published successfully via cyberherd_messaging extension")
         else:
-            logger.warning(f"cyberherd: message failed to publish via cyberherd_messaging extension")
+            logger.warning("cyberherd: message failed to publish via cyberherd_messaging extension")
     # If published successfully, mirror to websocket clients for overlays (progress.html)
     broadcasted = False
     if ok or not nostr_enabled:
@@ -1113,7 +1112,7 @@ async def try_publish_note(
 
         ok = False
         if nostr_enabled:
-            logger.info(f"cyberherd: publishing note via cyberherd_messaging extension")
+            logger.info("cyberherd: publishing note via cyberherd_messaging extension")
             logger.debug(f"cyberherd: publishing content='{content[:100]}...' e_tags={e_tags} p_tags={p_tags}")
             ok = await _msg.publish_note(
                 content,
@@ -1125,11 +1124,11 @@ async def try_publish_note(
                 wallet_id=wallet_id,
             )
             if ok:
-                logger.info(f"cyberherd: note published successfully")
+                logger.info("cyberherd: note published successfully")
             else:
-                logger.error(f"cyberherd: note failed to publish - check cyberherd_messaging extension logs for details")
+                logger.error("cyberherd: note failed to publish - check cyberherd_messaging extension logs for details")
         else:
-            logger.info(f"cyberherd: nostr publishing disabled, skipping note publication")
+            logger.info("cyberherd: nostr publishing disabled, skipping note publication")
         # Always mirror to websocket for overlays (even when nostr disabled)
         broadcasted = False
         if mirror_to_websocket:

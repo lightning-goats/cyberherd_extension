@@ -6,7 +6,6 @@ Nostr-based event monitoring for zaps, reposts, and reactions.
 import asyncio
 import os
 import logging
-from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -25,14 +24,8 @@ from . import db as _db
 from .crud import db
 from . import crud
 from .setup import register_services
-from .tasks import cyberherd_tasks, start_invoice_listener
+from .tasks import start_invoice_listener
 from .services.subscriptions import cyberherd_subscription_handler
-from .services.note_metadata import apply_event_address
-from .utils.common import extract_t_tags_from_event, utc_now
-
-# Import zap monitor for initialization
-from .services.payment_coordinator import get_payment_coordinator as get_zap_monitor
-from .models import CyberherdMember
 
 # Define the extension router and include both web UI and API subrouters
 cyberherd_ext: APIRouter = APIRouter(prefix="/cyberherd", tags=["cyberherd"])
@@ -68,12 +61,14 @@ def cyberherd_start():
                 # Wait for app reference to be available (set by init_extension)
                 # This ensures monitors have access to app state for cache updates
                 retries = 0
-                while _APP_REF is None and retries < 30:
+                while _APP_REF is None:
                     await asyncio.sleep(1)
                     retries += 1
-                
-                if _APP_REF is None:
-                    logger.warning("Cyberherd: _APP_REF still None after waiting, starting monitors without app context")
+                    if retries == 30:
+                        logger.warning(
+                            "Cyberherd: _APP_REF still None after waiting, "
+                            "deferring websocket monitors until app context is available"
+                        )
                 
                 # Use the captured global app reference
                 await handle_websocket_monitors(_APP_REF)

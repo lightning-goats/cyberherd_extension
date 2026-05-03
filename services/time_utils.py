@@ -43,13 +43,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import os
 try:
     # Python 3.9+
     from zoneinfo import ZoneInfo
 except Exception:  # pragma: no cover - very old Python
     ZoneInfo = None
-from typing import Optional
 
 
 @dataclass(frozen=True)

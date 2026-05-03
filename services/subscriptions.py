@@ -24,9 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from datetime import datetime, timezone
 from typing import Any, Optional
-import os
 
 from loguru import logger
 
@@ -39,7 +37,7 @@ from .time_utils import (
 
 # Import package-level CRUD helpers (lnbits/extensions/cyberherd/crud.py)
 from .. import crud
-from ..utils.common import parse_bool_env, parse_int_env, parse_float_env, utc_now
+from ..utils.common import utc_now
 from .zap_totals import record_incremental_zap_total, bolt11_decode  # type: ignore
 from .pubkey import resolve_effective_pubkey
 from .headbutt import trigger_headbutt_from_zap
@@ -217,7 +215,6 @@ def get_refresh_event() -> asyncio.Event | None:
     
     Returns the event from the holder dict which is shared across modules.
     """
-    global _refresh_event_holder
     if _refresh_event_holder['event'] is None:
         try:
             _refresh_event_holder['event'] = asyncio.Event()
@@ -1463,7 +1460,7 @@ async def _is_tracked_event(user_id: str, note_event_id: str, settings, app, cac
             
             if events:
                 event = events[0]
-                logger.debug(f"  Found event via nostr_helpers, checking if it would be tracked...")
+                logger.debug("  Found event via nostr_helpers, checking if it would be tracked...")
                 # Check if this event would be tracked
                 if _would_event_be_tracked(event, eff_pub, tags):
                     logger.debug(f"✅ Event {note_event_id[:16]}... WOULD be tracked, adding to cache")

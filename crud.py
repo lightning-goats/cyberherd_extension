@@ -11,7 +11,7 @@ from loguru import logger
 from lnbits.db import Database # type: ignore
 from .models import CyberherdSettings, LegacyCyberherdMember
 from .services.shares import compute_member_share_percentages
-from .utils.common import extract_t_tags_from_event, utc_now, coerce_bool
+from .utils.common import extract_t_tags_from_event, coerce_bool
 
 db = Database("ext_cyberherd")
 # Serialize critical write operations in this module to reduce sqlite locking
@@ -157,15 +157,6 @@ async def _bootstrap_settings_storage():
 
     Safe to run at runtime; guards each DDL so it works on Postgres and SQLite.
     """
-    # Detect if we're on PostgreSQL (has schema support)
-    is_postgres = False
-    try:
-        # Try a PostgreSQL-specific query
-        await db.execute("SELECT 1 FROM information_schema.schemata LIMIT 1")
-        is_postgres = True
-    except Exception:
-        pass
-    
     table_name = "settings"
     index_name = "idx_cyberherd_settings_user"
     

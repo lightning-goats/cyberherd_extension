@@ -618,24 +618,24 @@ async def m032_enable_interaction_tracking(db: Database):
     logger.info("CYBERHERD m032: enabling interaction tracking for existing users")
     try:
         # Enable repost tracking for all users where it's currently disabled (or NULL)
-        result = await db.execute(
+        await db.execute(
             """
             UPDATE cyberherd.settings 
             SET repost_tracking_enabled = 1 
             WHERE repost_tracking_enabled = 0 OR repost_tracking_enabled IS NULL;
             """
         )
-        logger.info(f"CYBERHERD m032: enabled repost_tracking for existing users")
+        logger.info("CYBERHERD m032: enabled repost_tracking for existing users")
         
         # Enable likes tracking for all users where it's currently disabled (or NULL)
-        result = await db.execute(
+        await db.execute(
             """
             UPDATE cyberherd.settings 
             SET likes_tracking_enabled = 1 
             WHERE likes_tracking_enabled = 0 OR likes_tracking_enabled IS NULL;
             """
         )
-        logger.info(f"CYBERHERD m032: enabled likes_tracking for existing users")
+        logger.info("CYBERHERD m032: enabled likes_tracking for existing users")
         
         logger.info("CYBERHERD m032: interaction tracking enabled successfully")
     except Exception as e:
