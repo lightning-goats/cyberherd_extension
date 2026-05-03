@@ -435,15 +435,16 @@ class NostrWebSocketMonitor:
                     "since": int(time.time()) - SUBSCRIPTION_LOOKBACK_SECONDS,
                 }
                 
-                # Add tag filter if user is tracking specific hashtags
+                # Do not add a relay-side #t filter here. Nostr hashtag tag
+                # values are lowercase by convention and relay matching is
+                # exact, while some clients also publish content hashtags
+                # without t-tags. Subscribe to this author's recent notes and
+                # let process_note_for_tracked_tags apply the canonical local
+                # matcher for t-tags and content.
                 if tracked_tags:
-                    # Normalize tags (remove # prefix)
-                    # Note: Tag matching is case-sensitive in Nostr, so preserve case
-                    normalized_tags = [tag.lstrip('#') for tag in tracked_tags]
-                    filter_dict["#t"] = normalized_tags
-                    
+                    normalized_tags = [tag.lstrip("#").lower() for tag in tracked_tags]
                     logger.debug(
-                        f"User {self.user_id}: Adding tag filter for: {normalized_tags}"
+                        f"User {self.user_id}: Tracking tags locally for notes: {normalized_tags}"
                     )
                 
                 # Send REQ message
@@ -462,7 +463,7 @@ class NostrWebSocketMonitor:
                 logger.debug(
                     f"✅ User {self.user_id}: Created notes subscription (kind 1/30311) "
                     f"for pubkey {effective_pubkey[:8]}... "
-                    f"{'with ' + str(len(tracked_tags)) + ' tag filter(s)' if tracked_tags else 'all tags'} "
+                    f"{'with local matching for ' + str(len(tracked_tags)) + ' tag(s)' if tracked_tags else 'all tags'} "
                     f"since now-{SUBSCRIPTION_LOOKBACK_SECONDS}s "
                     f"(sub_id: {sub_id})"
                 )
@@ -794,4 +795,3 @@ async def clear_monitor_cache_for_user(user_id: str):
     monitor = _active_monitors.get(user_id)
     if monitor:
         monitor.clear_processed_cache()
-

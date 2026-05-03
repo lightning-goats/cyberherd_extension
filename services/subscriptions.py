@@ -610,10 +610,17 @@ async def force_requery_for_user(app, user_id: str) -> list[str]:
         elif not effective_pubkey:
             logger.warning(f"No effective pubkey for user {user_id}, cannot recover notes")
         else:
-            # Normalize tags for Nostr query (remove # prefix)
-            # Nostr "#t" filter expects tag values without the # prefix
-            # Note: Tag matching is case-sensitive in Nostr, so preserve case
-            query_tags = [t.lstrip('#') for t in tracked_tags if t]
+            # Normalize tags for Nostr queries. NIP-24 hashtag t-tags are
+            # lowercase, and relay #t matching is exact. We also query by
+            # author only below so notes with content hashtags but no t-tag
+            # still reach the local matcher.
+            query_tags = []
+            seen_query_tags = set()
+            for tag in tracked_tags:
+                normalized = str(tag).lstrip("#").lower()
+                if normalized and normalized not in seen_query_tags:
+                    query_tags.append(normalized)
+                    seen_query_tags.add(normalized)
             
             # Query notes (kind 1 and 30311) matching tracked tags from midnight
             # IMPORTANT: Must filter by author (effective_pubkey) to only get user's own notes
@@ -622,17 +629,41 @@ async def force_requery_for_user(app, user_id: str) -> list[str]:
                 f"with tags: {tracked_tags} (normalized to {query_tags})"
             )
             
-            filters = {
+            tag_filter = {
                 "kinds": [1, 30311],
                 "authors": [effective_pubkey],  # Only notes from this user
                 "#t": query_tags,
                 "since": since_ts,
                 "limit": 500
             }
+            author_filter = {
+                "kinds": [1, 30311],
+                "authors": [effective_pubkey],  # Only notes from this user
+                "since": since_ts,
+                "limit": 500
+            }
             
             try:
-                notes = await nostr_helpers.query_events(filters, limit=500, timeout=10.0)
-                _record_helper_query(True)
+                notes = []
+                seen_note_ids = set()
+                for filters in (tag_filter, author_filter):
+                    try:
+                        fetched = await nostr_helpers.query_events(
+                            filters, limit=500, timeout=10.0
+                        )
+                        _record_helper_query(True)
+                    except Exception as e:
+                        logger.error(f"Failed to query notes for recovery: {e}")
+                        _record_helper_query(False, str(e))
+                        continue
+
+                    for note in fetched or []:
+                        note_id = note.get("id") if isinstance(note, dict) else None
+                        if note_id and note_id in seen_note_ids:
+                            continue
+                        if note_id:
+                            seen_note_ids.add(note_id)
+                        notes.append(note)
                 
                 logger.info(f"Found {len(notes)} notes for user {user_id} recovery")
                 
@@ -653,8 +684,7 @@ async def force_requery_for_user(app, user_id: str) -> list[str]:
                         logger.warning(f"Failed to process note {note.get('id')} during recovery: {e}")
                         
             except Exception as e:
-                logger.error(f"Failed to query notes for recovery: {e}")
-                _record_helper_query(False, str(e))
+                logger.error(f"Failed to process notes for recovery: {e}")
         
         # Query engagement events (reposts and reactions) for tracked notes
         # Combine existing tracked IDs with newly detected ones to ensure we query for
