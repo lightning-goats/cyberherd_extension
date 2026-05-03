@@ -670,13 +670,13 @@ async def force_requery_for_user(app, user_id: str) -> list[str]:
                 # Process each note
                 for note in notes:
                     try:
-                        await process_note_for_tracked_tags(
+                        tracked = await process_note_for_tracked_tags(
                             user_id=user_id,
                             event=note,
                             app=app
                         )
                         note_id = note.get("id")
-                        if note_id:
+                        if tracked and note_id:
                             processed_ids.append(note_id)
                             # Add to local set of currently tracked IDs for immediate use
                             newly_detected_ids.add(note_id)
@@ -1017,6 +1017,7 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                 logger.debug(
                     f"⚠️ Event {eid[:16]}... was not added to tracked_event_ids (filtered out) user_id={user_id}"
                 )
+            return result
 
         # kind 6: reposts
         elif kind == 6 and getattr(settings, "repost_tracking_enabled", False):
@@ -1583,7 +1584,7 @@ async def process_note_for_tracked_tags(user_id: str, event: dict, app=None):
         settings = await crud.get_settings(user_id)
         if not settings:
             logger.warning(f"No settings found for user {user_id}, cannot process note")
-            return
+            return False
         
         # Track notes even if no tracked_tags are configured.
         # When tags are empty, any note authored by the effective pubkey today
@@ -1597,7 +1598,7 @@ async def process_note_for_tracked_tags(user_id: str, event: dict, app=None):
                 f"No effective pubkey available for user {user_id}. "
                 f"Cannot track notes. Check nostr_pubkey_override or nsecbunker settings."
             )
-            return
+            return False
         
         logger.info(
             f"Processing note for user {user_id}: "
@@ -1612,10 +1613,11 @@ async def process_note_for_tracked_tags(user_id: str, event: dict, app=None):
         # 1. Check if note matches tracked tags (or any author note if tags empty)
         # 2. Add to tracked_event_ids via _append_today
         # 3. Trigger immediate subscription refresh (for engagement tracking)
-        await process_event_for_user(user_id, event, settings, app, recovery_mode=False)
+        return await process_event_for_user(user_id, event, settings, app, recovery_mode=False)
         
     except Exception as e:
         logger.error(f"Error processing note for user {user_id}: {e}")
+        return False
 
 
 async def process_repost_for_tracked_notes(user_id: str, event: dict, app=None):

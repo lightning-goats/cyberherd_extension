@@ -4,6 +4,7 @@ import pytest
 from fastapi import HTTPException
 
 import lnbits.extensions.cyberherd.views_api as views_api
+from lnbits.extensions.cyberherd.services import payment_coordinator
 from lnbits.extensions.cyberherd.services import nostr_websocket_monitor
 from lnbits.extensions.cyberherd.services import subscriptions
 
@@ -151,3 +152,69 @@ async def test_recovery_queries_author_fallback_for_content_only_hashtags(monkey
         if filters.get("kinds") == [1, 30311]
     ]
     assert any("#t" not in filters for filters in note_filters)
+
+
+@pytest.mark.anyio
+async def test_process_note_for_tracked_tags_returns_whether_note_was_tracked(
+    monkeypatch,
+):
+    settings = _settings(tracked_event_ids=[])
+    event = {
+        "id": "c" * 64,
+        "kind": 1,
+        "pubkey": "b" * 64,
+        "created_at": 1777788010,
+        "tags": [["t", "other"]],
+        "content": "not a matching note",
+    }
+
+    async def fake_get_settings(user_id):
+        return settings
+
+    async def fake_append_today(user_id, eff_pub, tags, event, app=None):
+        return False
+
+    monkeypatch.setattr(subscriptions.crud, "get_settings", fake_get_settings)
+    monkeypatch.setattr(subscriptions, "get_effective_pubkey", lambda _settings: "b" * 64)
+    monkeypatch.setattr(subscriptions, "_append_today", fake_append_today)
+
+    tracked = await subscriptions.process_note_for_tracked_tags(
+        user_id="user-id",
+        event=event,
+        app=None,
+    )
+
+    assert tracked is False
+
+
+@pytest.mark.anyio
+async def test_payment_recovery_uses_supplied_tracked_settings(monkeypatch):
+    settings = _settings(
+        herd_wallet="herd-wallet-id",
+        tracked_event_ids=["c" * 64],
+        tracked_event_timestamps={},
+    )
+    captured = {}
+
+    async def fake_get_payments(wallet_id, incoming, since, limit):
+        return [SimpleNamespace(wallet_id="herd-wallet-id", extra={"nostr": "{}"})]
+
+    async def fake_process_payment_for_zap(self, payment, settings_override=None):
+        captured["settings_override"] = settings_override
+        return False
+
+    monkeypatch.setattr(
+        "lnbits.core.services.payments.get_payments",
+        fake_get_payments,
+    )
+    monkeypatch.setattr(
+        payment_coordinator.PaymentCoordinatorService,
+        "_process_payment_for_zap",
+        fake_process_payment_for_zap,
+    )
+
+    monitor = payment_coordinator.PaymentCoordinatorService(user_id="user-id")
+
+    await monitor._recover_missed_payment_zaps(settings)
+
+    assert captured["settings_override"] is settings

@@ -237,7 +237,7 @@ class PaymentCoordinatorService:
             
         self._running = False
     
-    async def _process_payment_for_zap(self, payment):
+    async def _process_payment_for_zap(self, payment, settings_override=None):
         """Process a payment notification to detect LNURLp zaps.
         
         This method parses payment.extra["nostr"] for NIP-57 zap requests
@@ -253,7 +253,7 @@ class PaymentCoordinatorService:
         """
         try:
             # Disabled in live flow; keep as no-op fast exit
-            settings = await crud.get_settings(self.user_id)
+            settings = settings_override or await crud.get_settings(self.user_id)
             if not settings:
                 return False
             herd_wallet_id = getattr(settings, 'herd_wallet', None)
@@ -1050,7 +1050,10 @@ class PaymentCoordinatorService:
                     # Note: Recovery now enforces current day validation - zaps are only
                     # processed for today's tracked notes
                     processed += 1
-                    res = await self._process_payment_for_zap(payment)
+                    res = await self._process_payment_for_zap(
+                        payment,
+                        settings_override=settings,
+                    )
                     # Treat truthy result as success (some code paths may return True)
                     if res:
                         successful += 1
