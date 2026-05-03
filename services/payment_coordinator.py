@@ -384,6 +384,8 @@ class PaymentCoordinatorService:
             target_note_id_raw: Optional[str] = None
             target_author_raw: Optional[str] = None
             address_candidates: list[str] = []
+            relay_hints: list[str] = []
+            seen_relay_hints: set[str] = set()
 
             tags = zap_request.get("tags", [])
             for tag in tags:
@@ -397,6 +399,14 @@ class PaymentCoordinatorService:
                     target_author_raw = value
                 elif marker == "a" and isinstance(value, str) and value:
                     address_candidates.append(value)
+                elif marker == "relays":
+                    for relay in tag[1:]:
+                        if not isinstance(relay, str):
+                            continue
+                        relay = relay.strip()
+                        if relay and relay not in seen_relay_hints:
+                            seen_relay_hints.add(relay)
+                            relay_hints.append(relay)
 
             # Fallbacks for non-standard fields
             if not target_note_id_raw:
@@ -407,6 +417,16 @@ class PaymentCoordinatorService:
             extra_address = zap_request.get("a")
             if isinstance(extra_address, str) and extra_address:
                 address_candidates.append(extra_address)
+
+            extra_relays = zap_request.get("relays")
+            if isinstance(extra_relays, list):
+                for relay in extra_relays:
+                    if not isinstance(relay, str):
+                        continue
+                    relay = relay.strip()
+                    if relay and relay not in seen_relay_hints:
+                        seen_relay_hints.add(relay)
+                        relay_hints.append(relay)
 
             if not target_note_id_raw and address_candidates:
                 resolved_id, resolved_author = await self._resolve_note_from_addresses(settings, address_candidates)
@@ -547,6 +567,7 @@ class PaymentCoordinatorService:
                                 settings=settings,
                                 note_id=target_note_id,
                                 author_hint=author_hint_for_tracking,
+                                relay_hints=relay_hints,
                             )
                         except Exception as exc:
                             ensured = False
@@ -565,9 +586,8 @@ class PaymentCoordinatorService:
                             is_tracked = target_note_id in tracked_notes
                             if is_tracked:
                                 logger.info(
-                                    "Auto-tracked note %s after zap from %s",
-                                    target_note_id[:8],
-                                    zapper_pubkey[:8],
+                                    f"Auto-tracked note {target_note_id[:8]}... "
+                                    f"after zap from {zapper_pubkey[:8]}..."
                                 )
                     else:
                         logger.debug(
@@ -733,6 +753,7 @@ class PaymentCoordinatorService:
         note_id: str,
         created_at: int | None = None,
         author_hint: str | None = None,
+        relay_hints: list[str] | None = None,
     ) -> bool:
         """Best-effort helper to persist zap target note IDs into tracked_event_ids.
 
@@ -765,13 +786,17 @@ class PaymentCoordinatorService:
                     # If effective pubkey resolution fails, continue optimistically
                     pass
 
-            tagged_event = await self._fetch_tagged_note(settings, note_id, author_hint)
+            tagged_event = await self._fetch_tagged_note(
+                settings,
+                note_id,
+                author_hint,
+                relay_hints=relay_hints,
+            )
             if not tagged_event:
-                logger.debug(
-                    "Zap monitor: refusing to auto-track note %s for user %s because it "
-                    "does not contain required tracked tags",
-                    note_id[:8],
-                    self.user_id,
+                logger.info(
+                    f"Zap monitor: refusing to auto-track note {note_id[:8]}... "
+                    f"for user {self.user_id} because it was not found or did not "
+                    f"match tracked tags (relay_hints={len(relay_hints or [])})"
                 )
                 return False
 
@@ -833,6 +858,7 @@ class PaymentCoordinatorService:
         settings,
         note_id: str,
         author_hint: str | None = None,
+        relay_hints: list[str] | None = None,
     ) -> dict | None:
         """Fetch a note by ID and verify it matches CyberHerd tracking rules."""
         if not note_id:
@@ -846,7 +872,13 @@ class PaymentCoordinatorService:
                 {"ids": [note_id]},
                 limit=1,
                 timeout=5.0,
+                extra_relays=relay_hints or None,
             )
+            if not events:
+                logger.info(
+                    f"Zap monitor: target note {note_id[:8]}... was not found "
+                    f"while checking tracked tags (relay_hints={len(relay_hints or [])})"
+                )
             for event in events or []:
                 if not isinstance(event, dict):
                     continue
@@ -868,6 +900,10 @@ class PaymentCoordinatorService:
                 tracked_tags = getattr(settings, "tracked_tags", []) or []
                 if _would_event_be_tracked(event, eff_pub, tracked_tags):
                     return event
+                logger.info(
+                    f"Zap monitor: target note {note_id[:8]}... was found but "
+                    "does not match today's tracked tag rules"
+                )
         except Exception as exc:
             logger.debug(
                 "Zap monitor: failed to fetch/verify tagged note %s for user %s: %s",

@@ -273,8 +273,9 @@ async def test_fetch_tagged_note_returns_event_matching_tracked_tag(monkeypatch)
         "content": "hello #CyberHerd",
     }
 
-    async def fake_query_events(filters, limit=1, timeout=5.0):
+    async def fake_query_events(filters, limit=1, timeout=5.0, extra_relays=None):
         assert filters == {"ids": [note_id]}
+        assert extra_relays is None
         return [event]
 
     monkeypatch.setattr(
@@ -296,3 +297,83 @@ async def test_fetch_tagged_note_returns_event_matching_tracked_tag(monkeypatch)
     )
 
     assert fetched is event
+
+
+@pytest.mark.anyio
+async def test_payment_zap_uses_relay_hints_for_opportunistic_tracking(monkeypatch):
+    settings = _settings(
+        herd_wallet="herd-wallet-id",
+        tracked_event_ids=[],
+        tracked_event_timestamps={},
+        nostr_pubkey_override="b" * 64,
+        minimum_sats=10,
+    )
+    captured = {}
+    note_id = "c" * 64
+    zap_request = {
+        "pubkey": "d" * 64,
+        "tags": [
+            ["e", note_id],
+            ["p", "b" * 64],
+            ["relays", "wss://relay.example", "wss://relay2.example"],
+        ],
+    }
+    payment = SimpleNamespace(
+        wallet_id="herd-wallet-id",
+        amount=33_000,
+        extra={"nostr": zap_request},
+        payment_hash="e" * 64,
+        checking_id="e" * 64,
+    )
+
+    async def fake_get_settings(user_id):
+        return settings
+
+    async def fake_get_member(pubkey, user_id=None):
+        return None
+
+    async def fake_ensure_note_tracked(
+        self,
+        settings,
+        note_id,
+        created_at=None,
+        author_hint=None,
+        relay_hints=None,
+    ):
+        captured["relay_hints"] = relay_hints
+        captured["author_hint"] = author_hint
+        settings.tracked_event_ids = [note_id]
+        return True
+
+    async def fake_register_processed_event(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(payment_coordinator.crud, "get_settings", fake_get_settings)
+    monkeypatch.setattr(
+        payment_coordinator.crud,
+        "get_cyberherd_member_by_pubkey",
+        fake_get_member,
+    )
+    monkeypatch.setattr(
+        payment_coordinator.crud,
+        "register_processed_event",
+        fake_register_processed_event,
+    )
+    monkeypatch.setattr(
+        payment_coordinator,
+        "resolve_effective_pubkey",
+        lambda _settings: "b" * 64,
+    )
+    monkeypatch.setattr(
+        payment_coordinator.PaymentCoordinatorService,
+        "_ensure_note_tracked",
+        fake_ensure_note_tracked,
+    )
+
+    monitor = payment_coordinator.PaymentCoordinatorService(user_id="user-id")
+
+    ok = await monitor._process_payment_for_zap(payment, settings_override=settings)
+
+    assert ok is True
+    assert captured["relay_hints"] == ["wss://relay.example", "wss://relay2.example"]
+    assert captured["author_hint"] == "b" * 64
