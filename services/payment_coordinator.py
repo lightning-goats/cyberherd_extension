@@ -828,8 +828,53 @@ class PaymentCoordinatorService:
             )
             return False
 
-    async def _fetch_tagged_note(self, *args, **kwargs) -> dict | None:
-        """Deprecated: Nostr tag verification handled by subscriptions."""
+    async def _fetch_tagged_note(
+        self,
+        settings,
+        note_id: str,
+        author_hint: str | None = None,
+    ) -> dict | None:
+        """Fetch a note by ID and verify it matches CyberHerd tracking rules."""
+        if not note_id:
+            return None
+
+        try:
+            from . import nostr_helpers
+            from .subscriptions import _would_event_be_tracked
+
+            events = await nostr_helpers.query_events(
+                {"ids": [note_id]},
+                limit=1,
+                timeout=5.0,
+            )
+            for event in events or []:
+                if not isinstance(event, dict):
+                    continue
+                if event.get("id") != note_id:
+                    continue
+
+                try:
+                    kind = int(event.get("kind") or 0)
+                except Exception:
+                    kind = 0
+                if kind not in (1, 30311):
+                    continue
+
+                event_pubkey = str(event.get("pubkey") or "").strip().lower()
+                if author_hint and event_pubkey != author_hint:
+                    continue
+
+                eff_pub = resolve_effective_pubkey(settings)
+                tracked_tags = getattr(settings, "tracked_tags", []) or []
+                if _would_event_be_tracked(event, eff_pub, tracked_tags):
+                    return event
+        except Exception as exc:
+            logger.debug(
+                "Zap monitor: failed to fetch/verify tagged note %s for user %s: %s",
+                note_id[:8],
+                self.user_id,
+                exc,
+            )
         return None
 
     async def _get_today_note_ids(self, *args, **kwargs) -> tuple[bool, list[str]]:
@@ -963,13 +1008,15 @@ class PaymentCoordinatorService:
                 logger.warning(msg)
                 return {"scanned": 0, "processed": 0, "error": msg}
 
-            # CRITICAL: Recovery should only run after tracked_event_ids are populated
-            # This prevents scanning payments before subscriptions have detected today's notes
+            # Continue even when tracked_event_ids is empty. _process_payment_for_zap
+            # can opportunistically fetch and validate the zap target note by ID,
+            # then persist it if it matches the user's tracked tags.
             tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
             if not tracked_notes:
-                msg = "No tracked_event_ids found; recovery deferred until notes are detected"
-                logger.info(msg)
-                return {"scanned": 0, "processed": 0, "error": msg}
+                logger.info(
+                    "No tracked_event_ids found; scanning payments for "
+                    "opportunistic tagged-note recovery"
+                )
 
             # Use LOCAL midnight to match the boundary used for validating tracked_event_ids
             # This prevents timezone mismatches that could cause duplicate processing
