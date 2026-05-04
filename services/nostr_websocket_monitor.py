@@ -419,18 +419,20 @@ class NostrWebSocketMonitor:
             if effective_pubkey:
                 sub_id = self._get_new_subid()
                 
-                # Build filter for user's new notes
-                # We use a short lookback window (real-time) similar to engagement events.
-                # Historical events (from earlier today) are handled by:
-                # 1. force_requery_for_user() called on connection
-                # 2. periodic_event_recovery() called hourly
-                # This avoids issues with "since" filters being too far in the past.
+                # Build filter for user's notes from the current local day.
+                # Nostr clients can publish events whose created_at is behind
+                # the server clock or whose relay delivery is delayed. A short
+                # rolling lookback can make those notes invisible to realtime
+                # subscriptions even though recovery later finds them.
+                from .time_utils import get_day_boundaries_utc
+
+                boundaries = get_day_boundaries_utc(days_ago=0)
+                note_since = int(boundaries.local_since_ts)
                 
                 filter_dict = {
                     "kinds": [1, 30311],  # Regular notes and long-form content
                     "authors": [effective_pubkey],  # Only from this user
-                    # Real-time subscription with short lookback
-                    "since": int(time.time()) - SUBSCRIPTION_LOOKBACK_SECONDS,
+                    "since": note_since,
                 }
                 
                 # Do not add a relay-side #t filter here. Nostr hashtag tag
@@ -462,7 +464,7 @@ class NostrWebSocketMonitor:
                     f"✅ User {self.user_id}: Created notes subscription (kind 1/30311) "
                     f"for pubkey {effective_pubkey[:8]}... "
                     f"{'with local matching for ' + str(len(tracked_tags)) + ' tag(s)' if tracked_tags else 'all tags'} "
-                    f"since now-{SUBSCRIPTION_LOOKBACK_SECONDS}s "
+                    f"since local day start {note_since} "
                     f"(sub_id: {sub_id})"
                 )
             else:

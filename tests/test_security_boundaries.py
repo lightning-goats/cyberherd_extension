@@ -122,6 +122,38 @@ async def test_notes_subscription_uses_author_filter_without_exact_case_t_filter
 
 
 @pytest.mark.anyio
+async def test_notes_subscription_uses_local_day_since_for_realtime_detection(
+    monkeypatch,
+):
+    settings = _settings(tracked_event_ids=[])
+    sent_messages = []
+
+    async def fake_get_settings(user_id):
+        return settings
+
+    async def fake_send(message):
+        sent_messages.append(message)
+
+    monkeypatch.setattr(nostr_websocket_monitor, "get_settings", fake_get_settings)
+    monkeypatch.setattr(subscriptions, "get_effective_pubkey", lambda _settings: "b" * 64)
+
+    monitor = nostr_websocket_monitor.NostrWebSocketMonitor("user-id")
+    monkeypatch.setattr(monitor, "_send", fake_send)
+
+    await monitor._subscribe_to_tracked_notes()
+
+    note_reqs = [
+        msg for msg in sent_messages
+        if msg[0] == "REQ" and msg[2].get("kinds") == [1, 30311]
+    ]
+    assert len(note_reqs) == 1
+    note_filter = note_reqs[0][2]
+    assert note_filter["since"] == int(
+        subscriptions._get_today_boundaries_utc().local_since_ts
+    )
+
+
+@pytest.mark.anyio
 async def test_recovery_queries_author_fallback_for_content_only_hashtags(monkeypatch):
     settings = _settings(tracked_event_ids=[])
     captured_filters = []
@@ -423,7 +455,7 @@ async def test_fetch_tagged_note_returns_event_matching_tracked_tag(monkeypatch)
         "id": note_id,
         "kind": 1,
         "pubkey": "b" * 64,
-        "created_at": 1777788010,
+        "created_at": subscriptions._get_today_boundaries_utc().local_since_ts + 10,
         "tags": [["t", "cyberherd"]],
         "content": "hello #CyberHerd",
     }
