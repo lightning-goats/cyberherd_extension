@@ -154,6 +154,55 @@ async def test_notes_subscription_uses_local_day_since_for_realtime_detection(
 
 
 @pytest.mark.anyio
+async def test_realtime_note_poll_queries_and_processes_today_author_notes(
+    monkeypatch,
+):
+    settings = _settings(tracked_event_ids=[])
+    note_id = "d" * 64
+    event = {
+        "id": note_id,
+        "kind": 1,
+        "pubkey": "b" * 64,
+        "created_at": subscriptions._get_today_boundaries_utc().local_since_ts + 30,
+        "tags": [["t", "cyberherd"]],
+        "content": "hello #CyberHerd",
+    }
+    captured = {"processed": []}
+
+    async def fake_get_settings(user_id):
+        return settings
+
+    async def fake_query_events(filters, limit=100, timeout=6.0):
+        captured["filters"] = filters
+        captured["limit"] = limit
+        return [event]
+
+    async def fake_process_event(received_event):
+        captured["processed"].append(received_event)
+
+    monkeypatch.setattr(nostr_websocket_monitor, "get_settings", fake_get_settings)
+    monkeypatch.setattr(subscriptions, "get_effective_pubkey", lambda _settings: "b" * 64)
+    monkeypatch.setattr(
+        "lnbits.extensions.cyberherd.services.nostr_helpers.query_events",
+        fake_query_events,
+    )
+
+    monitor = nostr_websocket_monitor.NostrWebSocketMonitor("user-id")
+    monkeypatch.setattr(monitor, "_process_event", fake_process_event)
+
+    processed = await monitor._poll_realtime_notes_once()
+
+    assert processed == 1
+    assert captured["processed"] == [event]
+    assert captured["filters"]["kinds"] == [1, 30311]
+    assert captured["filters"]["authors"] == ["b" * 64]
+    assert "#t" not in captured["filters"]
+    assert captured["filters"]["since"] == int(
+        subscriptions._get_today_boundaries_utc().local_since_ts
+    )
+
+
+@pytest.mark.anyio
 async def test_recovery_queries_author_fallback_for_content_only_hashtags(monkeypatch):
     settings = _settings(tracked_event_ids=[])
     captured_filters = []

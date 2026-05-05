@@ -22,6 +22,7 @@ from loguru import logger
 from websockets.legacy.client import connect
 
 from ..crud import get_settings
+from ..utils.common import parse_int_env
 from .subscriptions import (
     process_note_for_tracked_tags,
     process_reaction_for_tracked_notes,
@@ -34,6 +35,9 @@ _app_instance = None
 # Subscription lookback window in seconds for engagement events (kind 6/7)
 # Engagement events use short lookback since we only care about recent interactions
 SUBSCRIPTION_LOOKBACK_SECONDS = 30
+REALTIME_NOTE_POLL_INTERVAL_SECONDS = max(
+    0, parse_int_env("CYBERHERD_REALTIME_NOTE_POLL_INTERVAL_SECONDS", 10)
+)
 
 
 
@@ -81,6 +85,7 @@ class NostrWebSocketMonitor:
         
         # Reconnection task
         self.reconnect_task = None
+        self.realtime_note_poll_task = None
         
         # Event deduplication: Track recently processed event IDs to prevent
         # duplicate processing when lookback window overlaps with real-time events
@@ -136,6 +141,17 @@ class NostrWebSocketMonitor:
             self.subscription_timeout_task = asyncio.create_task(
                 self._handle_subscription_timeouts()
             )
+
+        if (
+            REALTIME_NOTE_POLL_INTERVAL_SECONDS > 0
+            and (
+                not self.realtime_note_poll_task
+                or self.realtime_note_poll_task.done()
+            )
+        ):
+            self.realtime_note_poll_task = asyncio.create_task(
+                self._poll_realtime_notes()
+            )
         
         logger.debug(f"✅ NostrWebSocketMonitor started for user {self.user_id}")
     
@@ -157,6 +173,18 @@ class NostrWebSocketMonitor:
                     f"Error waiting for subscription-timeout task to stop: {e}"
                 )
             self.subscription_timeout_task = None
+
+        if self.realtime_note_poll_task:
+            self.realtime_note_poll_task.cancel()
+            try:
+                await self.realtime_note_poll_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(
+                    f"Error waiting for realtime note poll task to stop: {e}"
+                )
+            self.realtime_note_poll_task = None
 
         if self.reconnect_task:
             self.reconnect_task.cancel()
@@ -310,6 +338,75 @@ class NostrWebSocketMonitor:
             logger.error(
                 f"User {self.user_id}: Error in subscription-timeout monitor: {e}"
             )
+
+    async def _poll_realtime_notes_once(self) -> int:
+        """Query today's author notes through nostr_helpers and process them.
+
+        The WebSocket path depends on nostrclient's router forwarding thread.
+        Recovery proves the relay-manager query path is reliable, so this
+        direct query acts as a near-realtime fallback for tagged notes while
+        still using _process_event for deduplication and persistence.
+        """
+        user_settings = await get_settings(self.user_id)
+        if not user_settings:
+            return 0
+
+        from .subscriptions import get_effective_pubkey
+        from .time_utils import get_day_boundaries_utc
+        from . import nostr_helpers
+
+        effective_pubkey = get_effective_pubkey(user_settings)
+        if not effective_pubkey:
+            return 0
+
+        boundaries = get_day_boundaries_utc(days_ago=0)
+        since_ts = int(boundaries.local_since_ts)
+        filters = {
+            "kinds": [1, 30311],
+            "authors": [effective_pubkey],
+            "since": since_ts,
+            "limit": 200,
+        }
+
+        events = await nostr_helpers.query_events(
+            filters,
+            limit=200,
+            timeout=6.0,
+        )
+        processed = 0
+        for event in events or []:
+            if not isinstance(event, dict):
+                continue
+            try:
+                await self._process_event(event)
+                processed += 1
+            except Exception as exc:
+                event_id = str(event.get("id") or "unknown")
+                logger.warning(
+                    f"User {self.user_id}: realtime note poll failed for "
+                    f"event {event_id[:16]}...: {exc}"
+                )
+        if processed:
+            logger.info(
+                f"User {self.user_id}: realtime note poll processed "
+                f"{processed} author note event(s)"
+            )
+        return processed
+
+    async def _poll_realtime_notes(self):
+        """Near-realtime fallback polling for tagged note detection."""
+        try:
+            while not self._is_shutting_down():
+                try:
+                    await self._poll_realtime_notes_once()
+                except Exception as exc:
+                    logger.warning(
+                        f"User {self.user_id}: realtime note poll failed: {exc}"
+                    )
+                await asyncio.sleep(REALTIME_NOTE_POLL_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            logger.debug(f"User {self.user_id}: Realtime note poll cancelled")
+            raise
     
     async def _subscribe_to_tracked_notes(self):
         """Subscribe to reactions and reposts for all tracked notes.
