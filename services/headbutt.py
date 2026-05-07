@@ -811,9 +811,13 @@ class EnhancedHeadbuttService:
                 return None
 
             # Reject actions from the effective pubkey (operator's own reposts/likes/zaps)
+            settings = None
             try:
                 from ..views_api import _get_effective_pubkey
                 settings = await self.db.get_settings(self.user_id)
+                configured_min = getattr(settings, "minimum_sats", None)
+                if configured_min is not None:
+                    self.headbutt_min_sats = max(0, int(configured_min))
                 eff_pub = _get_effective_pubkey(settings)
                 if eff_pub and attacker.pubkey == eff_pub:
                     logger.info(

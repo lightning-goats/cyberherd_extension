@@ -1,11 +1,17 @@
 import json
+import os
+import time
+from datetime import datetime
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi import HTTPException
 
 import lnbits.extensions.cyberherd.views_api as views_api
+from lnbits.extensions.cyberherd.services import headbutt
 from lnbits.extensions.cyberherd.services import payment_coordinator
+from lnbits.extensions.cyberherd.services import time_utils
 from lnbits.extensions.cyberherd.services import nostr_websocket_monitor
 from lnbits.extensions.cyberherd.services import subscriptions
 
@@ -306,6 +312,109 @@ async def test_zap_receipt_websocket_subscription_remains_disabled(monkeypatch):
         if msg[0] == "REQ"
     ]
     assert [9735] not in req_kinds
+
+
+def test_local_day_boundaries_handle_dst_spring_forward(monkeypatch):
+    original_tz = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "America/Denver")
+    if hasattr(time, "tzset"):
+        time.tzset()
+
+    real_datetime = datetime
+    denver = ZoneInfo("America/Denver")
+
+    class FakeDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = real_datetime(2026, 3, 8, 12, 0, tzinfo=denver)
+            if tz is None:
+                return current
+            return current.astimezone(tz)
+
+    monkeypatch.setattr(time_utils, "datetime", FakeDateTime)
+
+    try:
+        boundaries = time_utils.get_day_boundaries_utc()
+    finally:
+        if original_tz is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", original_tz)
+        if hasattr(time, "tzset"):
+            time.tzset()
+
+    expected_since = int(real_datetime(2026, 3, 8, 0, 0, tzinfo=denver).timestamp())
+    expected_until = int(real_datetime(2026, 3, 9, 0, 0, tzinfo=denver).timestamp())
+
+    assert boundaries.local_since_ts == expected_since
+    assert boundaries.local_until_ts == expected_until
+    assert boundaries.local_until_ts - boundaries.local_since_ts == 23 * 60 * 60
+
+
+@pytest.mark.anyio
+async def test_headbutt_uses_configured_minimum_sats(monkeypatch):
+    note_id = "c" * 64
+    admitted = {"called": False}
+
+    class FakeDb:
+        async def get_settings(self, user_id):
+            return _settings(
+                max_members=3,
+                minimum_sats=50,
+                tracked_event_ids=[note_id],
+            )
+
+        async def get_active_cyberherd_members(self, user_id=None):
+            return []
+
+    async def fake_is_pubkey_banned(pubkey, user_id):
+        return False
+
+    async def fake_get_today_notes(self):
+        return [note_id]
+
+    async def fake_admission(self, attacker):
+        admitted["called"] = True
+        return "new"
+
+    async def fake_failure(self, attacker, victim, required):
+        admitted["required"] = required
+
+    monkeypatch.setattr(headbutt.crud, "is_pubkey_banned", fake_is_pubkey_banned)
+    monkeypatch.setattr(
+        headbutt.EnhancedHeadbuttService,
+        "_get_today_cyberherd_notes",
+        fake_get_today_notes,
+    )
+    monkeypatch.setattr(
+        headbutt.EnhancedHeadbuttService,
+        "_handle_attacker_admission",
+        fake_admission,
+    )
+    monkeypatch.setattr(
+        headbutt.EnhancedHeadbuttService,
+        "_send_headbutt_failure_notification",
+        fake_failure,
+    )
+
+    service = headbutt.EnhancedHeadbuttService(
+        db=FakeDb(),
+        messaging_module=SimpleNamespace(),
+        user_id="user-id",
+    )
+    attacker = headbutt._Attacker(
+        pubkey="d" * 64,
+        amount=25,
+        kinds=[9735],
+        note_id=note_id,
+        event_id="e" * 64,
+    )
+
+    result = await service.attempt_headbutt(attacker)
+
+    assert result is None
+    assert admitted["called"] is False
+    assert admitted["required"] == 50
 
 
 @pytest.mark.anyio
@@ -719,3 +828,83 @@ async def test_payment_zap_uses_relay_hints_for_opportunistic_tracking(monkeypat
     assert ok is True
     assert captured["relay_hints"] == ["wss://relay.example", "wss://relay2.example"]
     assert captured["author_hint"] == "b" * 64
+
+
+@pytest.mark.anyio
+async def test_payment_recovery_rejects_previous_day_tracked_note_for_new_member(
+    monkeypatch,
+):
+    note_id = "c" * 64
+    zapper_pubkey = "d" * 64
+    target_pubkey = "b" * 64
+    boundaries = subscriptions._get_today_boundaries_utc()
+    settings = _settings(
+        herd_wallet="herd-wallet-id",
+        tracked_event_ids=[note_id],
+        tracked_event_timestamps={note_id: boundaries.local_since_ts - 60},
+        nostr_pubkey_override=target_pubkey,
+    )
+    payment = SimpleNamespace(
+        wallet_id="herd-wallet-id",
+        amount=33_000,
+        extra={
+            "nostr": {
+                "pubkey": zapper_pubkey,
+                "tags": [["e", note_id], ["p", target_pubkey]],
+            }
+        },
+        payment_hash="e" * 64,
+        checking_id="e" * 64,
+    )
+    captured = {"headbutts": 0, "registered": 0}
+
+    async def fake_get_payments(wallet_id, incoming, since, limit):
+        assert since == boundaries.local_since_ts - 60
+        return [payment]
+
+    async def fake_get_member(pubkey, user_id=None):
+        return None
+
+    async def fake_register_processed_event(*args, **kwargs):
+        captured["registered"] += 1
+        return True
+
+    async def fake_trigger_headbutt_from_zap(*args, **kwargs):
+        captured["headbutts"] += 1
+        return {"status": "new"}
+
+    monkeypatch.setattr(
+        "lnbits.core.services.payments.get_payments",
+        fake_get_payments,
+    )
+    monkeypatch.setattr(
+        payment_coordinator.crud,
+        "get_cyberherd_member_by_pubkey",
+        fake_get_member,
+    )
+    monkeypatch.setattr(
+        payment_coordinator.crud,
+        "register_processed_event",
+        fake_register_processed_event,
+    )
+    monkeypatch.setattr(
+        payment_coordinator,
+        "trigger_headbutt_from_zap",
+        fake_trigger_headbutt_from_zap,
+    )
+    monkeypatch.setattr(
+        payment_coordinator,
+        "resolve_effective_pubkey",
+        lambda _settings: target_pubkey,
+    )
+
+    monitor = payment_coordinator.PaymentCoordinatorService(user_id="user-id")
+
+    result = await monitor._recover_missed_payment_zaps(settings)
+
+    assert result["scanned"] == 1
+    assert result["processed"] == 1
+    assert result["successful"] == 0
+    assert monitor.last_error == "note_not_current"
+    assert captured["registered"] == 0
+    assert captured["headbutts"] == 0

@@ -239,10 +239,9 @@ class PaymentCoordinatorService:
     async def _process_payment_for_zap(self, payment, settings_override=None):
         """Process a payment notification to detect LNURLp zaps.
         
-        This method parses payment.extra["nostr"] for NIP-57 zap requests
-        and processes them as a FALLBACK when kind 9735 WebSocket monitoring
-        misses zaps. Primary zap detection is via Nostr kind 9735 subscriptions,
-        but this provides recovery for payments that have zap request data.
+        This method parses payment.extra["nostr"] for NIP-57 zap requests.
+        Payment records are the primary zap detection path; kind 9735 Nostr
+        receipt subscriptions are intentionally disabled to avoid races.
         
         IMPORTANT: Only processes zaps for TODAY's tracked notes. This enforces
         the rule that zaps are only valid for the current day's CyberHerd notes.
@@ -543,8 +542,25 @@ class PaymentCoordinatorService:
                     if isinstance(note_id, str) and note_id.strip()
                 }
                 
-                # Check if target note is in tracked events
+                # Check if target note is in tracked events. A stale note ID
+                # left in settings is not enough for new-member admission; it
+                # must still be valid for the current local day.
                 is_tracked = target_note_id in tracked_notes
+                if is_tracked:
+                    is_current = await self._is_current_day_tracked_note(
+                        settings=settings,
+                        note_id=target_note_id,
+                        author_hint=target_author,
+                        relay_hints=relay_hints,
+                    )
+                    if not is_current:
+                        logger.info(
+                            f"❌ Zap target {target_note_id[:8]}... is present in "
+                            "tracked_event_ids but is not valid for today's local window. "
+                            "Ignoring zap."
+                        )
+                        self.last_error = "note_not_current"
+                        return False
                 
                 if not is_tracked:
                     author_hint_for_tracking = target_author
@@ -849,6 +865,55 @@ class PaymentCoordinatorService:
             logger.debug(
                 f"Zap monitor: failed to append note {note_id[:8]}... to tracked_event_ids "
                 f"for user {self.user_id}: {e}"
+            )
+            return False
+
+    async def _is_current_day_tracked_note(
+        self,
+        settings,
+        note_id: str,
+        author_hint: str | None = None,
+        relay_hints: list[str] | None = None,
+    ) -> bool:
+        """Return True only when a tracked note is valid for today's local day."""
+        try:
+            from .time_utils import get_day_boundaries_utc
+
+            boundaries = get_day_boundaries_utc(days_ago=0)
+            timestamps = dict(getattr(settings, "tracked_event_timestamps", {}) or {})
+            raw_ts = timestamps.get(note_id)
+            if raw_ts is None:
+                raw_ts = timestamps.get(str(note_id).strip().lower())
+
+            if raw_ts is not None:
+                try:
+                    note_ts = int(raw_ts)
+                except Exception:
+                    note_ts = 0
+                if note_ts > 0:
+                    if boundaries.is_timestamp_in_local_day(note_ts):
+                        return True
+                    logger.info(
+                        f"Tracked note {note_id[:8]}... has timestamp {note_ts}, "
+                        "outside today's local window; rejecting for new-member zap."
+                    )
+                    return False
+
+            # Legacy/manual tracked IDs may not have timestamps. In that case,
+            # require a relay fetch and reuse the canonical tag + author + local-day
+            # validator before admitting a new member from this note.
+            tagged_event = await self._fetch_tagged_note(
+                settings,
+                note_id,
+                author_hint,
+                relay_hints=relay_hints,
+            )
+            return bool(tagged_event)
+        except Exception as exc:
+            logger.debug(
+                "Failed to validate tracked note %s against today's local window: %s",
+                note_id[:8] if isinstance(note_id, str) else "unknown",
+                exc,
             )
             return False
 
