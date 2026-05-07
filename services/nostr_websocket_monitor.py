@@ -32,9 +32,6 @@ from .subscriptions import (
 # Module-level app reference (set when first monitor is created)
 _app_instance = None
 
-# Subscription lookback window in seconds for engagement events (kind 6/7)
-# Engagement events use short lookback since we only care about recent interactions
-SUBSCRIPTION_LOOKBACK_SECONDS = 30
 REALTIME_NOTE_POLL_INTERVAL_SECONDS = max(
     0, parse_int_env("CYBERHERD_REALTIME_NOTE_POLL_INTERVAL_SECONDS", 10)
 )
@@ -393,19 +390,79 @@ class NostrWebSocketMonitor:
             )
         return processed
 
+    async def _poll_realtime_interactions_once(self) -> int:
+        """Query today's tracked-note reposts/reactions and process them."""
+        user_settings = await get_settings(self.user_id)
+        if not user_settings:
+            return 0
+
+        tracked_note_ids = [
+            note_id
+            for note_id in (user_settings.tracked_event_ids or [])
+            if isinstance(note_id, str) and note_id.strip()
+        ]
+        if not tracked_note_ids:
+            return 0
+
+        engagement_kinds = []
+        if getattr(user_settings, "repost_tracking_enabled", False):
+            engagement_kinds.append(6)
+        if getattr(user_settings, "likes_tracking_enabled", False):
+            engagement_kinds.append(7)
+        if not engagement_kinds:
+            return 0
+
+        from .time_utils import get_day_boundaries_utc
+        from . import nostr_helpers
+
+        boundaries = get_day_boundaries_utc(days_ago=0)
+        since_ts = int(boundaries.local_since_ts)
+        filters = {
+            "kinds": engagement_kinds,
+            "#e": tracked_note_ids,
+            "since": since_ts,
+            "limit": 200,
+        }
+
+        events = await nostr_helpers.query_events(
+            filters,
+            limit=200,
+            timeout=6.0,
+        )
+        processed = 0
+        for event in events or []:
+            if not isinstance(event, dict):
+                continue
+            try:
+                await self._process_event(event)
+                processed += 1
+            except Exception as exc:
+                event_id = str(event.get("id") or "unknown")
+                logger.warning(
+                    f"User {self.user_id}: realtime interaction poll failed for "
+                    f"event {event_id[:16]}...: {exc}"
+                )
+        if processed:
+            logger.info(
+                f"User {self.user_id}: realtime interaction poll processed "
+                f"{processed} tracked-note event(s)"
+            )
+        return processed
+
     async def _poll_realtime_notes(self):
-        """Near-realtime fallback polling for tagged note detection."""
+        """Near-realtime fallback polling for note and interaction detection."""
         try:
             while not self._is_shutting_down():
                 try:
                     await self._poll_realtime_notes_once()
+                    await self._poll_realtime_interactions_once()
                 except Exception as exc:
                     logger.warning(
-                        f"User {self.user_id}: realtime note poll failed: {exc}"
+                        f"User {self.user_id}: realtime poll failed: {exc}"
                     )
                 await asyncio.sleep(REALTIME_NOTE_POLL_INTERVAL_SECONDS)
         except asyncio.CancelledError:
-            logger.debug(f"User {self.user_id}: Realtime note poll cancelled")
+            logger.debug(f"User {self.user_id}: Realtime poll cancelled")
             raise
     
     async def _subscribe_to_tracked_notes(self):
@@ -470,12 +527,18 @@ class NostrWebSocketMonitor:
                 # Only create subscription if at least one engagement type is enabled
                 if engagement_kinds:
                     sub_id = self._get_new_subid()
+                    from .time_utils import get_day_boundaries_utc
+
+                    boundaries = get_day_boundaries_utc(days_ago=0)
+                    engagement_since = int(boundaries.local_since_ts)
                     
                     filter_dict = {
                         "kinds": engagement_kinds,  # Only enabled types
                         "#e": tracked_note_ids,  # Match events referencing ANY tracked note
-                        # Use lookback window to catch events published during connection/subscription setup
-                        "since": int(time.time()) - SUBSCRIPTION_LOOKBACK_SECONDS,
+                        # Match today's recovery window. A short rolling
+                        # lookback misses delayed relay delivery and events
+                        # created earlier in the local day.
+                        "since": engagement_since,
                     }
                     
                     # Send REQ message
@@ -500,7 +563,7 @@ class NostrWebSocketMonitor:
                     logger.debug(
                         f"✅ User {self.user_id}: Created engagement subscription "
                         f"({'/'.join(engagement_types)}) for {len(tracked_note_ids)} tracked note(s) "
-                        f"with {SUBSCRIPTION_LOOKBACK_SECONDS}s lookback window "
+                        f"since local day start {engagement_since} "
                         f"(sub_id: {sub_id})"
                     )
                 else:

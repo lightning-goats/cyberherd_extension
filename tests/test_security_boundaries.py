@@ -203,6 +203,112 @@ async def test_realtime_note_poll_queries_and_processes_today_author_notes(
 
 
 @pytest.mark.anyio
+async def test_engagement_subscription_uses_local_day_since(monkeypatch):
+    note_id = "c" * 64
+    settings = _settings(tracked_event_ids=[note_id])
+    sent_messages = []
+
+    async def fake_get_settings(user_id):
+        return settings
+
+    async def fake_send(message):
+        sent_messages.append(message)
+
+    monkeypatch.setattr(nostr_websocket_monitor, "get_settings", fake_get_settings)
+    monkeypatch.setattr(subscriptions, "get_effective_pubkey", lambda _settings: "b" * 64)
+
+    monitor = nostr_websocket_monitor.NostrWebSocketMonitor("user-id")
+    monkeypatch.setattr(monitor, "_send", fake_send)
+
+    await monitor._subscribe_to_tracked_notes()
+
+    engagement_reqs = [
+        msg for msg in sent_messages
+        if msg[0] == "REQ" and msg[2].get("kinds") == [6, 7]
+    ]
+    assert len(engagement_reqs) == 1
+    engagement_filter = engagement_reqs[0][2]
+    assert engagement_filter["#e"] == [note_id]
+    assert engagement_filter["since"] == int(
+        subscriptions._get_today_boundaries_utc().local_since_ts
+    )
+
+
+@pytest.mark.anyio
+async def test_realtime_interaction_poll_queries_and_processes_tracked_events(
+    monkeypatch,
+):
+    note_id = "c" * 64
+    settings = _settings(tracked_event_ids=[note_id])
+    event = {
+        "id": "e" * 64,
+        "kind": 7,
+        "pubkey": "f" * 64,
+        "created_at": subscriptions._get_today_boundaries_utc().local_since_ts + 45,
+        "tags": [["e", note_id]],
+        "content": "+",
+    }
+    captured = {"processed": []}
+
+    async def fake_get_settings(user_id):
+        return settings
+
+    async def fake_query_events(filters, limit=200, timeout=6.0):
+        captured["filters"] = filters
+        captured["limit"] = limit
+        return [event]
+
+    async def fake_process_event(received_event):
+        captured["processed"].append(received_event)
+
+    monkeypatch.setattr(nostr_websocket_monitor, "get_settings", fake_get_settings)
+    monkeypatch.setattr(
+        "lnbits.extensions.cyberherd.services.nostr_helpers.query_events",
+        fake_query_events,
+    )
+
+    monitor = nostr_websocket_monitor.NostrWebSocketMonitor("user-id")
+    monkeypatch.setattr(monitor, "_process_event", fake_process_event)
+
+    processed = await monitor._poll_realtime_interactions_once()
+
+    assert processed == 1
+    assert captured["processed"] == [event]
+    assert captured["filters"]["kinds"] == [6, 7]
+    assert captured["filters"]["#e"] == [note_id]
+    assert captured["filters"]["since"] == int(
+        subscriptions._get_today_boundaries_utc().local_since_ts
+    )
+
+
+@pytest.mark.anyio
+async def test_zap_receipt_websocket_subscription_remains_disabled(monkeypatch):
+    settings = _settings(tracked_event_ids=["c" * 64], zap_tracking_enabled=True)
+    sent_messages = []
+
+    async def fake_get_settings(user_id):
+        return settings
+
+    async def fake_send(message):
+        sent_messages.append(message)
+
+    monkeypatch.setattr(nostr_websocket_monitor, "get_settings", fake_get_settings)
+    monkeypatch.setattr(subscriptions, "get_effective_pubkey", lambda _settings: "b" * 64)
+
+    monitor = nostr_websocket_monitor.NostrWebSocketMonitor("user-id")
+    monkeypatch.setattr(monitor, "_send", fake_send)
+
+    await monitor._subscribe_to_tracked_notes()
+
+    req_kinds = [
+        msg[2].get("kinds")
+        for msg in sent_messages
+        if msg[0] == "REQ"
+    ]
+    assert [9735] not in req_kinds
+
+
+@pytest.mark.anyio
 async def test_recovery_queries_author_fallback_for_content_only_hashtags(monkeypatch):
     settings = _settings(tracked_event_ids=[])
     captured_filters = []
