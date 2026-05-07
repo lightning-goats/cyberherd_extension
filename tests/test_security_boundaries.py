@@ -352,7 +352,7 @@ def test_local_day_boundaries_handle_dst_spring_forward(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_headbutt_uses_configured_minimum_sats(monkeypatch):
+async def test_open_slot_zap_uses_default_membership_minimum(monkeypatch):
     note_id = "c" * 64
     admitted = {"called": False}
 
@@ -404,7 +404,7 @@ async def test_headbutt_uses_configured_minimum_sats(monkeypatch):
     )
     attacker = headbutt._Attacker(
         pubkey="d" * 64,
-        amount=25,
+        amount=10,
         kinds=[9735],
         note_id=note_id,
         event_id="e" * 64,
@@ -412,9 +412,13 @@ async def test_headbutt_uses_configured_minimum_sats(monkeypatch):
 
     result = await service.attempt_headbutt(attacker)
 
-    assert result is None
-    assert admitted["called"] is False
-    assert admitted["required"] == 50
+    assert result == {
+        "newly_activated": "d" * 64,
+        "reason": "free_spot",
+        "status": "new",
+    }
+    assert admitted["called"] is True
+    assert "required" not in admitted
 
 
 @pytest.mark.anyio
