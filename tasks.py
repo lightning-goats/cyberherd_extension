@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from datetime import datetime, time, timezone
 from typing import Any
 
@@ -279,6 +280,7 @@ async def _restart_kind1_subscriptions_for_user(
 
 
 async def midnight_reset_job(app: Any | None = None):
+    global _APP_REF
     if app is None:
         app = _APP_REF
     """Deactivate all members and reset splits for every tracking-enabled settings row.
@@ -447,6 +449,7 @@ async def schedule_midnight_reset():
     """
     Schedules the midnight reset job to run daily.
     """
+    global _APP_REF
     while True:
         await wait_for_midnight()
         await midnight_reset_job(app=_APP_REF)

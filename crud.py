@@ -11,7 +11,7 @@ from loguru import logger
 from lnbits.db import Database # type: ignore
 from .models import CyberherdSettings, LegacyCyberherdMember
 from .services.shares import compute_member_share_percentages
-from .utils.common import extract_t_tags_from_event, coerce_bool
+from .utils.common import extract_t_tags_from_event, utc_now, coerce_bool
 
 db = Database("ext_cyberherd")
 # Serialize critical write operations in this module to reduce sqlite locking
@@ -157,6 +157,15 @@ async def _bootstrap_settings_storage():
 
     Safe to run at runtime; guards each DDL so it works on Postgres and SQLite.
     """
+    # Detect if we're on PostgreSQL (has schema support)
+    is_postgres = False
+    try:
+        # Try a PostgreSQL-specific query
+        await db.execute("SELECT 1 FROM information_schema.schemata LIMIT 1")
+        is_postgres = True
+    except Exception:
+        pass
+    
     table_name = "settings"
     index_name = "idx_cyberherd_settings_user"
     
@@ -1408,7 +1417,8 @@ async def ensure_inactive_cyberherd_member(
                 :pubkey, :user_id, :display_name, :nprofile, :lud16, :nip05,
                 :picture, :relays, :metadata_last_checked_at, 0
             )
-            ON CONFLICT(user_id, pubkey) DO UPDATE SET
+            ON CONFLICT(pubkey) DO UPDATE SET
+                user_id = excluded.user_id,
                 display_name = COALESCE(excluded.display_name, {table_name}.display_name),
                 nprofile = COALESCE(excluded.nprofile, {table_name}.nprofile),
                 lud16 = COALESCE(excluded.lud16, {table_name}.lud16),
@@ -1421,7 +1431,8 @@ async def ensure_inactive_cyberherd_member(
         insert_sql = f"""
             INSERT INTO {table_name} (pubkey, user_id, is_active)
             VALUES (:pubkey, :user_id, 0)
-            ON CONFLICT(user_id, pubkey) DO NOTHING
+            ON CONFLICT(pubkey) DO UPDATE SET
+                user_id = excluded.user_id
         """
 
     for attempt in range(2):
@@ -1606,7 +1617,8 @@ async def add_new_active_member(member_data: dict, user_id: str | None = None):
                 :pubkey, :user_id, :display_name, :event_id, :note, :kinds, :nprofile, :lud16,
                 :nip05, :payouts, :amount, :picture, :relays, :metadata_last_checked_at, 1
             )
-            ON CONFLICT(user_id, pubkey) DO UPDATE SET
+            ON CONFLICT(pubkey) DO UPDATE SET
+                user_id = excluded.user_id,
                 display_name = excluded.display_name,
                 event_id = excluded.event_id,
                 note = excluded.note,
@@ -2073,8 +2085,8 @@ async def _bootstrap_cyberherd_tables():
 
     stmts = [
         f"""CREATE TABLE IF NOT EXISTS {table_name} (
-            pubkey TEXT NOT NULL,
-            user_id TEXT NOT NULL DEFAULT '',
+            pubkey TEXT PRIMARY KEY,
+            user_id TEXT,
             display_name TEXT,
             event_id TEXT,
             note TEXT,
@@ -2088,9 +2100,7 @@ async def _bootstrap_cyberherd_tables():
             picture TEXT,
             relays TEXT,
             metadata_last_checked_at INTEGER,
-            is_active INTEGER DEFAULT 0,
-            banned INTEGER DEFAULT 0,
-            PRIMARY KEY (user_id, pubkey)
+            is_active INTEGER DEFAULT 0
         );""",
         # Basic helpful indexes
         f"CREATE INDEX IF NOT EXISTS idx_cyberherd_active ON {table_name}(is_active);",
@@ -3013,47 +3023,6 @@ async def register_processed_event(
         pubkey=pubkey,
         event_type=event_type,
     )
-
-
-async def delete_processed_event(
-    user_id: str,
-    event_hash: str,
-    note_id: str | None = None,
-) -> None:
-    """Remove a processed event marker, used when admission fails after claim."""
-    if not user_id or not event_hash:
-        return
-
-    try:
-        if note_id is not None:
-            await db.execute(
-                f"""
-                DELETE FROM {db.references_schema}processed_events
-                WHERE user_id = :user_id
-                  AND event_hash = :event_hash
-                  AND COALESCE(note_id, '') = :note_id
-                """,
-                {
-                    "user_id": user_id,
-                    "event_hash": event_hash,
-                    "note_id": note_id or "",
-                },
-            )
-        else:
-            await db.execute(
-                f"""
-                DELETE FROM {db.references_schema}processed_events
-                WHERE user_id = :user_id AND event_hash = :event_hash
-                """,
-                {"user_id": user_id, "event_hash": event_hash},
-            )
-    except Exception as exc:
-        msg = str(exc).lower()
-        if any(t in msg for t in ("undefinedtable", "does not exist", "no such table")):
-            return
-        logger.warning(
-            f"Failed deleting processed event marker for user {user_id}: {exc}"
-        )
 
 
 async def get_member_by_pubkey(user_id: str, pubkey: str):

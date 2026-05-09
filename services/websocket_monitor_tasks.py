@@ -9,6 +9,7 @@ Follows the nwcprovider pattern for task management.
 """
 
 import asyncio
+from typing import Dict
 
 from loguru import logger
 
@@ -119,7 +120,7 @@ async def handle_websocket_monitors(app):
         raise
 
 
-async def start_monitor_immediately(user_id: str, app=None):
+async def start_monitor_immediately(user_id: str):
     """Start a monitor for a specific user immediately.
     
     This can be called when a user adds their first tracked note,
@@ -130,7 +131,7 @@ async def start_monitor_immediately(user_id: str, app=None):
     """
     try:
         logger.debug(f"▶️  Starting immediate monitor for user {user_id}")
-        await start_monitor_for_user(user_id, app)
+        await start_monitor_for_user(user_id)
     except Exception as e:
         logger.error(f"Failed to start immediate monitor for user {user_id}: {e}")
 

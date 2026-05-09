@@ -9,6 +9,7 @@ to manage users and trigger headbutt logic when appropriate.
 import asyncio
 import ast
 import json
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -24,7 +25,7 @@ from loguru import logger
 from .. import crud
 from . import nostr_helpers
 from .note_metadata import refresh_tracked_event_addresses
-from ..utils.common import parse_int_env, extract_t_tags_from_event
+from ..utils.common import parse_int_env, utc_now, extract_t_tags_from_event
 from bech32 import bech32_decode, convertbits
 
 try:
@@ -665,6 +666,11 @@ class EnhancedHeadbuttService:
 
             # Get day boundaries using UTC-first approach (consistent with subscriptions.py)
             boundaries = get_day_boundaries_utc()
+            # Use UTC date for cache key (consistent with rest of codebase)
+            day_key = boundaries.utc_day_str
+            # Use neutral cache key shape consistent with views_api/subscriptions
+            cache_key = (day_key, None, eff_pub, tuple(sorted(tags)))
+
             # Cache check removed - relying on direct query or settings
 
 
@@ -811,7 +817,6 @@ class EnhancedHeadbuttService:
                 return None
 
             # Reject actions from the effective pubkey (operator's own reposts/likes/zaps)
-            settings = None
             try:
                 from ..views_api import _get_effective_pubkey
                 settings = await self.db.get_settings(self.user_id)
@@ -827,6 +832,7 @@ class EnhancedHeadbuttService:
 
             # Check if pubkey is banned
             try:
+                from .. import crud
                 if await crud.is_pubkey_banned(attacker.pubkey, self.user_id):
                     logger.info(
                         f"AdmissionGuard: rejecting action from banned pubkey "
@@ -1022,7 +1028,6 @@ class EnhancedHeadbuttService:
             attacker_note_id_norm = _normalize_event_id(attacker_note_id_raw)
             attacker_note_id = attacker_note_id_norm or attacker_note_id_raw
 
-            settings_for_tracking = None
             tracked_event_ids_raw: list[str] = []
             try:
                 settings_for_tracking = await self.db.get_settings(self.user_id)
@@ -1174,14 +1179,6 @@ class EnhancedHeadbuttService:
                     f"AdmissionGuard reaction_no_headbutt: Kind 7 (reaction) cannot headbutt when herd is full "
                     f"(pubkey={attacker.pubkey[:8]}...)"
                 )
-                lowest_for_failure = self._get_lowest_member(active_members)
-                required_for_failure = self._required_amount_for_victim(lowest_for_failure)
-                await self._send_headbutt_failure_notification(
-                    attacker,
-                    lowest_for_failure
-                    or {"display_name": "Anon", "amount": 0, "pubkey": ""},
-                    required_for_failure,
-                )
                 return None
         
         if is_repost:
@@ -1192,14 +1189,6 @@ class EnhancedHeadbuttService:
             replaceable = [m for m in active_members if m.get("amount", 0) == 0]
             if not replaceable:
                 logger.info("No amount=0 members (reposts/reactions) to replace — repost headbutt skipped")
-                lowest_for_failure = self._get_lowest_member(active_members)
-                required_for_failure = self._required_amount_for_victim(lowest_for_failure)
-                await self._send_headbutt_failure_notification(
-                    attacker,
-                    lowest_for_failure
-                    or {"display_name": "Anon", "amount": 0, "pubkey": ""},
-                    required_for_failure,
-                )
                 return None
             lowest = self._get_lowest_member(replaceable)
             logger.info(f"Repost (kind 6) can replace any amount=0 member: {len(replaceable)} candidates")
@@ -1225,14 +1214,6 @@ class EnhancedHeadbuttService:
                     reactions_only.append(m)
             if not reactions_only:
                 logger.info("No reactions-only to replace — reaction headbutt skipped")
-                lowest_for_failure = self._get_lowest_member(active_members)
-                required_for_failure = self._required_amount_for_victim(lowest_for_failure)
-                await self._send_headbutt_failure_notification(
-                    attacker,
-                    lowest_for_failure
-                    or {"display_name": "Anon", "amount": 0, "pubkey": ""},
-                    required_for_failure,
-                )
                 return None
             lowest = self._get_lowest_member(reactions_only)
         else:
@@ -1269,10 +1250,7 @@ class EnhancedHeadbuttService:
             lowest_pubkey = lowest.get("pubkey")
         status = await self._handle_successful_headbutt(attacker, lowest)
         if status in ["new", "reactivated"]:
-            await self._send_headbutt_success_notification(
-                attacker,
-                lowest if isinstance(lowest, dict) else {"display_name": "Anon", "amount": 0, "pubkey": ""},
-            )
+            await self._maybe_publish_new_member(attacker, status)
             await self._post_admission_tasks(
                 attacker.pubkey,
                 getattr(attacker, "event_id", None),
@@ -1343,6 +1321,7 @@ class EnhancedHeadbuttService:
         # for historical events during recovery as long as they're new (not duplicates).
         try:
             if event_id and self.user_id:
+                from .. import crud
                 try:
                     if await crud.is_event_processed(str(self.user_id), event_id):
                         logger.debug("Skipping publish for event %s because it's already processed", event_id)
@@ -1545,6 +1524,7 @@ class EnhancedHeadbuttService:
                     # Persist processed status so other paths don't republish the same event
                     try:
                         if event_id:
+                            from .. import crud
                             try:
                                 await crud.register_processed_event(
                                     self.user_id,
@@ -1719,15 +1699,6 @@ class EnhancedHeadbuttService:
             active_members, key=lambda m: (m.get("amount", 0), m.get("pubkey", ""))
         )
 
-    def _required_amount_for_victim(self, victim: dict[str, Any] | None) -> int:
-        required = int(self.headbutt_min_sats)
-        if isinstance(victim, dict):
-            try:
-                required = max(required, int(victim.get("amount", 0) or 0) + 1)
-            except Exception:
-                pass
-        return required
-
     def _in_cooldown(self) -> bool:
         return (time.time() - self._last_bump_ts) < self.COOLDOWN_SECONDS
 
@@ -1819,10 +1790,9 @@ class EnhancedHeadbuttService:
                 if verification_result is True:
                     _metadata_cache_mark_verified(attacker.pubkey, True)
                 elif not cached_verified:
-                    logger.info(
-                        f"AdmissionGuard nip05_required: verification_unconfirmed (pubkey={attacker.pubkey[:16]}..., nip05={nip05_value}, reason={verification_reason})"
+                    logger.warning(
+                        f"AdmissionGuard nip05_unverified: proceeding without confirmation (pubkey={attacker.pubkey[:16]}..., nip05={nip05_value}, reason={verification_reason})"
                     )
-                    return "nip05_required"
                 else:
                     logger.debug(
                         f"AdmissionGuard nip05_cached_ok: using cached verification (pubkey={attacker.pubkey[:16]}..., reason={verification_reason})"
@@ -1988,8 +1958,9 @@ class EnhancedHeadbuttService:
                 except Exception:
                     victim_nprofile = None
             
-            attacker_name = getattr(attacker, "display_name", None) or "Anon"
-            victim_name = victim.get("display_name") or "Anon"
+            # Format names with nprofiles
+            attacker_name = f"nostr:{attacker_nprofile}" if attacker_nprofile else (getattr(attacker, "display_name", None) or "Anon")
+            victim_name = f"nostr:{victim_nprofile}" if victim_nprofile else (victim.get("display_name") or "Anon")
 
             attacker_amount = int(getattr(attacker, "amount", 0) or 0)
             victim_amount = int(victim.get("amount", 0) or 0)
@@ -2066,129 +2037,6 @@ class EnhancedHeadbuttService:
                 logger.warning(f"cyberherd: {template_key} message publish returned False")
         except Exception as e:
             logger.error(f"Error sending headbutt failure notification: {e}")
-
-    async def _send_headbutt_success_notification(
-        self, attacker: Any, victim: dict[str, Any]
-    ):
-        try:
-            existing_attacker = None
-            existing_victim = None
-
-            attacker_nprofile = getattr(attacker, "nprofile", None)
-            if not attacker_nprofile:
-                try:
-                    existing_attacker = await self.db.get_cyberherd_member_by_pubkey(
-                        attacker.pubkey, user_id=self.user_id
-                    )
-                    attacker_nprofile = (
-                        existing_attacker.get("nprofile") if existing_attacker else None
-                    )
-                except Exception:
-                    attacker_nprofile = None
-
-            victim_nprofile = None
-            victim_pubkey = victim.get("pubkey") if isinstance(victim, dict) else None
-            if victim_pubkey:
-                try:
-                    existing_victim = await self.db.get_cyberherd_member_by_pubkey(
-                        victim_pubkey, user_id=self.user_id
-                    )
-                    victim_nprofile = (
-                        existing_victim.get("nprofile") if existing_victim else None
-                    )
-                except Exception:
-                    victim_nprofile = None
-
-            attacker_name = getattr(attacker, "display_name", None) or "Anon"
-            victim_name = (
-                victim.get("display_name")
-                if isinstance(victim, dict)
-                else None
-            ) or "Anon"
-
-            attacker_amount = int(getattr(attacker, "amount", 0) or 0)
-            victim_amount = (
-                int(victim.get("amount", 0) or 0) if isinstance(victim, dict) else 0
-            )
-
-            note_id = getattr(attacker, "note", None) or getattr(attacker, "note_id", None)
-            e_tags = [note_id] if note_id else []
-            p_tags = [
-                p
-                for p in (
-                    getattr(attacker, "pubkey", None),
-                    victim_pubkey,
-                )
-                if p
-            ]
-
-            template_key = self._select_template_key_for_headbutt(
-                "headbutt_success",
-                attacker=attacker,
-                victim=victim,
-                headbutt_result={"victim": victim},
-            )
-
-            values = {
-                "attacker_name": attacker_name,
-                "attacker_amount": attacker_amount,
-                "attacker_pubkey": getattr(attacker, "pubkey", None),
-                "attacker_nprofile": attacker_nprofile,
-                "victim_name": victim_name,
-                "victim_amount": victim_amount,
-                "victim_pubkey": victim_pubkey,
-                "victim_nprofile": victim_nprofile,
-                "name": attacker_name,
-                "event_id": getattr(attacker, "event_id", None),
-                "note_id": note_id,
-            }
-
-            settings = None
-            try:
-                settings = await self.db.get_settings(self.user_id)
-            except Exception:
-                pass
-
-            websocket_topic = await self._get_websocket_topic()
-            reply_event_id, reply_a_tag = await self._resolve_reply_params(
-                note_id, settings=settings
-            )
-
-            from . import messaging as ch_msg
-
-            chosen_relay = None
-            try:
-                relays_source = getattr(attacker, "relays", None)
-                if not relays_source and existing_attacker:
-                    relays_source = existing_attacker.get("relays")
-                if not relays_source and existing_victim:
-                    relays_source = existing_victim.get("relays")
-                if relays_source:
-                    chosen_relay = _pick_first_relay(relays_source)
-            except Exception:
-                chosen_relay = None
-
-            herd_wallet_id = getattr(settings, "herd_wallet", None) if settings else None
-            success = await ch_msg.publish_event_message(
-                template_key,
-                owner_user_id=self.user_id,
-                values=values,
-                e_tags=e_tags,
-                p_tags=p_tags,
-                websocket_topic=websocket_topic,
-                reply_to_30311_event=reply_event_id,
-                reply_to_30311_a_tag=reply_a_tag,
-                reply_relay=chosen_relay,
-                wallet_id=herd_wallet_id,
-            )
-            if success:
-                logger.info(f"cyberherd: {template_key} message published")
-            else:
-                logger.warning(
-                    f"cyberherd: {template_key} message publish returned False"
-                )
-        except Exception as e:
-            logger.error(f"Error sending headbutt success notification: {e}")
 
     async def _handle_repost_admission(self, attacker: Any) -> dict[str, Any] | None:
         """Handle admission for repost events (kind 6) with 1% allocation."""
@@ -2340,6 +2188,7 @@ async def trigger_headbutt_from_zap(
     """
     try:
         # Import here to avoid circular dependencies
+        from .. import crud
         from . import messaging as ch_msg
         
         # Create headbutt service
@@ -2395,6 +2244,7 @@ async def trigger_headbutt_from_repost(
     """
     try:
         # Import here to avoid circular dependencies
+        from .. import crud
         from . import messaging as ch_msg
 
         # Create headbutt service with recovery mode passed through
@@ -2451,6 +2301,7 @@ async def trigger_headbutt_from_reaction(
     """
     try:
         # Import here to avoid circular dependencies
+        from .. import crud
         from . import messaging as ch_msg
 
         # Create headbutt service with recovery mode passed through

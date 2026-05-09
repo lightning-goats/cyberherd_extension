@@ -205,8 +205,11 @@ def compute_member_share_percentages(
         zap_percents = _proportional_percentages(weights, total=remaining_pool)
         for record, pct in zip(zappers, zap_percents):
             shares[record["pubkey"]] = shares.get(record["pubkey"], 0) + pct
-    # If there are no zappers, the remaining pool is intentionally left
-    # unallocated so engagement members stay at exactly 1% each.
+    elif not zappers and remaining_pool > 0 and engagement_members:
+        # No zappers: distribute remaining pool evenly among engagement members
+        extra = _proportional_percentages([1] * num_engagement, total=remaining_pool)
+        for record, pct in zip(engagement_members, extra):
+            shares[record["pubkey"]] = shares.get(record["pubkey"], 0) + pct
 
     return shares
 

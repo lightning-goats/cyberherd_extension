@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import httpx
 

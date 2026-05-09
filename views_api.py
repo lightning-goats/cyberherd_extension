@@ -1,10 +1,11 @@
 from loguru import logger
 
+import re
 import asyncio
 import json
 import time
 from http import HTTPStatus
-from typing import Any
+from typing import Optional, Dict, Any
 
 from fastapi import (
     APIRouter,
@@ -20,7 +21,7 @@ from fastapi.responses import JSONResponse
 
 # Common LNbits helpers used across extensions
 from lnbits.core.models import WalletTypeInfo
-from lnbits.decorators import require_admin_key, api_key_header, require_invoice_key
+from lnbits.decorators import require_admin_key, api_key_header, optional_user_id, require_invoice_key
 import uuid
 from lnbits.decorators import KeyChecker, api_key_query
 from lnbits.core.models import KeyType
@@ -32,6 +33,7 @@ from lnbits.utils.nostr import (
 from lnbits.extensions.cyberherd.utils.tlv import hex_to_nprofile
 from lnbits.extensions.cyberherd.services.pubkey import (
     resolve_effective_pubkey,
+    resolve_and_persist_effective_pubkey,
 )
 from lnbits.extensions.cyberherd.services.nostr_helpers import (
     reconnect_nostrclient_ws,
@@ -73,8 +75,8 @@ _reconnect_nostrclient_ws = reconnect_nostrclient_ws
 
 # No compatibility shims required - import targets exist in helper modules
 from lnbits.core.crud import get_wallet_for_key
-from . import crud
-from .crud import clear_processed_events_for_user, clear_processed_zaps_for_user
+from . import crud, services
+from .crud import clear_processed_zaps_for_user
 from .services.splits import reset_splits_to_predefined_wallet
 from .services.payment_coordinator import (
     get_payment_coordinator as get_zap_monitor,
@@ -316,101 +318,6 @@ async def _resolve_user_from_api_key(request: Request) -> str | None:
         return None
 
 
-async def _resolve_owned_wallet_id(
-    value: str | None,
-    *,
-    field_name: str,
-    owner_user_id: str,
-    required: bool = False,
-) -> str | None:
-    """Resolve a wallet id/key and ensure it belongs to the authenticated user."""
-    if value is None:
-        if required:
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST,
-                detail=f"Missing '{field_name}'",
-            )
-        return None
-
-    candidate = str(value).strip()
-    if not candidate:
-        if required:
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST,
-                detail=f"Missing '{field_name}'",
-            )
-        return None
-
-    wallet = await get_wallet(candidate)
-    if wallet is None:
-        wallet = await get_wallet_for_key(candidate)
-    if wallet is None:
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST,
-            detail=f"Could not resolve {field_name} as a wallet id or key",
-        )
-
-    wallet_user = getattr(wallet, "user", None)
-    if wallet_user != owner_user_id:
-        raise HTTPException(
-            status_code=HTTPStatus.FORBIDDEN,
-            detail=f"{field_name} does not belong to the authenticated user",
-        )
-
-    wallet_id = getattr(wallet, "id", None)
-    if not wallet_id:
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST,
-            detail=f"Resolved {field_name} has no wallet id",
-        )
-    return str(wallet_id)
-
-
-def _build_settings_response(
-    settings,
-    *,
-    effective_pubkey: str | None,
-    websocket_url: str | None = None,
-    include_private: bool = False,
-) -> dict[str, Any]:
-    """Build settings response with private wallet fields gated by auth."""
-    tags = settings.tracked_tags if isinstance(settings.tracked_tags, list) else []
-    response: dict[str, Any] = {
-        "max_members": settings.max_members,
-        "tracked_tags": tags,
-        "effective_nostr_pubkey": effective_pubkey,
-        "effective_nostr_npub": (
-            hex_to_npub(effective_pubkey) if effective_pubkey else None
-        ),
-        "nostrclient_required": True,
-        "nostrclient_available": _nostrclient_available(),
-        "zap_tracking_enabled": getattr(settings, "zap_tracking_enabled", False),
-        "midnight_reset_enabled": getattr(settings, "midnight_reset_enabled", True),
-        "nip05_verification_enabled": getattr(settings, "nip05_verification_enabled", True),
-        "zap_monitor_mode": getattr(settings, "zap_monitor_mode", "websocket"),
-        "repost_tracking_enabled": getattr(settings, "repost_tracking_enabled", False),
-        "likes_tracking_enabled": getattr(settings, "likes_tracking_enabled", False),
-        "minimum_sats": getattr(settings, "minimum_sats", 10),
-        "feeder_trigger_sats": getattr(settings, "feeder_trigger_sats", None),
-        "member_allocation_percent": getattr(settings, "member_allocation_percent", 10),
-        "send_splits_enabled": getattr(settings, "send_splits_enabled", False),
-    }
-
-    if include_private:
-        response.update(
-            {
-                "source_wallet": settings.source_wallet,
-                "zap_wallet": settings.zap_wallet,
-                "zap_wallet_alias": settings.zap_wallet_alias,
-                "herd_wallet": settings.herd_wallet,
-                "tracked_event_ids": getattr(settings, "tracked_event_ids", []),
-                "nostr_pubkey_override": getattr(settings, "nostr_pubkey_override", None),
-                "websocket_url": websocket_url,
-            }
-        )
-    return response
-
-
 async def auth_wallet_or_admin(
     request: Request,
     api_key_header: str | None = Depends(lambda request=Depends(lambda: None): None),
@@ -418,13 +325,15 @@ async def auth_wallet_or_admin(
     """(Legacy) fallback dependency; should not be used directly by FastAPI.
 
     Note: this definition exists to keep older callsites working but the real
-    API-key dependency is the one defined below, which uses FastAPI's
-    Security/Depends to resolve invoice keys. Do not call this function
-    directly.
+    auth wallet-or-admin dependency is the one defined below which uses
+    FastAPI's Security/Depends to correctly resolve API keys and admin
+    sessions. Do not call this function directly.
     """
-    # This function intentionally rejects direct use so callers use the proper
-    # dependency signature (see auth_wallet_or_admin_dep).
-    raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED, detail="authentication required")
+    # This function intentionally raises to ensure callers use the proper
+    # dependency signature (see auth_wallet_or_admin_dep). If somehow invoked
+    # directly, return a permissive admin placeholder (safe default for tests).
+    user = await check_admin(request)  # type: ignore[arg-type]
+    return {"type": "admin", "value": user}
 
 
 async def auth_wallet_or_admin_dep(
@@ -432,7 +341,10 @@ async def auth_wallet_or_admin_dep(
     api_key_header: str | None = Security(api_key_header),
     api_key_query: str | None = Security(api_key_query),
 ):
-    """Dependency that resolves an API-key wallet context or anonymous caller."""
+    """Dependency that allows either a wallet key (invoice/admin) via X-API-KEY
+    or an admin session cookie. Returns a dict with type and the resolved
+    WalletTypeInfo or User.
+    """
     key_value = api_key_header or api_key_query
     if key_value:
         # Use the standard require_invoice_key helper but pass the resolved
@@ -442,19 +354,8 @@ async def auth_wallet_or_admin_dep(
         )
         return {"type": "wallet", "value": wallet_info}
 
-    # No API key -> anonymous caller
+    # No API key and no admin session -> anonymous caller
     return {"type": "anonymous", "value": None}
-
-
-def _require_auth_user_id(auth: dict[str, Any]) -> str:
-    if auth["type"] == "wallet":
-        return auth["value"].wallet.user
-    if auth["type"] == "admin":
-        return auth["value"].id
-    raise HTTPException(
-        status_code=HTTPStatus.UNAUTHORIZED,
-        detail="Missing user context",
-    )
 
 
 
@@ -471,7 +372,7 @@ def _utc_midnight_timestamp(days_offset: int = 0) -> int:
 
 def _nostrclient_available() -> bool:
     try:
-        __import__("lnbits.extensions.nostrclient.router")
+        from lnbits.extensions.nostrclient.router import nostr_client  # noqa: F401
 
         return True
     except Exception:
@@ -518,11 +419,6 @@ async def api_get_source_wallet(
         user_id = auth["value"].wallet.user
     elif auth["type"] == "admin":
         user_id = auth["value"].id
-    else:
-        raise HTTPException(
-            status_code=HTTPStatus.UNAUTHORIZED,
-            detail="wallet key required",
-        )
 
     settings = await crud.get_settings(user_id)
     return {"source_wallet": settings.source_wallet}
@@ -670,10 +566,7 @@ async def api_get_diagnostics(
 
     # Include nostr diagnostics (helpers + subscriptions)
     try:
-        diagnostics["nostr"] = await api_get_nostr_diagnostics(
-            request,
-            auth={"type": "wallet", "value": wallet_info},
-        )
+        diagnostics["nostr"] = await api_get_nostr_diagnostics(request, auth=auth)
     except Exception as e:
         diagnostics["nostr"] = {"error": str(e)}
 
@@ -913,18 +806,8 @@ async def api_pay_members(request: Request, wallet_info: WalletTypeInfo = Depend
     user_id = wallet_info.wallet.user
     settings = await crud.get_settings(user_id)
 
-    herd_wallet = await _resolve_owned_wallet_id(
-        getattr(settings, "herd_wallet", None),
-        field_name="herd_wallet",
-        owner_user_id=user_id,
-        required=True,
-    )
-    target_wallet = await _resolve_owned_wallet_id(
-        getattr(settings, "source_wallet", None),
-        field_name="source_wallet",
-        owner_user_id=user_id,
-        required=True,
-    )
+    herd_wallet = getattr(settings, "herd_wallet", None)
+    target_wallet = getattr(settings, "source_wallet", None)
 
     if not herd_wallet:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="No herd_wallet configured in cyberherd settings")
@@ -987,14 +870,6 @@ async def api_get_settings(request: Request, auth=Depends(auth_wallet_or_admin_d
             user_id = auth["value"].id
 
     settings = await crud.get_settings(user_id)
-    include_private = bool(
-        user_id
-        and (
-            (auth and auth.get("type") in {"wallet", "admin"})
-            or request.headers.get("X-API-KEY")
-            or request.query_params.get("api-key")
-        )
-    )
     
     # DO NOT start zap monitor on every GET request - only start from:
     # 1. Warm start on server startup (__init__.py)
@@ -1011,6 +886,9 @@ async def api_get_settings(request: Request, auth=Depends(auth_wallet_or_admin_d
         )
     except Exception:
         pass
+    # tracked_tags stored as JSON-ish string in DB; ensure it's a list
+    tags = settings.tracked_tags if isinstance(settings.tracked_tags, list) else []
+
     # Compute effective nostr pubkey: override if set, else from nsecbunker
     # Unified resolver (uses cached/override/legacy/derived)
     effective_pubkey = resolve_effective_pubkey(settings)
@@ -1037,12 +915,33 @@ async def api_get_settings(request: Request, auth=Depends(auth_wallet_or_admin_d
     except Exception:
         websocket_url = None
 
-    return _build_settings_response(
-        settings,
-        effective_pubkey=effective_pubkey,
-        websocket_url=websocket_url,
-        include_private=include_private,
-    )
+    return {
+        "source_wallet": settings.source_wallet,
+        "zap_wallet": settings.zap_wallet,
+        "zap_wallet_alias": settings.zap_wallet_alias,
+        "herd_wallet": settings.herd_wallet,
+        "max_members": settings.max_members,
+        "tracked_tags": tags,
+        "tracked_event_ids": getattr(settings, "tracked_event_ids", []),
+        "nostr_pubkey_override": getattr(settings, "nostr_pubkey_override", None),
+        "effective_nostr_pubkey": effective_pubkey,
+        "effective_nostr_npub": (
+            hex_to_npub(effective_pubkey) if effective_pubkey else None
+        ),
+        "nostrclient_required": True,
+        "nostrclient_available": _nostrclient_available(),
+        "zap_tracking_enabled": getattr(settings, "zap_tracking_enabled", False),
+        "midnight_reset_enabled": getattr(settings, "midnight_reset_enabled", True),
+        "nip05_verification_enabled": getattr(settings, "nip05_verification_enabled", True),
+        "zap_monitor_mode": getattr(settings, "zap_monitor_mode", "websocket"),
+        "repost_tracking_enabled": getattr(settings, "repost_tracking_enabled", False),
+        "likes_tracking_enabled": getattr(settings, "likes_tracking_enabled", False),
+        "minimum_sats": getattr(settings, "minimum_sats", 10),
+        "feeder_trigger_sats": getattr(settings, "feeder_trigger_sats", None),
+        "member_allocation_percent": getattr(settings, "member_allocation_percent", 10),
+        "send_splits_enabled": getattr(settings, "send_splits_enabled", False),
+        "websocket_url": websocket_url,
+    }
 
 
 @cyberherd_api_router.get("/api/v1/bunker_status")
@@ -1081,18 +980,14 @@ async def api_set_source_wallet(
             detail="Missing 'source_wallet' in payload",
         )
 
-    user_id = wallet_info.wallet.user
-    wallet_id = await _resolve_owned_wallet_id(
-        source,
-        field_name="source_wallet",
-        owner_user_id=user_id,
-        required=True,
-    )
-    wallet = await get_wallet(wallet_id)
+    # Resolve wallet id either by direct id or by adminkey/inkey
+    wallet = await get_wallet(source)
+    if wallet is None:
+        wallet = await get_wallet_for_key(source)
     if wallet is None:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST,
-            detail="Could not resolve source_wallet",
+            detail="Could not resolve wallet id or key",
         )
 
     # Validate balance: require at least 1 sat (1000 msat) to avoid misconfiguration
@@ -1121,8 +1016,10 @@ async def api_set_source_wallet(
 
     # require authenticated caller
     # Persist per-user settings using authenticated admin wallet
+    user_id = wallet_info.wallet.user
+
     settings = await crud.get_settings(user_id)
-    settings.source_wallet = wallet_id
+    settings.source_wallet = wallet.id
     try:
         await crud.upsert_settings(settings, user_id)
     except Exception as e:
@@ -1133,7 +1030,7 @@ async def api_set_source_wallet(
         except Exception:
             pass
         raise HTTPException(status_code=500, detail="Failed to persist source wallet")
-    return {"source_wallet": wallet_id}
+    return {"source_wallet": wallet.id}
 
 
 @cyberherd_api_router.put("/api/v1/settings")
@@ -1186,6 +1083,7 @@ async def api_put_settings(
     payment_listener_was_required = payment_listener_required(settings)
 
     # Capture previous toggle values to detect new enablement.
+    zap_tracking_was_enabled = bool(getattr(settings, "zap_tracking_enabled", False))
     repost_tracking_was_enabled = bool(getattr(settings, "repost_tracking_enabled", False))
     likes_tracking_was_enabled = bool(getattr(settings, "likes_tracking_enabled", False))
 
@@ -1218,25 +1116,13 @@ async def api_put_settings(
     tracked_event_ids = payload.get("tracked_event_ids")
 
     if source is not None:
-        settings.source_wallet = await _resolve_owned_wallet_id(
-            source,
-            field_name="source_wallet",
-            owner_user_id=user_id,
-        )
+        settings.source_wallet = source
     if zap_wallet is not None:
-        settings.zap_wallet = await _resolve_owned_wallet_id(
-            zap_wallet,
-            field_name="zap_wallet",
-            owner_user_id=user_id,
-        )
+        settings.zap_wallet = zap_wallet
     if zap_wallet_alias is not None:
         settings.zap_wallet_alias = zap_wallet_alias
     if herd_wallet is not None:
-        settings.herd_wallet = await _resolve_owned_wallet_id(
-            herd_wallet,
-            field_name="herd_wallet",
-            owner_user_id=user_id,
-        )
+        settings.herd_wallet = herd_wallet
     if maxm is not None:
         try:
             settings.max_members = int(maxm)
@@ -1417,6 +1303,8 @@ async def api_put_settings(
                     db=crud,
                     user_id=user_id
                 )
+
+                zap_enabled = bool(getattr(settings, "zap_tracking_enabled", False))
 
                 if monitor_requirements_changed:
                     if payment_listener_needed_now:
@@ -1760,10 +1648,7 @@ async def api_get_today_cyberherd_notes(request: Request, auth=Depends(auth_wall
     except Exception as e:
         logger.warning(f"Failed to merge from in-memory cache: {e}")
 
-    logger.debug(
-        f"api_get_today_cyberherd_notes user={user_id} "
-        f"tracked_ids_len={len(tracked_ids)}"
-    )
+    logger.info(f"DEBUG: api_get_today_cyberherd_notes user={user_id} tracked_ids_len={len(tracked_ids)} ids={tracked_ids}")
     
     # Normalize to list of strings
     today_ids = []
@@ -2784,7 +2669,12 @@ async def api_get_shares(request: Request, auth=Depends(auth_wallet_or_admin_dep
 
 @cyberherd_api_router.get("/api/v1/zap_monitor_status")
 async def api_get_zap_monitor_status(request: Request, auth=Depends(auth_wallet_or_admin_dep)):
-    user_id = _require_auth_user_id(auth)
+    # Optional user_id scoping — monitor currently global / singleton
+    user_id = None
+    if auth["type"] == "wallet":
+        user_id = auth["value"].wallet.user
+    elif auth["type"] == "admin":
+        user_id = auth["value"].id
     try:
         zm = get_zap_monitor(app=request.app, db=crud, user_id=user_id)
         st = await zm.status() if zm else {}
@@ -2804,7 +2694,14 @@ async def api_query_zap_events(
     auth=Depends(auth_wallet_or_admin_dep),
 ):
     """Return processed zap receipts for the authenticated user."""
-    user_id = _require_auth_user_id(auth)
+    if auth["type"] == "wallet":
+        user_id = auth["value"].wallet.user
+    elif auth["type"] == "admin":
+        user_id = auth["value"].id
+    else:
+        raise HTTPException(
+            status_code=HTTPStatus.UNAUTHORIZED, detail="Missing user context"
+        )
 
     since_ts = None
     if hours:
@@ -2915,7 +2812,6 @@ async def api_get_nostr_diagnostics(request: Request, auth=Depends(auth_wallet_o
     
     Useful for debugging Nostr connectivity issues and helper failures.
     """
-    _require_auth_user_id(auth)
     try:
         from .services import nostr_helpers
         from .services import subscriptions
@@ -3054,10 +2950,8 @@ async def api_trigger_zap_recovery(request: Request, wallet_info: WalletTypeInfo
             return result
         
         if not tracked_note_ids:
-            result["warning"] = (
-                "No tracked notes found; scanning payments for opportunistic "
-                "tagged-note recovery"
-            )
+            result["warning"] = "No tracked notes found - nothing to monitor for zaps"
+            return result
         
         # Get the zap monitor service
         zm = get_zap_monitor(app=request.app, db=crud, user_id=user_id)
@@ -3145,7 +3039,6 @@ async def api_trigger_zap_recovery(request: Request, wallet_info: WalletTypeInfo
         return {"error": str(e), "traceback": traceback.format_exc()}
 
 
-@cyberherd_api_router.post("/api/v1/process_zap_receipt")
 async def api_process_zap_receipt(request: Request, wallet_info: WalletTypeInfo = Depends(require_admin_key)):
     """Process an individual zap receipt for recovery purposes.
     
@@ -3162,7 +3055,6 @@ async def api_process_zap_receipt(request: Request, wallet_info: WalletTypeInfo 
     zapper_pubkey = data.get("zapper_pubkey") 
     amount_sats = data.get("amount_sats")
     zapped_event_id = data.get("zapped_event_id")
-    target_author_pubkey = data.get("target_author_pubkey")
     
     if not all([zap_receipt_id, zapper_pubkey, amount_sats, zapped_event_id]):
         return JSONResponse({
@@ -3178,51 +3070,29 @@ async def api_process_zap_receipt(request: Request, wallet_info: WalletTypeInfo 
         if not zap_monitor:
             return JSONResponse({"error": "No zap monitor available for user"}, status_code=500)
         
-        settings = await crud.get_settings(user_id)
-        if not settings:
-            return JSONResponse({"error": "No settings found for user"}, status_code=404)
-
         # Create a synthetic payment object with the zap data
         class SyntheticPayment:
-            def __init__(
-                self,
-                zap_receipt_id,
-                zapper_pubkey,
-                amount_sats,
-                zapped_event_id,
-                target_author_pubkey=None,
-            ):
-                tags = [["e", zapped_event_id]]
-                if target_author_pubkey:
-                    tags.append(["p", target_author_pubkey])
-                tags.append(["description", json.dumps({"pubkey": zapper_pubkey})])
+            def __init__(self, zap_receipt_id, zapper_pubkey, amount_sats, zapped_event_id):
                 self.checking_id = zap_receipt_id
-                self.payment_hash = zap_receipt_id
-                self.wallet_id = getattr(settings, "herd_wallet", None)
-                self.amount = int(amount_sats) * 1000
+                self.amount = amount_sats
                 self.extra = {
                     "nostr": json.dumps({
                         "kind": 9735,
-                        "tags": tags,
+                        "tags": [
+                            ["e", zapped_event_id],
+                            ["p", zapper_pubkey],
+                            ["description", json.dumps({"pubkey": zapper_pubkey})]
+                        ],
                         "pubkey": zapper_pubkey
                     })
                 }
                 self.success = True
                 self.status = "success"
         
-        synthetic_payment = SyntheticPayment(
-            zap_receipt_id,
-            zapper_pubkey,
-            amount_sats,
-            zapped_event_id,
-            target_author_pubkey,
-        )
+        synthetic_payment = SyntheticPayment(zap_receipt_id, zapper_pubkey, amount_sats, zapped_event_id)
         
         # Process through the zap monitor
-        result = await zap_monitor._process_payment_for_zap(
-            synthetic_payment,
-            settings_override=settings,
-        )
+        result = await zap_monitor._process_payment_for_zap(synthetic_payment)
         
         if result:
             logger.info(f"Successfully processed zap receipt {zap_receipt_id[:16]}...")
