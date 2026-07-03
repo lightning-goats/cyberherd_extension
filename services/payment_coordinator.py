@@ -690,6 +690,36 @@ class PaymentCoordinatorService:
             if result:
                 # We already registered the payment hash as claimed above; update state
                 self.last_zap_at = int(time.time())
+
+                # The payment path is authoritative for zaps, but historically only
+                # updated cyber_herd.amount. The leaderboard sorts by the zap_totals
+                # table, so update it (and notify watchers) here too — otherwise the
+                # leaderboard stays stale until a manual backfill.
+                try:
+                    target_pubkey = resolve_effective_pubkey(settings)
+                except Exception:
+                    target_pubkey = None
+                if target_pubkey:
+                    try:
+                        try:
+                            event_timestamp = int(zap_request.get("created_at") or 0) or int(time.time())
+                        except Exception:
+                            event_timestamp = int(time.time())
+                        from .zap_totals import record_incremental_zap_total
+                        from .leaderboard import broadcast_leaderboard_update
+
+                        await record_incremental_zap_total(
+                            user_id=cast(str, self.user_id),
+                            zapper_pubkey=zapper_pubkey,
+                            target_pubkey=target_pubkey,
+                            amount_sats=amount_sats,
+                            event_timestamp=event_timestamp,
+                            event_id=event_id or "",
+                        )
+                        await broadcast_leaderboard_update(cast(str, self.user_id), settings=settings)
+                    except Exception:
+                        logger.debug("Failed to update zap totals/broadcast leaderboard", exc_info=True)
+
                 logger.info(
                     f"✅ Payment-based zap processed: {amount_sats} sats from {zapper_pubkey[:8]}... "
                     f"to note {target_note_id[:8]}..."

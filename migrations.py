@@ -13,6 +13,85 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+async def _column_exists(db: Database, schema_table: str, column: str) -> bool:
+    """Return True if ``column`` exists on ``schema_table``.
+
+    Checking existence up front avoids issuing a failing ``ALTER TABLE ... ADD
+    COLUMN`` inside the shared migration transaction. On Postgres a failed
+    statement aborts the whole transaction, which would silently break every
+    subsequent migration; catching the error is not enough because the
+    transaction is already poisoned. Works on Postgres (information_schema) and
+    SQLite (PRAGMA), returning False on any error.
+    """
+    if "." in schema_table:
+        schema, table = schema_table.split(".", 1)
+    else:
+        schema, table = None, schema_table
+
+    # Postgres / Cockroach: information_schema.
+    try:
+        params = {"table": table, "col": column}
+        if schema:
+            query = (
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = :schema AND table_name = :table "
+                "AND column_name = :col LIMIT 1"
+            )
+            params["schema"] = schema
+        else:
+            query = (
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = :table AND column_name = :col LIMIT 1"
+            )
+        row = await db.fetchone(query, params)
+        if row:
+            return True
+    except Exception:
+        # Not Postgres, or information_schema unavailable — fall through.
+        pass
+
+    # SQLite: PRAGMA table_info.
+    try:
+        rows = await db.fetchall(f"PRAGMA table_info({table})")
+        for r in rows:
+            try:
+                name = r.get("name") if hasattr(r, "get") else r["name"]
+            except Exception:
+                name = None
+            if name == column:
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+async def _add_column_if_missing(
+    db: Database, schema_table: str, column: str, column_def: str
+) -> None:
+    """ALTER TABLE to add ``column`` only when it does not already exist.
+
+    ``column_def`` is the SQL type/default fragment (e.g. ``INTEGER DEFAULT 0``).
+    Portable and safe to re-run: on a fresh install where the consolidated m001
+    schema already defines the column, this is a no-op that never issues a
+    failing statement.
+    """
+    try:
+        if await _column_exists(db, schema_table, column):
+            return
+        await db.execute(
+            f"ALTER TABLE {schema_table} ADD COLUMN {column} {column_def};"
+        )
+        logger.info(f"CyberHerd migration: added column {schema_table}.{column}")
+    except Exception as e:
+        # Tolerate a concurrent add / benign duplicate race; anything else is
+        # logged for visibility but not fatal.
+        msg = str(e).lower()
+        if any(t in msg for t in ("duplicate", "already exists")):
+            return
+        logger.warning(f"CyberHerd migration: could not add {schema_table}.{column}: {e}")
+
 # Expose ordered list of migration function names
 __all__ = [
     'm001_consolidated_schema',  # Changed from m000 to m001
@@ -234,6 +313,34 @@ async def m001_consolidated_schema(db: Database):
         """
     )
 
+    # -------------------------------------------------------------------------
+    # Processed Events Table - idempotency for payment/engagement processing.
+    # Previously only created lazily by the runtime bootstrap, which left a
+    # window on fresh installs where dedup checks hit a missing table and
+    # returned "not processed", allowing double-processing. Create it here.
+    # -------------------------------------------------------------------------
+    await db.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {db.references_schema}processed_events (
+            user_id TEXT NOT NULL,
+            event_hash TEXT NOT NULL,
+            note_id TEXT DEFAULT '',
+            pubkey TEXT,
+            processed_at INTEGER NOT NULL,
+            event_type TEXT
+        );
+        """
+    )
+    try:
+        await db.execute(
+            f"""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_events_unique_triple
+            ON {db.references_schema}processed_events(user_id, event_hash, COALESCE(note_id, ''));
+            """
+        )
+    except Exception as e:
+        logger.info(f"CyberHerd m001: processed_events unique index: {e}")
+
     logger.info("CyberHerd: consolidated schema migration completed")
 
 
@@ -266,14 +373,7 @@ async def m021_add_likes_tracking(db: Database):
     # Build table name with schema prefix for PostgreSQL, without for SQLite
     table_name = f"{db.references_schema}settings"
     
-    try:
-        await db.execute(
-            f"ALTER TABLE {table_name} ADD COLUMN likes_tracking_enabled INTEGER DEFAULT 0;"
-        )
-        logger.info("CyberHerd m021: added likes_tracking_enabled column")
-    except Exception as e:
-        # Column likely already exists (from m000_consolidated_schema)
-        logger.info(f"CyberHerd m021: column already exists or table not ready: {e}")
+    await _add_column_if_missing(db, table_name, "likes_tracking_enabled", "INTEGER DEFAULT 0")
 
 
 async def m022_add_user_id_to_cyber_herd(db: Database):
@@ -287,15 +387,8 @@ async def m022_add_user_id_to_cyber_herd(db: Database):
     # Build table name with schema prefix for PostgreSQL, without for SQLite
     table_name = f"{db.references_schema}cyber_herd"
     
-    try:
-        await db.execute(
-            f"ALTER TABLE {table_name} ADD COLUMN user_id TEXT;"
-        )
-        logger.info("CyberHerd m022: added user_id column to cyber_herd table")
-    except Exception as e:
-        # Column likely already exists (from m000_consolidated_schema)
-        logger.info(f"CyberHerd m022: column already exists or table not ready: {e}")
-    
+    await _add_column_if_missing(db, table_name, "user_id", "TEXT")
+
     # Add indices for performance
     try:
         await db.execute(
@@ -314,15 +407,7 @@ async def m023_add_tracked_event_addresses(db: Database):
     logger.info("CYBERHERD MIGRATION m023: Adding tracked_event_addresses column")
     table_name = f"{db.references_schema}settings"
 
-    try:
-        await db.execute(
-            f"ALTER TABLE {table_name} ADD COLUMN tracked_event_addresses TEXT DEFAULT '{{}}';"
-        )
-        logger.info("CyberHerd m023: added tracked_event_addresses column")
-    except Exception as e:
-        logger.info(
-            f"CyberHerd m023: column already exists or table not ready: {e}"
-        )
+    await _add_column_if_missing(db, table_name, "tracked_event_addresses", "TEXT DEFAULT '{}'")
 
 
 async def m024_add_midnight_reset_toggle(db: Database):
@@ -332,13 +417,7 @@ async def m024_add_midnight_reset_toggle(db: Database):
     """
     logger.info("CYBERHERD MIGRATION m024: Adding midnight_reset_enabled column (default 1)")
     table_name = f"{db.references_schema}settings"
-    try:
-        await db.execute(
-            f"ALTER TABLE {table_name} ADD COLUMN midnight_reset_enabled INTEGER DEFAULT 1;"
-        )
-        logger.info("CyberHerd m024: added midnight_reset_enabled column")
-    except Exception as e:
-        logger.info(f"CyberHerd m024: column already exists or table not ready: {e}")
+    await _add_column_if_missing(db, table_name, "midnight_reset_enabled", "INTEGER DEFAULT 1")
 
 
 async def m025_migrate_legacy_userids(db: Database):
@@ -426,18 +505,8 @@ async def m025_migrate_legacy_userids(db: Database):
 async def m027_add_feeder_trigger_sats(db: Database):
     """Add feeder_trigger_sats column to settings for external feeder logic."""
     table_name = f"{db.references_schema}settings"
-    try:
-        logger.info("CYBERHERD m027: Adding feeder_trigger_sats column to settings")
-        await db.execute(
-            f"ALTER TABLE {table_name} ADD COLUMN feeder_trigger_sats INTEGER DEFAULT 0;"
-        )
-        logger.info("CYBERHERD m027: feeder_trigger_sats column added")
-    except Exception as e:
-        msg = str(e).lower()
-        if "duplicate" in msg or "already exists" in msg:
-            logger.info("CYBERHERD m027: feeder_trigger_sats column already exists, skipping")
-        else:
-            logger.warning(f"CYBERHERD m027: failed to add feeder_trigger_sats column: {e}")
+    logger.info("CYBERHERD m027: Adding feeder_trigger_sats column to settings")
+    await _add_column_if_missing(db, table_name, "feeder_trigger_sats", "INTEGER DEFAULT 0")
 
 
 async def m026_add_zap_totals_table(db: Database):
@@ -491,24 +560,18 @@ async def m028_sync_processed_zaps_schema(db: Database):
         )
     except Exception as e:
         logger.debug(f"CYBERHERD m028: base table ensure failed (may already exist): {e}")
-    alter_statements = [
-        f"ALTER TABLE {table_name} ADD COLUMN event_id TEXT;",
-        f"ALTER TABLE {table_name} ADD COLUMN note_id TEXT;",
-        f"ALTER TABLE {table_name} ADD COLUMN zapper_pubkey TEXT;",
-        f"ALTER TABLE {table_name} ADD COLUMN amount INTEGER;",
-        f"ALTER TABLE {table_name} ADD COLUMN processed_at TEXT;",
-        f"ALTER TABLE {table_name} ADD COLUMN zap_receipt_id TEXT;",
-        f"ALTER TABLE {table_name} ADD COLUMN payment_hash TEXT;",
-        f"ALTER TABLE {table_name} ADD COLUMN amount_sats INTEGER;",
+    columns_to_add = [
+        ("event_id", "TEXT"),
+        ("note_id", "TEXT"),
+        ("zapper_pubkey", "TEXT"),
+        ("amount", "INTEGER"),
+        ("processed_at", "TEXT"),
+        ("zap_receipt_id", "TEXT"),
+        ("payment_hash", "TEXT"),
+        ("amount_sats", "INTEGER"),
     ]
-    for stmt in alter_statements:
-        try:
-            await db.execute(stmt)
-        except Exception as e:
-            msg = str(e).lower()
-            if any(token in msg for token in ("duplicate", "already exists", "syntax error", "duplicate column")):
-                continue
-            logger.debug(f"CYBERHERD m028: alter skipped ({stmt}): {e}")
+    for column, column_def in columns_to_add:
+        await _add_column_if_missing(db, table_name, column, column_def)
 
     index_statements = [
         "CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_event ON cyberherd.processed_zaps(user_id, event_id);",
@@ -544,41 +607,17 @@ async def m028_sync_processed_zaps_schema(db: Database):
 async def m029_add_nip05_verification_toggle(db: Database):
     """Add nip05_verification_enabled column to settings table."""
     logger.info("CYBERHERD m029: adding nip05_verification_enabled column")
-    try:
-        await db.execute(
-            """
-            ALTER TABLE cyberherd.settings 
-            ADD COLUMN nip05_verification_enabled INTEGER DEFAULT 1;
-            """
-        )
-        logger.info("CYBERHERD m029: nip05_verification_enabled column added successfully")
-    except Exception as e:
-        msg = str(e).lower()
-        if any(token in msg for token in ("duplicate", "already exists", "duplicate column")):
-            logger.info("CYBERHERD m029: nip05_verification_enabled column already exists, skipping")
-        else:
-            logger.warning(f"CYBERHERD m029: failed to add nip05_verification_enabled column: {e}")
+    await _add_column_if_missing(
+        db, f"{db.references_schema}settings", "nip05_verification_enabled", "INTEGER DEFAULT 1"
+    )
 
 
 async def m030_add_banned_column(db: Database):
     """Add banned column to cyber_herd table for member banning."""
     logger.info("CYBERHERD m030: adding banned column to cyber_herd table")
     table_name = f"{db.references_schema}cyber_herd"
-    try:
-        await db.execute(
-            f"""
-            ALTER TABLE {table_name}
-            ADD COLUMN banned INTEGER DEFAULT 0;
-            """
-        )
-        logger.info("CYBERHERD m030: banned column added successfully")
-    except Exception as e:
-        msg = str(e).lower()
-        if any(token in msg for token in ("duplicate", "already exists", "duplicate column")):
-            logger.info("CYBERHERD m030: banned column already exists, skipping")
-        else:
-            logger.warning(f"CYBERHERD m030: failed to add banned column: {e}")
-    
+    await _add_column_if_missing(db, table_name, "banned", "INTEGER DEFAULT 0")
+
     # Add index for banned status queries
     try:
         await db.execute(
@@ -592,20 +631,9 @@ async def m030_add_banned_column(db: Database):
 async def m031_add_send_splits_enabled(db: Database):
     """Add send_splits_enabled column to settings table for automatic splits trigger."""
     logger.info("CYBERHERD m031: adding send_splits_enabled column")
-    try:
-        await db.execute(
-            """
-            ALTER TABLE cyberherd.settings 
-            ADD COLUMN send_splits_enabled INTEGER DEFAULT 0;
-            """
-        )
-        logger.info("CYBERHERD m031: send_splits_enabled column added successfully")
-    except Exception as e:
-        msg = str(e).lower()
-        if any(token in msg for token in ("duplicate", "already exists", "duplicate column")):
-            logger.info("CYBERHERD m031: send_splits_enabled column already exists, skipping")
-        else:
-            logger.warning(f"CYBERHERD m031: failed to add send_splits_enabled column: {e}")
+    await _add_column_if_missing(
+        db, f"{db.references_schema}settings", "send_splits_enabled", "INTEGER DEFAULT 0"
+    )
 
 
 async def m032_enable_interaction_tracking(db: Database):
@@ -645,20 +673,9 @@ async def m032_enable_interaction_tracking(db: Database):
 async def m033_add_member_allocation_percent(db: Database):
     """Add member_allocation_percent column to settings table for configurable split percentage."""
     logger.info("CYBERHERD m033: adding member_allocation_percent column")
-    try:
-        await db.execute(
-            """
-            ALTER TABLE cyberherd.settings 
-            ADD COLUMN member_allocation_percent INTEGER DEFAULT 10;
-            """
-        )
-        logger.info("CYBERHERD m033: member_allocation_percent column added successfully")
-    except Exception as e:
-        msg = str(e).lower()
-        if any(token in msg for token in ("duplicate", "already exists", "duplicate column")):
-            logger.info("CYBERHERD m033: member_allocation_percent column already exists, skipping")
-        else:
-            logger.warning(f"CYBERHERD m033: failed to add member_allocation_percent column: {e}")
+    await _add_column_if_missing(
+        db, f"{db.references_schema}settings", "member_allocation_percent", "INTEGER DEFAULT 10"
+    )
 
 
 async def m034_fix_processed_events_unique_constraint(db: Database):
@@ -803,15 +820,12 @@ async def m035_fix_cyber_herd_user_pubkey_key(db: Database):
             """
         )
 
-        for column_sql in (
-            f"ALTER TABLE {table_name} ADD COLUMN nip05 TEXT;",
-            f"ALTER TABLE {table_name} ADD COLUMN banned INTEGER DEFAULT 0;",
-            f"ALTER TABLE {table_name} ADD COLUMN user_id TEXT;",
+        for column, column_def in (
+            ("nip05", "TEXT"),
+            ("banned", "INTEGER DEFAULT 0"),
+            ("user_id", "TEXT"),
         ):
-            try:
-                await db.execute(column_sql)
-            except Exception:
-                pass
+            await _add_column_if_missing(db, table_name, column, column_def)
 
         await db.execute(
             f"""

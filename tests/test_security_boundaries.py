@@ -969,3 +969,72 @@ def test_verify_event_signature_accepts_genuine_and_rejects_forged():
 
     # Event without an advertised id but a valid signature — accepted.
     assert verify_event_signature({k: v for k, v in ev.items() if k != "id"}) is True
+
+
+@pytest.mark.anyio
+async def test_headbutt_does_not_evict_victim_when_attacker_fails_admission(monkeypatch):
+    """A full-herd headbutt attacker who fails admission (e.g. missing lud16 or
+    NIP-05) must NOT displace the lowest member. Admission is validated before
+    any eviction."""
+    deactivated = []
+
+    class FakeDb:
+        async def deactivate_cyberherd_member(self, pubkey, user_id=None):
+            deactivated.append(pubkey)
+
+        async def get_cyberherd_member_by_pubkey(self, pubkey, user_id=None):
+            return None
+
+    async def fake_admission_fail(self, attacker):
+        return "lud16_required"
+
+    monkeypatch.setattr(
+        headbutt.EnhancedHeadbuttService,
+        "_handle_attacker_admission",
+        fake_admission_fail,
+    )
+
+    service = headbutt.EnhancedHeadbuttService(
+        db=FakeDb(), messaging_module=SimpleNamespace(), user_id="user-id"
+    )
+    attacker = headbutt._Attacker(pubkey="d" * 64, amount=0, kinds=[6], note_id="n", event_id="e" * 64)
+    lowest = {"pubkey": "v" * 64, "amount": 100, "display_name": "Victim"}
+
+    status = await service._handle_successful_headbutt(attacker, lowest)
+
+    assert status == "lud16_required"
+    assert deactivated == []  # victim preserved
+
+
+@pytest.mark.anyio
+async def test_headbutt_evicts_victim_only_after_successful_admission(monkeypatch):
+    """When the attacker passes admission, the lowest member is evicted so the
+    herd stays at max_members."""
+    deactivated = []
+
+    class FakeDb:
+        async def deactivate_cyberherd_member(self, pubkey, user_id=None):
+            deactivated.append(pubkey)
+
+        async def get_cyberherd_member_by_pubkey(self, pubkey, user_id=None):
+            return None
+
+    async def fake_admission_ok(self, attacker):
+        return "new"
+
+    monkeypatch.setattr(
+        headbutt.EnhancedHeadbuttService,
+        "_handle_attacker_admission",
+        fake_admission_ok,
+    )
+
+    service = headbutt.EnhancedHeadbuttService(
+        db=FakeDb(), messaging_module=SimpleNamespace(), user_id="user-id"
+    )
+    attacker = headbutt._Attacker(pubkey="d" * 64, amount=200, kinds=[9735], note_id="n", event_id="e" * 64)
+    lowest = {"pubkey": "v" * 64, "amount": 100, "display_name": "Victim"}
+
+    status = await service._handle_successful_headbutt(attacker, lowest)
+
+    assert status == "new"
+    assert deactivated == ["v" * 64]  # victim evicted exactly once

@@ -1287,36 +1287,50 @@ class EnhancedHeadbuttService:
         return None
 
     async def _handle_successful_headbutt(self, attacker: Any, lowest: dict | None) -> str | None:
-        """Perform DB updates to replace the lowest member with the attacker.
+        """Replace the lowest member with the attacker, atomically in effect.
 
-        This is a conservative, minimal implementation: deactivate the lowest
-        member (if present), add/update the attacker as active, and return
-        the admission status string ('new'|'reactivated') as used by callers.
+        Ordering matters for correctness:
+        1. Admit the attacker through the SAME validation as the open-slot path
+           (`_handle_attacker_admission` enforces lud16 and NIP-05). If the
+           attacker fails those requirements we return the failure status and
+           never touch the victim — a headbutt must not displace a member for an
+           attacker who isn't even eligible to join.
+        2. Only after the attacker is admitted do we evict the lowest member.
+           This briefly leaves the herd at max+1 active members, which is safe
+           because the whole method runs under the process-wide headbutt lock.
+        3. If eviction fails, roll back the attacker so the herd never exceeds
+           max_members.
         """
         try:
+            # Step 1: validate + admit the attacker (may reactivate an existing
+            # inactive member). Returns 'new'/'reactivated' on success, or a
+            # requirement string like 'lud16_required'/'nip05_required'.
+            status = await self._handle_attacker_admission(attacker)
+            if status not in ("new", "reactivated"):
+                logger.info(
+                    f"Headbutt aborted: attacker {str(getattr(attacker, 'pubkey', ''))[:8]}... "
+                    f"failed admission ({status}); victim not displaced"
+                )
+                return status
+
+            # Step 2: free the slot by evicting the lowest member.
             if lowest and isinstance(lowest, dict):
                 try:
                     await self.db.deactivate_cyberherd_member(lowest.get("pubkey"), user_id=self.user_id)
-                except Exception:
-                    # Best-effort: log and continue
-                    logger.debug("Failed to deactivate previous lowest member during replacement")
+                except Exception as exc:
+                    # Step 3: eviction failed — roll back the attacker so we don't
+                    # exceed max_members.
+                    logger.error(
+                        f"Headbutt eviction failed for {str(lowest.get('pubkey'))[:8]}...: {exc}; "
+                        f"rolling back attacker admission"
+                    )
+                    try:
+                        await self.db.deactivate_cyberherd_member(attacker.pubkey, user_id=self.user_id)
+                    except Exception:
+                        logger.error("Failed to roll back attacker after eviction failure")
+                    return None
 
-            # Add or update attacker as active (reuse existing handler where possible)
-            existing = await self.db.get_cyberherd_member_by_pubkey(attacker.pubkey, user_id=self.user_id)
-            
-            # Payouts are fully recomputed by recompute_member_payouts()
-            # inside update_and_activate_member / add_new_active_member.
-            if existing:
-                await self.db.update_and_activate_member(
-                    attacker.pubkey,
-                    int(getattr(attacker, "amount", 0) or 0),
-                    user_id=self.user_id,
-                    kinds=getattr(attacker, "kinds", None),
-                )
-                return "reactivated"
-            else:
-                await self._add_new_member(attacker)
-                return "new"
+            return status
         except Exception as e:
             logger.error(f"Error in _handle_successful_headbutt: {e}")
             return None
