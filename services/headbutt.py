@@ -825,6 +825,18 @@ class EnhancedHeadbuttService:
             except Exception as e:
                 logger.warning(f"Could not check effective pubkey: {e}")
 
+            # Honor the operator-configured membership minimum. This is the floor
+            # for open-slot zap admission and for the headbutt exceed-lowest
+            # threshold (required = max(minimum_sats, lowest + 1)). Falls back to
+            # the service default when the setting is unavailable.
+            try:
+                if settings is not None:
+                    configured_min = getattr(settings, "minimum_sats", None)
+                    if configured_min is not None:
+                        self.headbutt_min_sats = int(configured_min)
+            except Exception:
+                logger.debug("Could not read minimum_sats; using default headbutt minimum")
+
             # Check if pubkey is banned
             try:
                 if await crud.is_pubkey_banned(attacker.pubkey, self.user_id):
@@ -1165,24 +1177,24 @@ class EnhancedHeadbuttService:
             getattr(attacker, "kinds", None) and 7 in getattr(attacker, "kinds", [])
         )
         
-        # Kind 7 (reactions) should NEVER headbutt
+        # Kind 7 (reactions) can NEVER headbutt when the herd is full — they may
+        # only take an open slot (per cyberherd_explanation.md). A combined kind
+        # 6+7 event still counts as a repost (is_repost True) and is handled by
+        # the repost branch below, so only a pure reaction is rejected here.
         if is_reaction and not is_repost:
-            kinds = getattr(attacker, "kinds", [])
-            # Only block if it's kind 7 without kind 6
-            if 7 in kinds and 6 not in kinds:
-                logger.info(
-                    f"AdmissionGuard reaction_no_headbutt: Kind 7 (reaction) cannot headbutt when herd is full "
-                    f"(pubkey={attacker.pubkey[:8]}...)"
-                )
-                lowest_for_failure = self._get_lowest_member(active_members)
-                required_for_failure = self._required_amount_for_victim(lowest_for_failure)
-                await self._send_headbutt_failure_notification(
-                    attacker,
-                    lowest_for_failure
-                    or {"display_name": "Anon", "amount": 0, "pubkey": ""},
-                    required_for_failure,
-                )
-                return None
+            logger.info(
+                f"AdmissionGuard reaction_no_headbutt: reaction cannot headbutt when herd is full "
+                f"(pubkey={attacker.pubkey[:8]}...)"
+            )
+            lowest_for_failure = self._get_lowest_member(active_members)
+            required_for_failure = self._required_amount_for_victim(lowest_for_failure)
+            await self._send_headbutt_failure_notification(
+                attacker,
+                lowest_for_failure
+                or {"display_name": "Anon", "amount": 0, "pubkey": ""},
+                required_for_failure,
+            )
+            return None
         
         if is_repost:
             # For reposts (kind 6), can replace:
@@ -1203,38 +1215,6 @@ class EnhancedHeadbuttService:
                 return None
             lowest = self._get_lowest_member(replaceable)
             logger.info(f"Repost (kind 6) can replace any amount=0 member: {len(replaceable)} candidates")
-        elif is_reaction:
-            # For reactions (kind 7), can only replace reactions that have only kind 7 events
-            reactions_only = []
-            for m in active_members:
-                if int(m.get("amount", 0) or 0) != 0:
-                    continue
-                kinds_raw = m.get("kinds")
-                if not kinds_raw:
-                    continue
-                kinds_set = set()
-                try:
-                    for part in [p.strip() for p in str(kinds_raw).split(',') if p.strip()]:
-                        try:
-                            kinds_set.add(int(part))
-                        except Exception:
-                            pass
-                except Exception:
-                    kinds_set = set()
-                if kinds_set and 7 in kinds_set and 6 not in kinds_set:
-                    reactions_only.append(m)
-            if not reactions_only:
-                logger.info("No reactions-only to replace — reaction headbutt skipped")
-                lowest_for_failure = self._get_lowest_member(active_members)
-                required_for_failure = self._required_amount_for_victim(lowest_for_failure)
-                await self._send_headbutt_failure_notification(
-                    attacker,
-                    lowest_for_failure
-                    or {"display_name": "Anon", "amount": 0, "pubkey": ""},
-                    required_for_failure,
-                )
-                return None
-            lowest = self._get_lowest_member(reactions_only)
         else:
             # For zaps, prioritize displacing repost/reaction-only members first
             # Get members with only kind 6 or kind 7 events (amount=0)

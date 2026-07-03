@@ -352,7 +352,9 @@ def test_local_day_boundaries_handle_dst_spring_forward(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_open_slot_zap_uses_default_membership_minimum(monkeypatch):
+async def test_open_slot_zap_enforces_configured_membership_minimum(monkeypatch):
+    # With minimum_sats configured to 50, a 10-sat zap must be rejected even when
+    # a slot is open (cyberherd_explanation.md: the minimum is configurable).
     note_id = "c" * 64
     admitted = {"called": False}
 
@@ -412,13 +414,10 @@ async def test_open_slot_zap_uses_default_membership_minimum(monkeypatch):
 
     result = await service.attempt_headbutt(attacker)
 
-    assert result == {
-        "newly_activated": "d" * 64,
-        "reason": "free_spot",
-        "status": "new",
-    }
-    assert admitted["called"] is True
-    assert "required" not in admitted
+    # 10-sat zap is below the configured 50-sat minimum → rejected, not admitted.
+    assert result is None
+    assert admitted["called"] is False
+    assert admitted.get("required") == 50
 
 
 @pytest.mark.anyio
@@ -1038,3 +1037,61 @@ async def test_headbutt_evicts_victim_only_after_successful_admission(monkeypatc
 
     assert status == "new"
     assert deactivated == ["v" * 64]  # victim evicted exactly once
+
+
+@pytest.mark.anyio
+async def test_reaction_cannot_headbutt_when_herd_full(monkeypatch):
+    """cyberherd_explanation.md scenario 9: a reaction (kind 7) can NEVER
+    headbutt. When the herd is full it is rejected and displaces no member,
+    and the reactor is notified of the failure."""
+    note_id = "c" * 64
+    members = [
+        {"pubkey": "a" * 64, "amount": 0, "kinds": "6", "is_active": 1},      # repost-only
+        {"pubkey": "b" * 64, "amount": 100, "kinds": "9735", "is_active": 1},
+        {"pubkey": "f" * 64, "amount": 200, "kinds": "9735", "is_active": 1},
+    ]
+    deactivated = []
+    notified = {}
+
+    class FakeDb:
+        async def get_settings(self, user_id):
+            return _settings(max_members=3, tracked_event_ids=[note_id])
+
+        async def get_active_cyberherd_members(self, user_id=None):
+            return members
+
+        async def deactivate_cyberherd_member(self, pubkey, user_id=None):
+            deactivated.append(pubkey)
+
+        async def get_cyberherd_member_by_pubkey(self, pubkey, user_id=None):
+            return None
+
+    async def fake_is_pubkey_banned(pubkey, user_id):
+        return False
+
+    async def fake_get_today_notes(self):
+        return [note_id]
+
+    async def fake_failure(self, attacker, victim, required):
+        notified["failed"] = True
+
+    monkeypatch.setattr(headbutt.crud, "is_pubkey_banned", fake_is_pubkey_banned)
+    monkeypatch.setattr(
+        headbutt.EnhancedHeadbuttService, "_get_today_cyberherd_notes", fake_get_today_notes
+    )
+    monkeypatch.setattr(
+        headbutt.EnhancedHeadbuttService,
+        "_send_headbutt_failure_notification",
+        fake_failure,
+    )
+
+    service = headbutt.EnhancedHeadbuttService(
+        db=FakeDb(), messaging_module=SimpleNamespace(), user_id="user-id"
+    )
+    attacker = headbutt._Attacker(pubkey="d" * 64, amount=0, kinds=[7], note_id=note_id, event_id="e" * 64)
+
+    result = await service.attempt_headbutt(attacker)
+
+    assert result is None
+    assert deactivated == []                 # a reaction displaces no one, even a repost-only member
+    assert notified.get("failed") is True
