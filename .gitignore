@@ -59,12 +59,9 @@ lnbits/extensions/*/.mypy_cache/
 lnbits/extensions/*/*.sqlite3
 lnbits/extensions/*/*.db
 
-# Tests
-tests/
-*/tests/
-test_*.py
-*_test.py
-*.spec
+# Local runtime secrets
+data/
+data/.lnbits_auth_key
 
 # Misc
 *.bak

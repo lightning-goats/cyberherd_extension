@@ -1,8 +1,6 @@
 from typing import Optional
 from datetime import datetime, timezone
 
-from loguru import logger
-
 from pydantic import BaseModel, Field
 
 

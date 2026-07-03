@@ -12,7 +12,6 @@ legacy ZapMonitorService name remains available via alias for compatibility.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 from datetime import datetime, timezone
@@ -237,13 +236,12 @@ class PaymentCoordinatorService:
             
         self._running = False
     
-    async def _process_payment_for_zap(self, payment):
+    async def _process_payment_for_zap(self, payment, settings_override=None):
         """Process a payment notification to detect LNURLp zaps.
         
-        This method parses payment.extra["nostr"] for NIP-57 zap requests
-        and processes them as a FALLBACK when kind 9735 WebSocket monitoring
-        misses zaps. Primary zap detection is via Nostr kind 9735 subscriptions,
-        but this provides recovery for payments that have zap request data.
+        This method parses payment.extra["nostr"] for NIP-57 zap requests.
+        Payment records are the primary zap detection path; kind 9735 Nostr
+        receipt subscriptions are intentionally disabled to avoid races.
         
         IMPORTANT: Only processes zaps for TODAY's tracked notes. This enforces
         the rule that zaps are only valid for the current day's CyberHerd notes.
@@ -253,7 +251,7 @@ class PaymentCoordinatorService:
         """
         try:
             # Disabled in live flow; keep as no-op fast exit
-            settings = await crud.get_settings(self.user_id)
+            settings = settings_override or await crud.get_settings(self.user_id)
             if not settings:
                 return False
             herd_wallet_id = getattr(settings, 'herd_wallet', None)
@@ -289,12 +287,12 @@ class PaymentCoordinatorService:
                     if isinstance(nostr_json, dict):
                         zap_request = nostr_json
                         zap_request_source = "nostr"
-                        logger.debug(f"Parsed zap request from payment.extra['nostr'] (dict)")
+                        logger.debug("Parsed zap request from payment.extra['nostr'] (dict)")
                     else:
                         try:
                             zap_request = json.loads(nostr_json)
                             zap_request_source = "nostr"
-                            logger.debug(f"Parsed zap request from payment.extra['nostr']")
+                            logger.debug("Parsed zap request from payment.extra['nostr']")
                         except Exception as e:
                             logger.warning(f"Failed to parse zap request from nostr field: {e}")
 
@@ -323,7 +321,7 @@ class PaymentCoordinatorService:
                         try:
                             zap_request = json.loads(comment)
                             zap_request_source = "comment"
-                            logger.debug(f"Parsed zap request from payment.extra['comment'] (legacy)")
+                            logger.debug("Parsed zap request from payment.extra['comment'] (legacy)")
                         except json.JSONDecodeError:
                             pass  # Not a JSON comment, ignore
 
@@ -384,6 +382,8 @@ class PaymentCoordinatorService:
             target_note_id_raw: Optional[str] = None
             target_author_raw: Optional[str] = None
             address_candidates: list[str] = []
+            relay_hints: list[str] = []
+            seen_relay_hints: set[str] = set()
 
             tags = zap_request.get("tags", [])
             for tag in tags:
@@ -397,6 +397,14 @@ class PaymentCoordinatorService:
                     target_author_raw = value
                 elif marker == "a" and isinstance(value, str) and value:
                     address_candidates.append(value)
+                elif marker == "relays":
+                    for relay in tag[1:]:
+                        if not isinstance(relay, str):
+                            continue
+                        relay = relay.strip()
+                        if relay and relay not in seen_relay_hints:
+                            seen_relay_hints.add(relay)
+                            relay_hints.append(relay)
 
             # Fallbacks for non-standard fields
             if not target_note_id_raw:
@@ -407,6 +415,16 @@ class PaymentCoordinatorService:
             extra_address = zap_request.get("a")
             if isinstance(extra_address, str) and extra_address:
                 address_candidates.append(extra_address)
+
+            extra_relays = zap_request.get("relays")
+            if isinstance(extra_relays, list):
+                for relay in extra_relays:
+                    if not isinstance(relay, str):
+                        continue
+                    relay = relay.strip()
+                    if relay and relay not in seen_relay_hints:
+                        seen_relay_hints.add(relay)
+                        relay_hints.append(relay)
 
             if not target_note_id_raw and address_candidates:
                 resolved_id, resolved_author = await self._resolve_note_from_addresses(settings, address_candidates)
@@ -454,6 +472,12 @@ class PaymentCoordinatorService:
             # Use payment amount, not zap request amount (zap request amount is in millisats string)
             amount_msats = payment.amount or 0
             amount_sats = max(amount_msats // 1000, 0)
+            if amount_sats <= 0:
+                logger.info(
+                    f"Ignoring payment-based zap with non-positive amount: {amount_msats} msat"
+                )
+                self.last_error = "invalid_amount"
+                return False
             
             try:
                 payment_hash = getattr(payment, 'payment_hash', None) or getattr(payment, 'checking_id', None)
@@ -501,18 +525,42 @@ class PaymentCoordinatorService:
                         logger.debug(f"Could not verify note author: {e}")
                         # Continue optimistically if verification fails
                 else:
-                    logger.debug(
-                        f"No author information for note {target_note_id[:8]}... - "
-                        f"allowing zap for existing member {zapper_pubkey[:8]}..."
+                    logger.info(
+                        f"Zap target {target_note_id[:8]}... has no author metadata; "
+                        f"cannot verify Lightning Goats ownership for existing member "
+                        f"{zapper_pubkey[:8]}... - rejecting"
                     )
+                    self.last_error = "missing_note_author"
+                    return False
             else:
                 # New member: enforce strict tracking requirements
                 # Simple rule: If the zapped note is in tracked_event_ids, it's valid
                 # tracked_event_ids only contains notes from TODAY with the required tags
-                tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
+                tracked_notes = {
+                    note_id.strip().lower()
+                    for note_id in (getattr(settings, 'tracked_event_ids', []) or [])
+                    if isinstance(note_id, str) and note_id.strip()
+                }
                 
-                # Check if target note is in tracked events
+                # Check if target note is in tracked events. A stale note ID
+                # left in settings is not enough for new-member admission; it
+                # must still be valid for the current local day.
                 is_tracked = target_note_id in tracked_notes
+                if is_tracked:
+                    is_current = await self._is_current_day_tracked_note(
+                        settings=settings,
+                        note_id=target_note_id,
+                        author_hint=target_author,
+                        relay_hints=relay_hints,
+                    )
+                    if not is_current:
+                        logger.info(
+                            f"❌ Zap target {target_note_id[:8]}... is present in "
+                            "tracked_event_ids but is not valid for today's local window. "
+                            "Ignoring zap."
+                        )
+                        self.last_error = "note_not_current"
+                        return False
                 
                 if not is_tracked:
                     author_hint_for_tracking = target_author
@@ -534,6 +582,7 @@ class PaymentCoordinatorService:
                                 settings=settings,
                                 note_id=target_note_id,
                                 author_hint=author_hint_for_tracking,
+                                relay_hints=relay_hints,
                             )
                         except Exception as exc:
                             ensured = False
@@ -544,13 +593,16 @@ class PaymentCoordinatorService:
                             )
 
                         if ensured:
-                            tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
+                            tracked_notes = {
+                                note_id.strip().lower()
+                                for note_id in (getattr(settings, 'tracked_event_ids', []) or [])
+                                if isinstance(note_id, str) and note_id.strip()
+                            }
                             is_tracked = target_note_id in tracked_notes
                             if is_tracked:
                                 logger.info(
-                                    "Auto-tracked note %s after zap from %s",
-                                    target_note_id[:8],
-                                    zapper_pubkey[:8],
+                                    f"Auto-tracked note {target_note_id[:8]}... "
+                                    f"after zap from {zapper_pubkey[:8]}..."
                                 )
                     else:
                         logger.debug(
@@ -629,6 +681,19 @@ class PaymentCoordinatorService:
                     f"Headbutt processing returned no result for payment zap: "
                     f"{amount_sats} sats from {zapper_pubkey[:8]}..."
                 )
+                if event_id:
+                    try:
+                        await crud.delete_processed_event(
+                            cast(str, self.user_id),
+                            event_id,
+                            note_id=target_note_id,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to release processed marker for failed zap %s: %s",
+                            event_id[:16],
+                            exc,
+                        )
                 return False
             
         except Exception as e:
@@ -703,6 +768,7 @@ class PaymentCoordinatorService:
         note_id: str,
         created_at: int | None = None,
         author_hint: str | None = None,
+        relay_hints: list[str] | None = None,
     ) -> bool:
         """Best-effort helper to persist zap target note IDs into tracked_event_ids.
 
@@ -735,13 +801,17 @@ class PaymentCoordinatorService:
                     # If effective pubkey resolution fails, continue optimistically
                     pass
 
-            tagged_event = await self._fetch_tagged_note(settings, note_id, author_hint)
+            tagged_event = await self._fetch_tagged_note(
+                settings,
+                note_id,
+                author_hint,
+                relay_hints=relay_hints,
+            )
             if not tagged_event:
-                logger.debug(
-                    "Zap monitor: refusing to auto-track note %s for user %s because it "
-                    "does not contain required tracked tags",
-                    note_id[:8],
-                    self.user_id,
+                logger.info(
+                    f"Zap monitor: refusing to auto-track note {note_id[:8]}... "
+                    f"for user {self.user_id} because it was not found or did not "
+                    f"match tracked tags (relay_hints={len(relay_hints or [])})"
                 )
                 return False
 
@@ -798,8 +868,113 @@ class PaymentCoordinatorService:
             )
             return False
 
-    async def _fetch_tagged_note(self, *args, **kwargs) -> dict | None:
-        """Deprecated: Nostr tag verification handled by subscriptions."""
+    async def _is_current_day_tracked_note(
+        self,
+        settings,
+        note_id: str,
+        author_hint: str | None = None,
+        relay_hints: list[str] | None = None,
+    ) -> bool:
+        """Return True only when a tracked note is valid for today's local day."""
+        try:
+            from .time_utils import get_day_boundaries_utc
+
+            boundaries = get_day_boundaries_utc(days_ago=0)
+            timestamps = dict(getattr(settings, "tracked_event_timestamps", {}) or {})
+            raw_ts = timestamps.get(note_id)
+            if raw_ts is None:
+                raw_ts = timestamps.get(str(note_id).strip().lower())
+
+            if raw_ts is not None:
+                try:
+                    note_ts = int(raw_ts)
+                except Exception:
+                    note_ts = 0
+                if note_ts > 0:
+                    if boundaries.is_timestamp_in_local_day(note_ts):
+                        return True
+                    logger.info(
+                        f"Tracked note {note_id[:8]}... has timestamp {note_ts}, "
+                        "outside today's local window; rejecting for new-member zap."
+                    )
+                    return False
+
+            # Legacy/manual tracked IDs may not have timestamps. In that case,
+            # require a relay fetch and reuse the canonical tag + author + local-day
+            # validator before admitting a new member from this note.
+            tagged_event = await self._fetch_tagged_note(
+                settings,
+                note_id,
+                author_hint,
+                relay_hints=relay_hints,
+            )
+            return bool(tagged_event)
+        except Exception as exc:
+            logger.debug(
+                "Failed to validate tracked note %s against today's local window: %s",
+                note_id[:8] if isinstance(note_id, str) else "unknown",
+                exc,
+            )
+            return False
+
+    async def _fetch_tagged_note(
+        self,
+        settings,
+        note_id: str,
+        author_hint: str | None = None,
+        relay_hints: list[str] | None = None,
+    ) -> dict | None:
+        """Fetch a note by ID and verify it matches CyberHerd tracking rules."""
+        if not note_id:
+            return None
+
+        try:
+            from . import nostr_helpers
+            from .subscriptions import _would_event_be_tracked
+
+            events = await nostr_helpers.query_events(
+                {"ids": [note_id]},
+                limit=1,
+                timeout=5.0,
+                extra_relays=relay_hints or None,
+            )
+            if not events:
+                logger.info(
+                    f"Zap monitor: target note {note_id[:8]}... was not found "
+                    f"while checking tracked tags (relay_hints={len(relay_hints or [])})"
+                )
+            for event in events or []:
+                if not isinstance(event, dict):
+                    continue
+                if event.get("id") != note_id:
+                    continue
+
+                try:
+                    kind = int(event.get("kind") or 0)
+                except Exception:
+                    kind = 0
+                if kind not in (1, 30311):
+                    continue
+
+                event_pubkey = str(event.get("pubkey") or "").strip().lower()
+                if author_hint and event_pubkey != author_hint:
+                    continue
+
+                eff_pub = resolve_effective_pubkey(settings)
+                tracked_tags = getattr(settings, "tracked_tags", []) or []
+                if _would_event_be_tracked(event, eff_pub, tracked_tags):
+                    return event
+                logger.info(
+                    f"Zap monitor: target note {note_id[:8]}... was found but "
+                    "does not match today's tracked tag rules"
+                )
+        except Exception as exc:
+            logger.debug(
+                "Zap monitor: failed to fetch/verify tagged note %s for user %s: %s",
+                note_id[:8],
+                self.user_id,
+                exc,
+            )
         return None
 
     async def _get_today_note_ids(self, *args, **kwargs) -> tuple[bool, list[str]]:
@@ -924,7 +1099,6 @@ class PaymentCoordinatorService:
         
         Returns a diagnostic dict with counts and any errors encountered.
         """
-        from ..crud import get_settings as _get_settings  # noqa: F401
         try:
             # Resolve herd wallet from provided settings object
             herd_wallet = getattr(settings, 'herd_wallet', None)
@@ -933,13 +1107,15 @@ class PaymentCoordinatorService:
                 logger.warning(msg)
                 return {"scanned": 0, "processed": 0, "error": msg}
 
-            # CRITICAL: Recovery should only run after tracked_event_ids are populated
-            # This prevents scanning payments before subscriptions have detected today's notes
+            # Continue even when tracked_event_ids is empty. _process_payment_for_zap
+            # can opportunistically fetch and validate the zap target note by ID,
+            # then persist it if it matches the user's tracked tags.
             tracked_notes = getattr(settings, 'tracked_event_ids', []) or []
             if not tracked_notes:
-                msg = "No tracked_event_ids found; recovery deferred until notes are detected"
-                logger.info(msg)
-                return {"scanned": 0, "processed": 0, "error": msg}
+                logger.info(
+                    "No tracked_event_ids found; scanning payments for "
+                    "opportunistic tagged-note recovery"
+                )
 
             # Use LOCAL midnight to match the boundary used for validating tracked_event_ids
             # This prevents timezone mismatches that could cause duplicate processing
@@ -1020,7 +1196,10 @@ class PaymentCoordinatorService:
                     # Note: Recovery now enforces current day validation - zaps are only
                     # processed for today's tracked notes
                     processed += 1
-                    res = await self._process_payment_for_zap(payment)
+                    res = await self._process_payment_for_zap(
+                        payment,
+                        settings_override=settings,
+                    )
                     # Treat truthy result as success (some code paths may return True)
                     if res:
                         successful += 1

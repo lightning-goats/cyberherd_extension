@@ -33,6 +33,7 @@ __all__ = [
     'm032_enable_interaction_tracking',  # Enable repost/reaction tracking by default for existing users
     'm033_add_member_allocation_percent',  # Add member_allocation_percent for configurable split percentage
     'm034_fix_processed_events_unique_constraint',  # Fix unique constraint to include note_id for multi-note events
+    'm035_fix_cyber_herd_user_pubkey_key',  # Scope member identity by user_id + pubkey
 ]
 
 logger.info(f"CYBERHERD MIGRATIONS: Registered {len(__all__)} migrations: {__all__}")
@@ -113,13 +114,14 @@ async def m001_consolidated_schema(db: Database):
     await db.execute(
         """
         CREATE TABLE IF NOT EXISTS cyberherd.cyber_herd (
-            pubkey TEXT PRIMARY KEY,
+            pubkey TEXT NOT NULL,
             display_name TEXT,
             event_id TEXT,
             note TEXT,
             kinds TEXT,
             nprofile TEXT,
             lud16 TEXT,
+            nip05 TEXT,
             notified INTEGER DEFAULT 0,
             payouts REAL DEFAULT 0,
             amount INTEGER DEFAULT 0,
@@ -127,8 +129,9 @@ async def m001_consolidated_schema(db: Database):
             relays TEXT,
             metadata_last_checked_at INTEGER,
             is_active INTEGER DEFAULT 0,
-            user_id TEXT,
-            banned INTEGER DEFAULT 0
+            user_id TEXT NOT NULL DEFAULT '',
+            banned INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, pubkey)
         );
         """
     )
@@ -615,24 +618,24 @@ async def m032_enable_interaction_tracking(db: Database):
     logger.info("CYBERHERD m032: enabling interaction tracking for existing users")
     try:
         # Enable repost tracking for all users where it's currently disabled (or NULL)
-        result = await db.execute(
+        await db.execute(
             """
             UPDATE cyberherd.settings 
             SET repost_tracking_enabled = 1 
             WHERE repost_tracking_enabled = 0 OR repost_tracking_enabled IS NULL;
             """
         )
-        logger.info(f"CYBERHERD m032: enabled repost_tracking for existing users")
+        logger.info("CYBERHERD m032: enabled repost_tracking for existing users")
         
         # Enable likes tracking for all users where it's currently disabled (or NULL)
-        result = await db.execute(
+        await db.execute(
             """
             UPDATE cyberherd.settings 
             SET likes_tracking_enabled = 1 
             WHERE likes_tracking_enabled = 0 OR likes_tracking_enabled IS NULL;
             """
         )
-        logger.info(f"CYBERHERD m032: enabled likes_tracking for existing users")
+        logger.info("CYBERHERD m032: enabled likes_tracking for existing users")
         
         logger.info("CYBERHERD m032: interaction tracking enabled successfully")
     except Exception as e:
@@ -762,3 +765,102 @@ async def m034_fix_processed_events_unique_constraint(db: Database):
     except Exception as e:
         logger.warning(f"CYBERHERD m034: migration failed: {e}")
 
+
+async def m035_fix_cyber_herd_user_pubkey_key(db: Database):
+    """Rebuild cyber_herd so member rows are scoped by (user_id, pubkey).
+
+    Older installs used pubkey as the primary key, which lets one user's member
+    row overwrite another user's row when the same Nostr pubkey participates in
+    more than one CyberHerd instance.
+    """
+    logger.info("CYBERHERD m035: rebuilding cyber_herd with user-scoped primary key")
+    table_name = f"{db.references_schema}cyber_herd"
+    temp_table = f"{db.references_schema}cyber_herd_new"
+
+    try:
+        await db.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {temp_table} (
+                pubkey TEXT NOT NULL,
+                display_name TEXT,
+                event_id TEXT,
+                note TEXT,
+                kinds TEXT,
+                nprofile TEXT,
+                lud16 TEXT,
+                nip05 TEXT,
+                notified INTEGER DEFAULT 0,
+                payouts REAL DEFAULT 0,
+                amount INTEGER DEFAULT 0,
+                picture TEXT,
+                relays TEXT,
+                metadata_last_checked_at INTEGER,
+                is_active INTEGER DEFAULT 0,
+                user_id TEXT NOT NULL DEFAULT '',
+                banned INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, pubkey)
+            );
+            """
+        )
+
+        for column_sql in (
+            f"ALTER TABLE {table_name} ADD COLUMN nip05 TEXT;",
+            f"ALTER TABLE {table_name} ADD COLUMN banned INTEGER DEFAULT 0;",
+            f"ALTER TABLE {table_name} ADD COLUMN user_id TEXT;",
+        ):
+            try:
+                await db.execute(column_sql)
+            except Exception:
+                pass
+
+        await db.execute(
+            f"""
+            INSERT INTO {temp_table} (
+                pubkey, display_name, event_id, note, kinds, nprofile, lud16,
+                nip05, notified, payouts, amount, picture, relays,
+                metadata_last_checked_at, is_active, user_id, banned
+            )
+            SELECT
+                LOWER(TRIM(pubkey)),
+                display_name,
+                event_id,
+                note,
+                kinds,
+                nprofile,
+                lud16,
+                nip05,
+                COALESCE(notified, 0),
+                COALESCE(payouts, 0),
+                COALESCE(amount, 0),
+                picture,
+                relays,
+                metadata_last_checked_at,
+                COALESCE(is_active, 0),
+                COALESCE(NULLIF(TRIM(user_id), ''), ''),
+                COALESCE(banned, 0)
+            FROM {table_name}
+            WHERE pubkey IS NOT NULL AND TRIM(pubkey) != ''
+            ON CONFLICT DO NOTHING;
+            """
+        )
+
+        await db.execute(f"DROP TABLE IF EXISTS {table_name};")
+        await db.execute(f"ALTER TABLE {temp_table} RENAME TO cyber_herd;")
+
+        rebuilt_table = table_name
+        await db.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_id ON {rebuilt_table}(user_id);"
+        )
+        await db.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_active ON {rebuilt_table}(user_id, is_active);"
+        )
+        await db.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_banned ON {rebuilt_table}(user_id, banned);"
+        )
+        logger.info("CYBERHERD m035: cyber_herd user-scoped primary key ready")
+    except Exception as e:
+        logger.warning(f"CYBERHERD m035: migration failed: {e}")
+        try:
+            await db.execute(f"DROP TABLE IF EXISTS {temp_table};")
+        except Exception:
+            pass

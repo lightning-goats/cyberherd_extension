@@ -16,12 +16,11 @@ from lnbits.helpers import urlsafe_short_hash
 
 from .. import crud
 from .shares import (
-    _proportional_percentages,
     compute_member_share_percentages,
 )
 import asyncio
 import hashlib
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
 # Simple in-process cache & scheduling (per source_wallet) to avoid excessive writes.
 _split_signature_cache: Dict[str, str] = {}

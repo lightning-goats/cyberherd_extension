@@ -49,7 +49,6 @@ try:
     from zoneinfo import ZoneInfo
 except Exception:  # pragma: no cover - very old Python
     ZoneInfo = None
-from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -95,6 +94,23 @@ class DayBoundaries:
         return self.local_since_ts <= timestamp < self.local_until_ts
 
 
+def _get_system_local_timezone():
+    """Return the system local timezone, preserving DST rules when possible."""
+    tz_name = os.environ.get("TZ")
+    if ZoneInfo is not None and tz_name:
+        candidate = tz_name.strip()
+        if candidate and not candidate.startswith(":"):
+            try:
+                return ZoneInfo(candidate)
+            except Exception:
+                pass
+
+    try:
+        return datetime.now().astimezone().tzinfo or timezone.utc
+    except Exception:
+        return timezone.utc
+
+
 def get_day_boundaries_utc(days_ago: int = 0) -> DayBoundaries:
     """Get day boundaries with UTC-first approach (RECOMMENDED).
     
@@ -128,18 +144,22 @@ def get_day_boundaries_utc(days_ago: int = 0) -> DayBoundaries:
     
     # Local midnight for user-facing "today" concept
     # Use system's local timezone for consistency with nightly reset
-    try:
-        # Get system local timezone
-        local_tz = datetime.now().astimezone().tzinfo
-    except Exception:
-        # Fallback to UTC if local timezone detection fails
-        local_tz = timezone.utc
+    local_tz = _get_system_local_timezone()
 
     now_local = datetime.now(local_tz)
     local_target_date = now_local.date() - timedelta(days=days_ago)
-    local_midnight = datetime.combine(local_target_date, datetime.min.time()).replace(tzinfo=local_tz)
+    local_midnight = datetime.combine(
+        local_target_date,
+        datetime.min.time(),
+        tzinfo=local_tz,
+    )
+    next_local_midnight = datetime.combine(
+        local_target_date + timedelta(days=1),
+        datetime.min.time(),
+        tzinfo=local_tz,
+    )
     local_since_ts = int(local_midnight.astimezone(timezone.utc).timestamp())
-    local_until_ts = local_since_ts + 86400
+    local_until_ts = int(next_local_midnight.astimezone(timezone.utc).timestamp())
     local_day_str = local_target_date.isoformat()
     
     return DayBoundaries(

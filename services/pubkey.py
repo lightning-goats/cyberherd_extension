@@ -10,7 +10,7 @@ This avoids startup warnings like: "No effective pubkey available for event cach
 """
 from __future__ import annotations
 
-from typing import Optional, Any, Callable
+from typing import Optional
 import logging
 
 logger = logging.getLogger(__name__)
