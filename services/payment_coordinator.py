@@ -364,7 +364,26 @@ class PaymentCoordinatorService:
                 logger.warning(f"Zap request missing pubkey field (source: {zap_request_source})")
                 self.last_error = "missing_zapper_pubkey"
                 return False
-            
+
+            # The paid amount is authoritative (from the settled invoice), but the
+            # zapper *identity* comes from the caller-supplied zap request. Verify
+            # its schnorr signature so a crafted 9734 cannot enroll/credit an
+            # arbitrary pubkey (e.g. to headbutt a rival with someone else's name).
+            try:
+                from .nostr_helpers import verify_event_signature
+
+                if not verify_event_signature(zap_request):
+                    logger.warning(
+                        f"Zap request signature invalid; refusing to attribute zap to "
+                        f"{str(zapper_pubkey)[:16]}... (source: {zap_request_source})"
+                    )
+                    self.last_error = "invalid_zap_request_signature"
+                    return False
+            except Exception as e:
+                logger.debug(f"Zap request signature check error: {e}")
+                self.last_error = "zap_request_signature_error"
+                return False
+
             # Reject zaps from the effective pubkey (operator's own zaps)
             try:
                 eff_pub = resolve_effective_pubkey(settings)

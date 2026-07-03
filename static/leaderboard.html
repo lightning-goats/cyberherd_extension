@@ -174,9 +174,12 @@
 
         const queryParams = new URLSearchParams(window.location.search);
         let requestedPubkey = '';
-        let lnbitsHost = '';
-        let lnbitsPort = '';
-        let lnbitsSchemeOverride = null;
+        // The websocket target is always derived from the page's own origin.
+        // Accepting host/port/scheme from query params would let an attacker
+        // point the socket at a server they control and inject leaderboard
+        // rows that execute in this trusted origin — so the overrides are gone.
+        let lnbitsHost = window.location.hostname || '127.0.0.1';
+        let lnbitsPort = window.location.port || '';
         (function initFromPath() {
             const path = window.location.pathname || '';
             const params = new URLSearchParams(window.location.search);
@@ -187,12 +190,31 @@
             } else {
                 requestedPubkey = params.get('pubkey') || '';
             }
-            const inferredHost = window.location.hostname || '127.0.0.1';
-            const inferredPort = window.location.port || '';
-            lnbitsHost = params.get('lnbits_host') || inferredHost;
-            lnbitsPort = params.get('lnbits_port') || inferredPort;
-            lnbitsSchemeOverride = params.get('lnbits_scheme');
         })();
+
+        function escapeHtml(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        // Only allow http(s) image URLs; reject javascript:, data:, etc.
+        function safeImageUrl(value) {
+            const raw = String(value == null ? '' : value).trim();
+            if (!raw) return '';
+            try {
+                const u = new URL(raw, window.location.origin);
+                if (u.protocol === 'http:' || u.protocol === 'https:') {
+                    return u.href;
+                }
+            } catch (e) {
+                return '';
+            }
+            return '';
+        }
 
         let cachedEntries = [];
         let refreshTimer = null;
@@ -205,13 +227,7 @@
         }
 
         function resolveWebsocketScheme() {
-            if (!lnbitsSchemeOverride) {
-                return window.location.protocol === 'https:' ? 'wss' : 'ws';
-            }
-            if (lnbitsSchemeOverride.startsWith('http')) {
-                return lnbitsSchemeOverride.replace('http', 'ws');
-            }
-            return lnbitsSchemeOverride;
+            return window.location.protocol === 'https:' ? 'wss' : 'ws';
         }
 
         function buildLeaderboardWebSocketUrl(pubkey) {
@@ -245,14 +261,23 @@
 
             cachedEntries.forEach((entry, index) => {
                 const tr = document.createElement('tr');
+                // All member-supplied fields (display_name, picture, pubkey) come
+                // from arbitrary Nostr profile metadata and MUST be escaped/validated
+                // before being placed in the DOM.
+                const displayName = escapeHtml(entry.display_name || 'Anon');
+                const pictureUrl = safeImageUrl(entry.picture);
+                const pubkeyShort = entry.pubkey ? escapeHtml(String(entry.pubkey).slice(0, 8)) + '…' : '';
+                const avatar = pictureUrl
+                    ? `<img src="${escapeHtml(pictureUrl)}" alt="${displayName}" referrerpolicy="no-referrer" loading="lazy"/>`
+                    : `<div style="width:48px;height:48px;border-radius:50%;background:#1f2937;display:flex;align-items:center;justify-content:center;">🟣</div>`;
                 tr.innerHTML = `
                     <td data-label="Rank">${index + 1}</td>
                     <td data-label="Member">
                         <div class="member-info">
-                            ${entry.picture ? `<img src="${entry.picture}" alt="${entry.display_name}" referrerpolicy="no-referrer" loading="lazy"/>` : `<div style="width:48px;height:48px;border-radius:50%;background:#1f2937;display:flex;align-items:center;justify-content:center;">🟣</div>`}
+                            ${avatar}
                             <div>
-                                <div>${entry.display_name || 'Anon'}</div>
-                                <div style="font-size:0.8rem;color:#94a3b8;">${entry.pubkey ? entry.pubkey.slice(0, 8) + '…' : ''}</div>
+                                <div>${displayName}</div>
+                                <div style="font-size:0.8rem;color:#94a3b8;">${pubkeyShort}</div>
                             </div>
                         </div>
                     </td>

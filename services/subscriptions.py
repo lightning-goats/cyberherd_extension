@@ -995,6 +995,16 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
         if not eid or not pubkey:
             return
 
+        # Relay data is untrusted: verify the schnorr signature over the event id
+        # before it is allowed to drive membership. A forged kind 6/7/1 event with
+        # an arbitrary pubkey would otherwise grant free CyberHerd admission.
+        if not nostr_helpers.verify_event_signature(event):
+            logger.warning(
+                f"Rejecting event {eid[:16]}... kind={kind} from {pubkey[:16]}...: "
+                f"invalid or missing signature (user {user_id})"
+            )
+            return
+
         eff_pub = get_effective_pubkey(settings)
         tags = getattr(settings, "tracked_tags", [])
 

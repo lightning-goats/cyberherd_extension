@@ -36,12 +36,29 @@ _APP_REF = None
 
 
 def cyberherd_stop():
-    """Stop all cyberherd background tasks."""
+    """Stop all cyberherd background tasks.
+
+    Called by the LNbits core loader on extension deactivate/shutdown. Must
+    cancel *every* task we started (including the invoice listener and midnight
+    reset) and unregister the invoice listener, otherwise a disabled extension
+    keeps processing payments and moving funds.
+    """
     for task in scheduled_tasks:
         try:
             task.cancel()
         except Exception as ex:
             logger.warning(f"Error cancelling task: {ex}")
+    scheduled_tasks.clear()
+
+    # Unregister the invoice listener so paid invoices stop being routed to us.
+    try:
+        from lnbits.tasks import invoice_listeners
+        from .tasks import INVOICE_LISTENER_NAME
+
+        invoice_listeners.pop(INVOICE_LISTENER_NAME, None)
+        logger.info("Cyberherd: invoice listener unregistered")
+    except Exception as ex:
+        logger.warning(f"Cyberherd: failed to unregister invoice listener: {ex}")
 
 
 def cyberherd_start():
@@ -86,7 +103,9 @@ def cyberherd_start():
 
     # Ensure the invoice listener is active so realtime payments feed zap processing
     try:
-        start_invoice_listener()
+        inv_task = start_invoice_listener()
+        if inv_task is not None:
+            scheduled_tasks.append(inv_task)
         logger.info("✅ Cyberherd: Invoice listener task registered")
     except Exception as e:
         logger.error(f"Cyberherd: Failed to start invoice listener: {e}", exc_info=True)
@@ -95,7 +114,9 @@ def cyberherd_start():
     # where init_extension() is not invoked by the core loader.
     try:
         from .tasks import cyberherd_tasks as _cyberherd_tasks
-        _cyberherd_tasks(None)
+        reset_task = _cyberherd_tasks(None)
+        if reset_task is not None:
+            scheduled_tasks.append(reset_task)
         logger.info("✅ Cyberherd: Midnight reset scheduler initialized")
     except Exception as e:
         logger.error(f"Cyberherd: Failed to schedule midnight reset: {e}", exc_info=True)

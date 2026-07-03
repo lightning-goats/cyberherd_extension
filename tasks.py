@@ -211,19 +211,24 @@ async def process_incoming_payment(payment: Any, app: Any | None = None) -> None
         logger.error(f"CyberHerd: process_incoming_payment error: {exc}")
 
 
-def start_invoice_listener(app: Any | None = None) -> None:
-    """Register background invoice listener when enabled."""
+def start_invoice_listener(app: Any | None = None) -> Any | None:
+    """Register background invoice listener when enabled.
+
+    Returns the created task handle (or None if disabled) so the caller can
+    track it for cancellation on extension shutdown/deactivate.
+    """
     enabled = parse_bool_env("CYBERHERD_USE_INVOICE_LISTENER", True)
     if not enabled:
         logger.info("CyberHerd: invoice listener disabled via CYBERHERD_USE_INVOICE_LISTENER")
-        return
+        return None
 
     async def _handler(payment: Any) -> None:
         await process_incoming_payment(payment, app=app)
 
     listener = wait_for_paid_invoices(INVOICE_LISTENER_NAME, _handler)
-    create_permanent_unique_task(INVOICE_TASK_NAME, listener)
+    task = create_permanent_unique_task(INVOICE_TASK_NAME, listener)
     logger.info(f"CyberHerd: invoice listener registered as {INVOICE_LISTENER_NAME}")
+    return task
 
 
 def get_invoice_listener_status() -> dict[str, Any]:
@@ -416,19 +421,22 @@ async def wait_for_midnight():
     to determine the sleep interval. Logs include both local and UTC targets.
     """
     from datetime import timedelta
+    from .services.time_utils import _get_system_local_timezone
 
     now_utc = utc_now()
 
-    # Determine server local timezone and current local time
-    now_local = datetime.now().astimezone()
-    local_tz = now_local.tzinfo
+    # Determine server local timezone and current local time. Use a DST-aware
+    # named zone (not a fixed offset) so the reset fires at real local midnight
+    # on DST transition days.
+    local_tz = _get_system_local_timezone()
+    now_local = datetime.now(local_tz)
     local_tz_name = now_local.tzname() or "Local"
 
     # Build next local midnight using tz-aware time (handles DST correctly)
-    local_midnight = datetime.combine(now_local.date(), time(0, 0, tzinfo=local_tz))
+    local_midnight = datetime.combine(now_local.date(), time(0, 0), tzinfo=local_tz)
     if now_local >= local_midnight:
         next_date = (now_local + timedelta(days=1)).date()
-        local_midnight = datetime.combine(next_date, time(0, 0, tzinfo=local_tz))
+        local_midnight = datetime.combine(next_date, time(0, 0), tzinfo=local_tz)
 
     # Convert local target to UTC and compute sleep interval
     target_utc = local_midnight.astimezone(timezone.utc)
@@ -460,10 +468,11 @@ def cyberherd_tasks(app: Any | None = None):
     Creates a permanent unique task to schedule the midnight reset job.
     """
     logger.info("🔧 CyberHerd: Initializing background tasks...")
-    
+
+    reset_task = None
     try:
         # Schedule midnight reset job
-        create_permanent_unique_task("cyberherd_midnight_reset", schedule_midnight_reset)
+        reset_task = create_permanent_unique_task("cyberherd_midnight_reset", schedule_midnight_reset)
         logger.success("✅ CyberHerd: Midnight reset task created successfully (task_id='cyberherd_midnight_reset')")
         
         # Log next scheduled run time using local midnight converted to UTC
@@ -489,3 +498,5 @@ def cyberherd_tasks(app: Any | None = None):
     except Exception as e:
         logger.error(f"❌ CyberHerd: Failed to create midnight reset task: {e}")
         raise
+
+    return reset_task

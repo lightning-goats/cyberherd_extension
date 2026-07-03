@@ -478,6 +478,9 @@ async def test_process_note_for_tracked_tags_returns_whether_note_was_tracked(
     monkeypatch.setattr(subscriptions.crud, "get_settings", fake_get_settings)
     monkeypatch.setattr(subscriptions, "get_effective_pubkey", lambda _settings: "b" * 64)
     monkeypatch.setattr(subscriptions, "_append_today", fake_append_today)
+    # Signature verification is an orthogonal trust-boundary check exercised by
+    # its own test; the mock event here is unsigned, so stub it as valid.
+    monkeypatch.setattr(subscriptions.nostr_helpers, "verify_event_signature", lambda event: True)
 
     tracked = await subscriptions.process_note_for_tracked_tags(
         user_id="user-id",
@@ -824,6 +827,9 @@ async def test_payment_zap_uses_relay_hints_for_opportunistic_tracking(monkeypat
         "_ensure_note_tracked",
         fake_ensure_note_tracked,
     )
+    # Zap-request signature verification is covered by its own test; stub it
+    # here since this mock zap request is unsigned.
+    monkeypatch.setattr(subscriptions.nostr_helpers, "verify_event_signature", lambda event: True)
 
     monitor = payment_coordinator.PaymentCoordinatorService(user_id="user-id")
 
@@ -901,6 +907,9 @@ async def test_payment_recovery_rejects_previous_day_tracked_note_for_new_member
         "resolve_effective_pubkey",
         lambda _settings: target_pubkey,
     )
+    # This test exercises the note-currency gate; stub the orthogonal signature
+    # check so the unsigned mock zap request reaches it.
+    monkeypatch.setattr(subscriptions.nostr_helpers, "verify_event_signature", lambda event: True)
 
     monitor = payment_coordinator.PaymentCoordinatorService(user_id="user-id")
 
@@ -912,3 +921,51 @@ async def test_payment_recovery_rejects_previous_day_tracked_note_for_new_member
     assert monitor.last_error == "note_not_current"
     assert captured["registered"] == 0
     assert captured["headbutts"] == 0
+
+
+def _signed_event(priv, *, kind=7, tags=None, content="+", created_at=1777788010):
+    import hashlib
+    pub = priv.public_key_xonly.format().hex()
+    tags = tags if tags is not None else [["e", "a" * 64], ["p", "b" * 64]]
+    serialized = json.dumps(
+        [0, pub, created_at, kind, tags, content],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    eid = hashlib.sha256(serialized).hexdigest()
+    sig = priv.sign_schnorr(bytes.fromhex(eid)).hex()
+    return {
+        "id": eid,
+        "pubkey": pub,
+        "created_at": created_at,
+        "kind": kind,
+        "tags": tags,
+        "content": content,
+        "sig": sig,
+    }
+
+
+def test_verify_event_signature_accepts_genuine_and_rejects_forged():
+    """The trust-boundary check must accept real events and reject forgeries."""
+    import coincurve
+    from lnbits.extensions.cyberherd.services.nostr_helpers import (
+        verify_event_signature,
+    )
+
+    priv = coincurve.PrivateKey()
+    ev = _signed_event(priv)
+
+    # Genuine, correctly-signed event is accepted.
+    assert verify_event_signature(ev) is True
+
+    # Tampered content (id/sig no longer match) is rejected.
+    assert verify_event_signature({**ev, "content": "malicious"}) is False
+
+    # Attacker keeps a valid sig but claims a different pubkey — rejected.
+    assert verify_event_signature({**ev, "pubkey": "c" * 64}) is False
+
+    # Missing signature — rejected (fail closed).
+    assert verify_event_signature({k: v for k, v in ev.items() if k != "sig"}) is False
+
+    # Event without an advertised id but a valid signature — accepted.
+    assert verify_event_signature({k: v for k, v in ev.items() if k != "id"}) is True

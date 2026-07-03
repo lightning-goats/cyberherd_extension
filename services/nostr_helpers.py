@@ -15,6 +15,7 @@ Public API Functions:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import secrets
 from typing import Any, Iterable
@@ -33,6 +34,54 @@ try:
     _NOSTRCLIENT_AVAILABLE = True
 except Exception as e:
     logger.debug(f"Nostrclient not available: {e}")
+
+# Schnorr verification primitive (coincurve ships with nostrclient).
+try:
+    import coincurve as _coincurve
+except Exception as e:  # pragma: no cover - coincurve is a nostrclient dependency
+    _coincurve = None
+    logger.warning(f"coincurve unavailable; Nostr event signatures cannot be verified: {e}")
+
+
+def verify_event_signature(event: dict) -> bool:
+    """Verify a Nostr event's id and schnorr signature (NIP-01).
+
+    Relay data is untrusted: a malicious or buggy relay can deliver events
+    claiming any ``pubkey``. Before an event is allowed to drive CyberHerd
+    membership (kind 6/7 engagement, kind 1/30311 tracked notes) we recompute
+    the event id and verify the signature over it against the claimed pubkey.
+
+    Returns True only when the signature is cryptographically valid. Fails
+    closed on any malformed field or missing crypto primitive.
+    """
+    if _coincurve is None:
+        return False
+    try:
+        pubkey = event.get("pubkey")
+        sig = event.get("sig")
+        if not pubkey or not sig:
+            return False
+        created_at = int(event.get("created_at"))
+        kind = int(event.get("kind"))
+        tags = event.get("tags") or []
+        content = event.get("content")
+        if content is None:
+            content = ""
+        serialized = json.dumps(
+            [0, pubkey, created_at, kind, tags, content],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+        computed_id = hashlib.sha256(serialized).hexdigest()
+        # If the event advertises an id, it must match the recomputed one.
+        claimed_id = event.get("id")
+        if claimed_id and claimed_id != computed_id:
+            return False
+        pub = _coincurve.PublicKeyXOnly(bytes.fromhex(pubkey))
+        return bool(pub.verify(bytes.fromhex(sig), bytes.fromhex(computed_id)))
+    except Exception as e:
+        logger.debug(f"Event signature verification error: {e}")
+        return False
 
 
 # ============================================================================

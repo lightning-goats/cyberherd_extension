@@ -3221,6 +3221,11 @@ async def _get_detected_cyberherd_notes_for_settings(settings, since_days_ago: i
             
             # If no tags configured, accept all notes from author
             # Otherwise, match if: (1) any tag appears in t-tags, OR (2) any tag appears as #tag in content
+            # Initialise before the branch: with no tags configured these stay
+            # False, and the debug log further down would otherwise raise
+            # NameError — silently making every no-tag config detect zero notes.
+            has_t_tag = False
+            has_content_hashtag = False
             if not tags_lower:
                 # No tags set - accept any note from author
                 pass
