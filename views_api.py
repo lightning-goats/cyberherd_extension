@@ -1011,7 +1011,7 @@ async def api_get_settings(request: Request, auth=Depends(auth_wallet_or_admin_d
         )
     except Exception:
         pass
-    # Compute effective nostr pubkey: override if set, else from nsecbunker
+    # Compute effective nostr pubkey: override if set, else from nsec_oracle
     # Unified resolver (uses cached/override/legacy/derived)
     effective_pubkey = resolve_effective_pubkey(settings)
     try:
@@ -1050,7 +1050,7 @@ async def api_bunker_status(
     request: Request,
     wallet_info: WalletTypeInfo = Depends(require_admin_key),
 ):
-    """Check nsecbunker signing availability for this user's herd wallet."""
+    """Check nsec_oracle signing availability for this user's herd wallet."""
     user_id = wallet_info.wallet.user
     settings = await crud.get_settings(user_id)
     herd_wallet = getattr(settings, "herd_wallet", None)

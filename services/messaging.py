@@ -929,7 +929,7 @@ async def publish_shared_template(
                      from websocket type names.
         reply_to_30311_event: Optional event ID of the kind 30311 note being replied to
         reply_to_30311_a_tag: Optional `a` tag address for the kind 30311 note
-        wallet_id: Wallet ID for nsecbunker signing (mandatory)
+        wallet_id: Wallet ID for nsec_oracle signing (mandatory)
     """
     if not _messaging_available or _msg_crud is None or _msg is None:
         logger.debug("Messaging not available, skipping shared template publication")
@@ -1091,7 +1091,7 @@ async def try_publish_note(
         websocket_topic: WebSocket topic/wallet ID to broadcast to (default: "cyberherd")
         reply_to_30311_event: Optional event ID of the kind 30311 note being replied to
         reply_to_30311_a_tag: Optional `a` tag address for the kind 30311 note
-        wallet_id: Wallet ID for nsecbunker signing (mandatory)
+        wallet_id: Wallet ID for nsec_oracle signing (mandatory)
     """
     if not _messaging_available or _msg is None:
         logger.debug("Messaging not available, skipping note publication")
@@ -1262,7 +1262,7 @@ async def publish_event_message(
         websocket_topic: WebSocket topic/wallet ID to broadcast to (default: "cyberherd")
         reply_to_30311_event: Optional event ID for kind 30311 threading
         reply_to_30311_a_tag: Optional `a` tag address for kind 30311 threading
-        wallet_id: Wallet ID for nsecbunker signing (mandatory)
+        wallet_id: Wallet ID for nsec_oracle signing (mandatory)
     """
     values = values or {}
 

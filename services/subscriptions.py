@@ -426,7 +426,7 @@ async def _append_today(user_id: str | None, eff_pub: str | None, tags: list[str
         logger.warning(
             f"📝 Cannot validate event {eid[:16] if eid else 'unknown'}... - "
             f"no effective pubkey configured for user {user_id}. "
-            f"Check nostr_pubkey_override or nsecbunker settings."
+            f"Check nostr_pubkey_override or nsec_oracle settings."
         )
         return False
     if event_pubkey != eff_pub:
@@ -1603,7 +1603,7 @@ async def process_note_for_tracked_tags(user_id: str, event: dict, app=None):
         if not eff_pub:
             logger.warning(
                 f"No effective pubkey available for user {user_id}. "
-                f"Cannot track notes. Check nostr_pubkey_override or nsecbunker settings."
+                f"Cannot track notes. Check nostr_pubkey_override or nsec_oracle settings."
             )
             return False
         

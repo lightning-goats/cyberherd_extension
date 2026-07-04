@@ -100,22 +100,22 @@
               <q-badge v-else-if="cyberherdData.ui.bunkerStatus && cyberherdData.ui.bunkerStatus.installed"
                 color="grey" text-color="white" class="q-mr-sm">Bunker: NO KEY</q-badge>
               <template v-if="!(cyberherdData.ui.bunkerStatus && cyberherdData.ui.bunkerStatus.installed && cyberherdData.ui.bunkerStatus.has_key && cyberherdData.ui.bunkerStatus.has_permissions)">
-                <q-badge color="orange-6" text-color="white" class="q-mr-sm">Configure nsecbunker to enable signing</q-badge>
+                <q-badge color="orange-6" text-color="white" class="q-mr-sm">Configure Nsec Oracle to enable signing</q-badge>
               </template>
             </div>
             <template v-if="cyberherdData.ui.bunkerStatus && cyberherdData.ui.bunkerStatus.installed && cyberherdData.ui.bunkerStatus.has_key && cyberherdData.ui.bunkerStatus.has_permissions">
               <div class="col-12">
-                <span class="text-caption text-blue">Signing handled by nsecbunker</span>
+                <span class="text-caption text-blue">Signing handled by Nsec Oracle</span>
               </div>
             </template>
             <template v-else>
               <div class="col-12">
-                <span class="text-caption text-orange">Configure nsecbunker extension to enable Nostr signing</span>
+                <span class="text-caption text-orange">Configure Nsec Oracle extension to enable Nostr signing</span>
               </div>
             </template>
             <div class="col-12">
               <q-input filled dense readonly :model-value="(cyberherdData.ui.bunkerStatus && cyberherdData.ui.bunkerStatus.pubkey) || cyberherdData.form.effective_nostr_pubkey"
-                label="Effective watch pubkey (hex)" hint="derived from pubkey override or nsecbunker" />
+                label="Effective watch pubkey (hex)" hint="derived from pubkey override or Nsec Oracle" />
             </div>
           </div>
 
