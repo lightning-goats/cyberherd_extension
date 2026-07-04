@@ -4,7 +4,13 @@
   "short_description": "Cyberherd extension (local development)",
   "tile": "/cyberherd/static/tile.png",
   "min_lnbits_version": "1.3.0",
-  "contributors": [],
+  "contributors": [
+    {
+      "name": "Sat",
+      "uri": "https://github.com/santyr",
+      "role": "Author"
+    }
+  ],
   "images": [],
   "license": "MIT",
   "nostr_signing": [
@@ -13,14 +19,20 @@
       "kind_label": "Short Text Note",
       "description": "Delegates to cyberherd_messaging for publishing Nostr notes about herd activity.",
       "required": false,
-      "recommended_rate_limit": {"count": 200, "seconds": 86400}
+      "recommended_rate_limit": {
+        "count": 200,
+        "seconds": 86400
+      }
     },
     {
       "kind": 1311,
       "kind_label": "Live Event Chat Reply",
       "description": "Delegates to cyberherd_messaging for posting live event thread replies.",
       "required": false,
-      "recommended_rate_limit": {"count": 200, "seconds": 86400}
+      "recommended_rate_limit": {
+        "count": 200,
+        "seconds": 86400
+      }
     }
   ]
 }
