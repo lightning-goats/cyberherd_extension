@@ -303,6 +303,29 @@ def _local_midnight_timestamp() -> int:
             return 0
 
 
+def _event_created_before_todays_reset(event: dict, settings) -> bool:
+    """True when a kind 6/7 engagement event predates today's daily reset.
+
+    A tracked #CyberHerd note can remain in ``tracked_event_ids`` across days, so
+    an OLD repost/reaction referencing it would otherwise be re-processed as a
+    new join every time a relay re-delivers it (subscription refresh / startup /
+    reconnect) — the extension "sees old events as new". When the daily midnight
+    reset is enabled (the default), only same-day engagement counts, so events
+    created before today's reset are skipped. The persistent processed-event
+    dedup still guards same-day re-delivery; this guards cross-day resurrection.
+    """
+    try:
+        if not getattr(settings, "midnight_reset_enabled", True):
+            return False
+        created_at = int(event.get("created_at") or 0)
+        if not created_at:
+            return False
+        day_start = _local_midnight_timestamp()
+        return bool(day_start) and created_at < day_start
+    except Exception:
+        return False
+
+
 # ---------------- Cache helpers ----------------
 def _get_cache(app) -> dict:
     # If no app or app.state is provided, fall back to a module-level cache
@@ -1038,10 +1061,17 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                 return False
             
             logger.info(f"🔄 Processing kind 6 repost event {eid[:16] if eid else 'unknown'}... for user {user_id} from pubkey {pubkey[:16]}...")
-            
-            # No timestamp check for kind 6 - we only care if it references a tracked event ID.
-            # The tracked event IDs themselves are already filtered to today's window when detected.
-            
+
+            # Only today's engagement counts. A tracked note can persist across
+            # days, so an old repost referencing it must not be re-processed as a
+            # new join when a relay re-delivers it on reconnect/startup.
+            if _event_created_before_todays_reset(event, settings):
+                logger.info(
+                    f"⏭️ Skipping stale kind 6 repost {eid[:16]}... "
+                    f"(created before today's reset) for user {user_id}"
+                )
+                return False
+
             cache = _get_cache(app)
             
             # Get current tracked event IDs for debugging
@@ -1151,10 +1181,17 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                 return False
             
             logger.info(f"🔍 Processing kind 7 reaction event {eid[:16] if eid else 'unknown'}... for user {user_id}")
-            
-            # No timestamp check for kind 7 - we only care if it references a tracked event ID.
-            # The tracked event IDs themselves are already filtered to today's window when detected.
-            
+
+            # Only today's engagement counts. A tracked note can persist across
+            # days, so an old reaction referencing it must not be re-processed as
+            # a new join when a relay re-delivers it on reconnect/startup.
+            if _event_created_before_todays_reset(event, settings):
+                logger.info(
+                    f"⏭️ Skipping stale kind 7 reaction {eid[:16]}... "
+                    f"(created before today's reset) for user {user_id}"
+                )
+                return False
+
             cache = _get_cache(app)
             identifiers = _collect_reference_identifiers(event, include_content=False)
             logger.info(f"📋 Found {len(identifiers)} reference identifiers in kind 7 event: {identifiers}")
