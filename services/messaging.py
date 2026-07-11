@@ -180,12 +180,22 @@ def _build_websocket_values(event_type: str, values: dict[str, Any] | None) -> d
     except Exception:
         ch_item = {}
 
+    def _not_mention(val: Any) -> str | None:
+        # Never let a nostr:npub / nostr:nprofile identifier stand in as a
+        # display name — the websocket overlay must show human-readable names.
+        if not val:
+            return None
+        s = str(val)
+        if "nostr:" in s or s.startswith(("npub1", "nprofile1")):
+            return None
+        return s
+
     display_name = (
-        ch_item.get("display_name")
-        or websocket_values.get("member_display_name")
-        or websocket_values.get("display_name")
-        or websocket_values.get("member_name")
-        or websocket_values.get("name")
+        _not_mention(ch_item.get("display_name"))
+        or _not_mention(websocket_values.get("member_display_name"))
+        or _not_mention(websocket_values.get("display_name"))
+        or _not_mention(websocket_values.get("member_name"))
+        or _not_mention(websocket_values.get("name"))
     )
     if not display_name:
         return websocket_values
