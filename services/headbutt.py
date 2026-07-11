@@ -1992,6 +1992,53 @@ class EnhancedHeadbuttService:
         event_type_override: str | None = None,
     ):
         try:
+            # A failed headbutt is a definitive, one-time outcome. Mark the
+            # triggering event processed so it is never re-published on a later
+            # poll cycle or during startup recovery. Without this a failed
+            # repost/reaction is re-processed every cycle (and replayed in bulk
+            # on restart, each attempt picking a random template), spamming the
+            # thread with duplicate rejections.
+            dedup_event_id = getattr(attacker, "event_id", None)
+            dedup_note_id = getattr(attacker, "note", None) or getattr(attacker, "note_id", None)
+
+            async def _mark_failure_processed():
+                if not (dedup_event_id and self.user_id):
+                    return
+                try:
+                    await crud.register_processed_event(
+                        self.user_id,
+                        dedup_event_id,
+                        note_id=dedup_note_id,
+                        pubkey=getattr(attacker, "pubkey", None),
+                        event_type="headbutt_failure",
+                    )
+                except Exception:
+                    logger.warning(
+                        f"Failed to register processed event {dedup_event_id} after headbutt failure"
+                    )
+
+            # Already handled by another path (realtime vs recovery race, or a
+            # prior cycle) — don't publish a duplicate.
+            if dedup_event_id and self.user_id:
+                try:
+                    if await crud.is_event_processed(
+                        str(self.user_id), dedup_event_id, note_id=dedup_note_id
+                    ):
+                        logger.debug(
+                            "Skipping headbutt failure publish for already-processed event %s",
+                            dedup_event_id,
+                        )
+                        return
+                except Exception:
+                    pass
+
+            # Startup recovery reconciles historical state silently: register the
+            # event so it isn't published live later, but don't emit a stale
+            # rejection note now.
+            if getattr(self, "recovery_mode", False):
+                await _mark_failure_processed()
+                return
+
             existing_attacker = None
             existing_victim = None
             # Get nprofile for attacker
@@ -2124,6 +2171,9 @@ class EnhancedHeadbuttService:
             )
             if success:
                 logger.info(f"cyberherd: {template_key} message published")
+                # Mark processed so this failed headbutt isn't republished on the
+                # next poll cycle or during startup recovery.
+                await _mark_failure_processed()
             else:
                 logger.warning(f"cyberherd: {template_key} message publish returned False")
         except Exception as e:
