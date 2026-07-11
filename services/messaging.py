@@ -55,6 +55,8 @@ _MEMBERSHIP_EVENTS = {
     "member_increase",
     "kind_6_repost",
     "kind_7_reaction",
+    "existing_member_repost",
+    "existing_member_reaction",
 }
 
 
@@ -600,6 +602,10 @@ async def make_messages(event_type: str, **kwargs) -> dict:
         # Repost / reaction specific categories (use exact categories available in cyberherd_messaging)
         "kind_6_repost": "kind_6_repost",
         "kind_7_reaction": "kind_7_reaction",
+        # Existing members re-engaging (already in the herd) — distinct from the
+        # new-join categories above so the message doesn't welcome them as new.
+        "existing_member_repost": "existing_member_repost",
+        "existing_member_reaction": "existing_member_reaction",
         "zapper_displaces_kind_6": "zapper_displaces_kind_6",
         "zapper_displaces_kind_7": "zapper_displaces_kind_7",
         "kind_6_headbutt_failure": "kind_6_headbutt_failure",
@@ -1280,6 +1286,10 @@ async def publish_event_message(
         # Repost / reaction categories map to their own template categories in the messaging extension
         "kind_6_repost": "kind_6_repost",
         "kind_7_reaction": "kind_7_reaction",
+        # Existing members re-engaging (already in the herd) — distinct from the
+        # new-join categories above so the message doesn't welcome them as new.
+        "existing_member_repost": "existing_member_repost",
+        "existing_member_reaction": "existing_member_reaction",
         "zapper_displaces_kind_6": "zapper_displaces_kind_6",
         "zapper_displaces_kind_7": "zapper_displaces_kind_7",
         "kind_6_headbutt_failure": "kind_6_headbutt_failure",

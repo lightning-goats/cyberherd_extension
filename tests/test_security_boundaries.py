@@ -1118,6 +1118,81 @@ async def test_reaction_cannot_headbutt_when_herd_full(monkeypatch):
     assert notified.get("failed") is True
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "kind,expected_event_type",
+    [(7, "existing_member_reaction"), (6, "existing_member_repost")],
+)
+async def test_existing_member_reengagement_uses_existing_member_category(
+    monkeypatch, kind, expected_event_type
+):
+    """Regression: an EXISTING herd member who reposts/reacts again must NOT be
+    welcomed as a new join.
+
+    The new-join categories (kind_6_repost / kind_7_reaction) carry "has joined"
+    templates and are reserved for genuinely new members. When an already-active,
+    already-zapped member reposts or reacts, the message must route to a dedicated
+    existing-member category (existing_member_repost / existing_member_reaction)."""
+    note_id = "a" * 64
+    attacker_pubkey = "d" * 64
+    existing_row = {
+        "pubkey": attacker_pubkey,
+        "amount": 500,          # already zapped -> active paying member
+        "kinds": "9735",
+        "is_active": 1,
+        "display_name": "Member",
+        "nprofile": None,
+    }
+    published = {}
+
+    class FakeDb:
+        async def get_settings(self, user_id):
+            return _settings()
+
+        async def get_active_cyberherd_members(self, user_id=None):
+            return [existing_row]
+
+        async def get_cyberherd_member_by_pubkey(self, pubkey, user_id=None):
+            return dict(existing_row)
+
+        async def update_and_activate_member(self, pubkey, amount, user_id=None, kinds=None):
+            return None
+
+    async def fake_is_pubkey_banned(pubkey, user_id):
+        return False
+
+    async def fake_publish(self, event_type, **kwargs):
+        published["event_type"] = event_type
+
+    async def fake_post_admission(self, *a, **k):
+        return None
+
+    monkeypatch.setattr(headbutt.crud, "is_pubkey_banned", fake_is_pubkey_banned)
+    monkeypatch.setattr(
+        headbutt.EnhancedHeadbuttService, "_publish_membership_event", fake_publish
+    )
+    monkeypatch.setattr(
+        headbutt.EnhancedHeadbuttService, "_post_admission_tasks", fake_post_admission
+    )
+
+    service = headbutt.EnhancedHeadbuttService(
+        db=FakeDb(), messaging_module=SimpleNamespace(), user_id="user-id"
+    )
+    attacker = headbutt._Attacker(
+        pubkey=attacker_pubkey, amount=0, kinds=[kind], note_id=note_id, event_id="e" * 64
+    )
+
+    result = await service.attempt_headbutt(attacker)
+
+    assert result == {
+        "updated": attacker_pubkey,
+        "reason": "cumulative_zap",
+        "status": "updated",
+    }
+    # Must NOT be the new-join category (kind_6_repost / kind_7_reaction).
+    assert published.get("event_type") == expected_event_type
+
+
 # ---------------------------------------------------------------------------
 # Realtime detection hardening: dedup-after-act and proxy-stall detection
 # ---------------------------------------------------------------------------

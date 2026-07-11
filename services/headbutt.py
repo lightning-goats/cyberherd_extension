@@ -982,12 +982,15 @@ class EnhancedHeadbuttService:
                 
                 # Select the appropriate event_type for messaging:
                 # - For new members: use "new_member" (generic) since we want consistent welcome messages
-                # - For existing members: use specific types if triggered by repost/reaction
+                # - For existing members: use dedicated existing-member categories for
+                #   repost/reaction so the message acknowledges continued support rather
+                #   than welcoming them as a new join. (kind_6_repost / kind_7_reaction
+                #   stay reserved for genuinely NEW members in _maybe_publish_new_member.)
                 if base_event_type == "member_increase":
                     if is_repost:
-                        event_type = "kind_6_repost"  # Existing member reposted
+                        event_type = "existing_member_repost"  # Existing member reposted again
                     elif is_reaction:
-                        event_type = "kind_7_reaction"  # Existing member reacted
+                        event_type = "existing_member_reaction"  # Existing member reacted again
                     else:
                         event_type = "member_increase"  # Existing member zapped (or other)
                 else:
