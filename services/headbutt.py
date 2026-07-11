@@ -462,6 +462,29 @@ def _normalize_event_id(value: Any) -> str | None:
     return None
 
 
+def _ensure_nprofile(nprofile: Any, pubkey: Any) -> str | None:
+    """Return an nprofile, deriving one from a hex pubkey when none is given."""
+    if nprofile:
+        return str(nprofile)
+    if pubkey and isinstance(pubkey, str) and re.fullmatch(r"[0-9a-f]{64}", pubkey.lower()):
+        try:
+            from ..utils.tlv import hex_to_nprofile  # type: ignore
+
+            return hex_to_nprofile(pubkey)
+        except Exception:
+            return None
+    return None
+
+
+def _nostr_mention(nprofile: Any, display_name: Any) -> str:
+    """Format a Nostr @-mention (``nostr:{nprofile}``), falling back to the
+    display name when no nprofile is available."""
+    if nprofile:
+        s = str(nprofile)
+        return s if s.startswith("nostr:") else f"nostr:{s}"
+    return str(display_name) if display_name else "Anon"
+
+
 
 
 
@@ -1990,8 +2013,41 @@ class EnhancedHeadbuttService:
                 except Exception:
                     victim_nprofile = None
             
-            attacker_name = getattr(attacker, "display_name", None) or "Anon"
+            # Resolve the attacker's display name. A failed headbutt never goes
+            # through _handle_attacker_admission, so attacker.display_name is
+            # usually unset here (especially for reposts/reactions) — resolve it
+            # from metadata/DB so the message shows a real name, not "Anon".
+            attacker_name = getattr(attacker, "display_name", None)
+            if not attacker_name or attacker_name == "Anon":
+                if existing_attacker is None:
+                    try:
+                        existing_attacker = await self.db.get_cyberherd_member_by_pubkey(
+                            attacker.pubkey, user_id=self.user_id
+                        )
+                    except Exception:
+                        existing_attacker = None
+                attacker_name = existing_attacker.get("display_name") if existing_attacker else None
+                if not attacker_name:
+                    try:
+                        metadata, _src = await self._resolve_attacker_metadata(attacker)
+                        if metadata and metadata.get("display_name"):
+                            attacker_name = metadata.get("display_name")
+                    except Exception:
+                        pass
+                if attacker_name and not getattr(attacker, "display_name", None):
+                    attacker.display_name = attacker_name
+            attacker_name = attacker_name or "Anon"
             victim_name = victim.get("display_name") or "Anon"
+
+            # Derive nprofiles (from a hex pubkey when the row lacks one) so the
+            # Nostr note can @-mention both parties like other message types do.
+            attacker_nprofile = _ensure_nprofile(attacker_nprofile, getattr(attacker, "pubkey", None))
+            victim_nprofile = _ensure_nprofile(victim_nprofile, victim.get("pubkey"))
+
+            # Nostr-facing names are nprofile mentions; the websocket render swaps
+            # these back to the *_display_name values for the live-stream overlay.
+            attacker_mention = _nostr_mention(attacker_nprofile, attacker_name)
+            victim_mention = _nostr_mention(victim_nprofile, victim_name)
 
             attacker_amount = int(getattr(attacker, "amount", 0) or 0)
             victim_amount = int(victim.get("amount", 0) or 0)
@@ -2009,18 +2065,20 @@ class EnhancedHeadbuttService:
             )
 
             values = {
-                "attacker_name": attacker_name,
+                "attacker_name": attacker_mention,
+                "attacker_display_name": attacker_name,
                 "attacker_amount": attacker_amount,
                 "attacker_pubkey": getattr(attacker, "pubkey", None),
                 "attacker_nprofile": attacker_nprofile,
-                "victim_name": victim_name,
+                "victim_name": victim_mention,
+                "victim_display_name": victim_name,
                 "victim_amount": victim_amount,
                 "victim_pubkey": victim.get("pubkey"),
                 "victim_nprofile": victim_nprofile,
                 "required_amount": required_sats,
                 "required_sats": required_sats,
                 "difference": difference_needed,
-                "name": attacker_name,
+                "name": attacker_mention,
                 "event_id": getattr(attacker, "event_id", None),
                 "note_id": note_id,
             }
@@ -2110,6 +2168,13 @@ class EnhancedHeadbuttService:
                 else None
             ) or "Anon"
 
+            # Derive nprofiles and Nostr mentions (the ws render swaps mentions
+            # back to the *_display_name values for the live-stream overlay).
+            attacker_nprofile = _ensure_nprofile(attacker_nprofile, getattr(attacker, "pubkey", None))
+            victim_nprofile = _ensure_nprofile(victim_nprofile, victim_pubkey)
+            attacker_mention = _nostr_mention(attacker_nprofile, attacker_name)
+            victim_mention = _nostr_mention(victim_nprofile, victim_name)
+
             attacker_amount = int(getattr(attacker, "amount", 0) or 0)
             victim_amount = (
                 int(victim.get("amount", 0) or 0) if isinstance(victim, dict) else 0
@@ -2134,15 +2199,17 @@ class EnhancedHeadbuttService:
             )
 
             values = {
-                "attacker_name": attacker_name,
+                "attacker_name": attacker_mention,
+                "attacker_display_name": attacker_name,
                 "attacker_amount": attacker_amount,
                 "attacker_pubkey": getattr(attacker, "pubkey", None),
                 "attacker_nprofile": attacker_nprofile,
-                "victim_name": victim_name,
+                "victim_name": victim_mention,
+                "victim_display_name": victim_name,
                 "victim_amount": victim_amount,
                 "victim_pubkey": victim_pubkey,
                 "victim_nprofile": victim_nprofile,
-                "name": attacker_name,
+                "name": attacker_mention,
                 "event_id": getattr(attacker, "event_id", None),
                 "note_id": note_id,
             }
