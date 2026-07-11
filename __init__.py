@@ -5,9 +5,8 @@ Nostr-based event monitoring for zaps, reposts, and reactions.
 
 import asyncio
 import os
-import logging
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 from fastapi import APIRouter, Request, Depends
 from starlette.requests import HTTPConnection
