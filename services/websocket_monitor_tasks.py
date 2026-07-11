@@ -39,6 +39,21 @@ async def handle_websocket_monitors(app):
     try:
         while True:
             try:
+                # Adopt an app reference if one has been captured since the last
+                # cycle (the core loader may not have provided app context at
+                # startup; _capture_app_ref sets it from the first request).
+                if app is None:
+                    try:
+                        import lnbits.extensions.cyberherd as _cyb_pkg
+                        captured = getattr(_cyb_pkg, "_APP_REF", None)
+                        if captured is not None:
+                            app = captured
+                            logger.info(
+                                "Cyberherd: WebSocket monitor manager adopted app context"
+                            )
+                    except Exception:
+                        pass
+
                 # Get all user settings
                 all_settings = await get_all_settings()
                 

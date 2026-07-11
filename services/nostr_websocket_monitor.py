@@ -92,7 +92,19 @@ class NostrWebSocketMonitor:
         self.dedup_ttl_seconds = 300
         # Last cleanup time for processed event IDs
         self.last_dedup_cleanup = time.time()
-        
+
+        # Liveness tracking to detect a silently-stalled proxy WebSocket.
+        # last_ws_event_at: last time ANY event arrived over the WS.
+        # last_reliable_event_at: last time the reliable poll processed a fresh
+        # event (one the WS had not already handled). If the poll keeps finding
+        # fresh events while the WS delivers none, the proxy forwarding has
+        # stalled on an otherwise-healthy socket and we force a reconnect.
+        self.last_ws_event_at = time.time()
+        self.last_reliable_event_at = 0.0
+        self.ws_stall_threshold_seconds = max(
+            0, parse_int_env("CYBERHERD_WS_STALL_THRESHOLD_SECONDS", 90)
+        )
+
         logger.debug(f"🔌 NostrWebSocketMonitor created for user {user_id}")
     
     def clear_processed_cache(self):
@@ -267,6 +279,46 @@ class NostrWebSocketMonitor:
         # Remove from tracking regardless of whether sending CLOSE succeeded
         self.subscriptions.pop(sub_id, None)
 
+    def _ws_appears_stalled(self, now: float) -> bool:
+        """Return True when the proxy WebSocket appears silently stalled.
+
+        The signal is a divergence: the reliable poll has processed a fresh event
+        recently (within the threshold) while the WS socket has delivered no event
+        for longer than the threshold. During genuinely quiet periods both are
+        silent, so this does not fire. Disabled when the stall threshold or the
+        realtime poll interval is 0.
+        """
+        if self.ws_stall_threshold_seconds <= 0 or REALTIME_NOTE_POLL_INTERVAL_SECONDS <= 0:
+            return False
+        if self.last_reliable_event_at <= 0:
+            return False
+        ws_silent_for = now - self.last_ws_event_at
+        poll_fresh_ago = now - self.last_reliable_event_at
+        return (
+            ws_silent_for > self.ws_stall_threshold_seconds
+            and poll_fresh_ago < self.ws_stall_threshold_seconds
+        )
+
+    async def _force_reconnect(self):
+        """Close the current socket so the reconnect loop rebuilds it.
+
+        Used when the proxy WebSocket appears to have silently stopped forwarding
+        events (socket healthy, no EVENTs) while the reliable poll still sees
+        fresh events. Closing makes ws.recv() raise, breaking the message loop so
+        _connect_to_relay reconnects, which re-subscribes and runs recovery.
+        """
+        # Reset the marker so we do not immediately re-trigger before the new
+        # connection has had a chance to deliver events.
+        self.last_ws_event_at = time.time()
+        ws = self.ws
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception as e:
+                logger.debug(
+                    f"User {self.user_id}: error during forced reconnect close: {e}"
+                )
+
     async def _handle_subscription_timeouts(self):
         """Monitor new subscriptions and refresh if handshakes never complete.
         
@@ -284,6 +336,20 @@ class NostrWebSocketMonitor:
                     continue
 
                 now = time.time()
+
+                # Liveness: if the reliable poll keeps finding fresh events but
+                # the WS has delivered none for a while, nostrclient's proxy
+                # forwarding has silently stalled on an otherwise-healthy socket.
+                # Force a reconnect (which re-subscribes and runs recovery).
+                if self._ws_appears_stalled(now):
+                    logger.warning(
+                        f"User {self.user_id}: proxy WebSocket delivered no events "
+                        f"for {int(now - self.last_ws_event_at)}s while the reliable "
+                        f"poll is active; forcing reconnect (suspected silent "
+                        f"forwarding stall)"
+                    )
+                    await self._force_reconnect()
+                    continue
 
                 # If we're connected but have no active subscriptions, refresh.
                 if not self.subscriptions:
@@ -375,7 +441,10 @@ class NostrWebSocketMonitor:
             if not isinstance(event, dict):
                 continue
             try:
-                await self._process_event(event)
+                if await self._process_event(event):
+                    # The reliable poll found and acted on a fresh event; used by
+                    # the watchdog to detect a silently-stalled proxy WebSocket.
+                    self.last_reliable_event_at = time.time()
                 processed += 1
             except Exception as exc:
                 event_id = str(event.get("id") or "unknown")
@@ -434,7 +503,10 @@ class NostrWebSocketMonitor:
             if not isinstance(event, dict):
                 continue
             try:
-                await self._process_event(event)
+                if await self._process_event(event):
+                    # The reliable poll found and acted on a fresh event; used by
+                    # the watchdog to detect a silently-stalled proxy WebSocket.
+                    self.last_reliable_event_at = time.time()
                 processed += 1
             except Exception as exc:
                 event_id = str(event.get("id") or "unknown")
@@ -669,29 +741,28 @@ class NostrWebSocketMonitor:
         except Exception as e:
             logger.error(f"User {self.user_id}: Error in subscription refresh: {e}")
     
-    async def _process_event(self, event: dict):
+    async def _process_event(self, event: dict) -> bool:
         """Process a Nostr event (note, repost, or reaction).
-        
+
+        Returns True only when the event was freshly acted upon (a note that was
+        tracked, or a repost/reaction that matched a tracked note). Duplicates,
+        no-ops (e.g. a reaction whose note is not tracked yet), ignored kinds and
+        errors return False.
+
+        Deduplication is applied *after* a successful, actionable result — never
+        before — so that a transient failure or a not-yet-actionable event can be
+        retried by the next poll or by recovery instead of being suppressed for
+        the dedup TTL.
+
         Args:
             event: Nostr event dict from EVENT message
         """
         try:
             event_id = event.get("id", "unknown")
             kind = event.get("kind")
-            
-            # Deduplication: Check if we've already processed this event recently
-            # This prevents duplicate processing when lookback window overlaps with real-time
+
             current_time = time.time()
-            if event_id in self.processed_event_ids:
-                logger.debug(
-                    f"User {self.user_id}: Skipping duplicate event {event_id[:8]}... "
-                    f"(already processed {int(current_time - self.processed_event_ids[event_id])}s ago)"
-                )
-                return
-            
-            # Mark event as processed
-            self.processed_event_ids[event_id] = current_time
-            
+
             # Periodic cleanup of old processed event IDs (every 60 seconds)
             if current_time - self.last_dedup_cleanup > 60:
                 cutoff = current_time - self.dedup_ttl_seconds
@@ -703,7 +774,19 @@ class NostrWebSocketMonitor:
                         f"User {self.user_id}: Cleaned up {len(old_ids)} old processed event IDs"
                     )
                 self.last_dedup_cleanup = current_time
-            
+
+            # Deduplication: skip events we have already acted on recently.
+            # This prevents redundant work when the lookback window overlaps with
+            # real-time events. Only *acted* events are cached (see below), so a
+            # previously-failed or not-yet-actionable event is not blocked here.
+            if event_id in self.processed_event_ids:
+                logger.debug(
+                    f"User {self.user_id}: Skipping already-handled event {event_id[:8]}... "
+                    f"(acted {int(current_time - self.processed_event_ids[event_id])}s ago)"
+                )
+                return False
+
+            acted = False
             if kind in (1, 30311):
                 # Kind 1: Regular note
                 # Kind 30311: Parameterized replaceable event (long-form content)
@@ -711,20 +794,20 @@ class NostrWebSocketMonitor:
                 logger.info(
                     f"User {self.user_id}: New kind {kind} note {event_id[:8]}... detected"
                 )
-                
+
                 # Process the note: check tags, add to tracked_event_ids, trigger subscription refresh
-                await process_note_for_tracked_tags(self.user_id, event, self.app)
-            
+                acted = bool(await process_note_for_tracked_tags(self.user_id, event, self.app))
+
             elif kind == 6:
                 # Repost
                 logger.debug(f"User {self.user_id}: Processing repost {event_id[:8]}...")
-                await process_repost_for_tracked_notes(self.user_id, event, self.app)
-            
+                acted = bool(await process_repost_for_tracked_notes(self.user_id, event, self.app))
+
             elif kind == 7:
                 # Reaction (like)
                 logger.debug(f"User {self.user_id}: Processing reaction {event_id[:8]}...")
-                await process_reaction_for_tracked_notes(self.user_id, event, self.app)
-            
+                acted = bool(await process_reaction_for_tracked_notes(self.user_id, event, self.app))
+
             elif kind == 9735:
                 # Zap receipts are ignored in realtime: zap subscriptions were
                 # intentionally disabled. Payments are the single authoritative
@@ -740,10 +823,20 @@ class NostrWebSocketMonitor:
                     f"User {self.user_id}: Ignoring event kind {kind} "
                     f"(processing 1/30311=notes, 6=repost, 7=reaction, 9735=zap)"
                 )
-        
+
+            # Cache only events we actually acted on. A no-op (e.g. a reaction
+            # whose target note is not tracked yet) is intentionally left uncached
+            # so a later poll can retry it once the note becomes tracked.
+            if acted and isinstance(event_id, str) and event_id != "unknown":
+                self.processed_event_ids[event_id] = current_time
+            return acted
+
         except Exception as e:
+            # Do NOT cache on failure: leaving the event uncached lets the next
+            # poll or a recovery run retry it instead of suppressing it for the TTL.
             logger.error(f"User {self.user_id}: Error processing event: {e}")
-    
+            return False
+
     async def _on_message(self, message: str):
         """Handle incoming WebSocket message.
         
@@ -761,9 +854,12 @@ class NostrWebSocketMonitor:
                 
                 # Only process events from our subscriptions
                 if sub_id in self.subscriptions:
+                    now = time.time()
                     meta = self.subscriptions.get(sub_id) or {}
                     meta["handshake_completed"] = True
-                    meta["last_event_at"] = time.time()
+                    meta["last_event_at"] = now
+                    # Record WS delivery for the stall-detection watchdog.
+                    self.last_ws_event_at = now
                     await self._process_event(event)
             
             elif msg_type == "EOSE":
@@ -893,7 +989,14 @@ async def start_monitor_for_user(user_id: str, app=None) -> NostrWebSocketMonito
         app = _app_instance
 
     if app is None:
-        raise RuntimeError("WebSocket monitor startup requires app context")
+        # The core loader may never provide app context (it calls cyberherd_start
+        # but not init_extension). Proceed without it: event processing and the
+        # note cache fall back to a module-level store, and the manager adopts a
+        # real app later if one becomes available.
+        logger.warning(
+            f"Cyberherd: starting monitor for user {user_id} without app context "
+            f"(module-cache fallback)"
+        )
     
     if user_id in _active_monitors:
         monitor = _active_monitors[user_id]

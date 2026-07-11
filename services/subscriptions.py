@@ -993,7 +993,7 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
         except Exception:
             kind = 0
         if not eid or not pubkey:
-            return
+            return False
 
         # Relay data is untrusted: verify the schnorr signature over the event id
         # before it is allowed to drive membership. A forged kind 6/7/1 event with
@@ -1003,7 +1003,7 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                 f"Rejecting event {eid[:16]}... kind={kind} from {pubkey[:16]}...: "
                 f"invalid or missing signature (user {user_id})"
             )
-            return
+            return False
 
         eff_pub = get_effective_pubkey(settings)
         tags = getattr(settings, "tracked_tags", [])
@@ -1024,7 +1024,7 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                 logger.debug(
                     f"⚠️ Event {eid[:16]}... was not added to tracked_event_ids (filtered out) user_id={user_id}"
                 )
-            return result
+            return bool(result)
 
         # kind 6: reposts
         elif kind == 6 and getattr(settings, "repost_tracking_enabled", False):
@@ -1035,7 +1035,7 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                     f"Skipping repost event {eid[:16]}... from effective pubkey "
                     f"(operator's own repost) for user {user_id}"
                 )
-                return
+                return False
             
             logger.info(f"🔄 Processing kind 6 repost event {eid[:16] if eid else 'unknown'}... for user {user_id} from pubkey {pubkey[:16]}...")
             
@@ -1135,6 +1135,10 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
             else:
                 logger.warning(f"⚠️ Repost event {eid[:16]}... does NOT reference any tracked event for user {user_id}")
 
+            # Report whether this event matched a tracked note so callers can
+            # decide whether to cache it as handled or retry it later.
+            return bool(tracked_targets)
+
         # kind 7: reactions
         elif kind == 7 and getattr(settings, "likes_tracking_enabled", False):
             # Reject reactions from the effective pubkey (operator's own actions)
@@ -1144,7 +1148,7 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                     f"Skipping reaction event {eid[:16]}... from effective pubkey "
                     f"(operator's own reaction) for user {user_id}"
                 )
-                return
+                return False
             
             logger.info(f"🔍 Processing kind 7 reaction event {eid[:16] if eid else 'unknown'}... for user {user_id}")
             
@@ -1237,9 +1241,16 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                         pass
             else:
                 logger.warning(f"⚠️ Kind 7 reaction event {eid[:16] if eid else 'unknown'}... did NOT match any tracked events. Identifiers checked: {identifiers}")
-                
+
+            # Report whether this event matched a tracked note so callers can
+            # decide whether to cache it as handled or retry it later.
+            return bool(tracked_targets)
+
+        return False
+
     except Exception as e:
         logger.error(f"Error processing event for user {user_id}: {e}")
+        return False
     finally:
         # monotonic watermark
         try:
@@ -1658,10 +1669,11 @@ async def process_repost_for_tracked_notes(user_id: str, event: dict, app=None):
         # prevent processing events that reference multiple tracked notes.
         
         # Process the event using the main logic
-        await process_event_for_user(user_id, event, settings, app, recovery_mode=False)
-        
+        return bool(await process_event_for_user(user_id, event, settings, app, recovery_mode=False))
+
     except Exception as e:
         logger.error(f"Error processing repost for user {user_id}: {e}")
+        return False
 
 
 async def process_reaction_for_tracked_notes(user_id: str, event: dict, app=None):
@@ -1695,10 +1707,11 @@ async def process_reaction_for_tracked_notes(user_id: str, event: dict, app=None
         # prevent processing events that reference multiple tracked notes.
         
         # Process the event using the main logic
-        await process_event_for_user(user_id, event, settings, app, recovery_mode=False)
-        
+        return bool(await process_event_for_user(user_id, event, settings, app, recovery_mode=False))
+
     except Exception as e:
         logger.error(f"Error processing reaction for user {user_id}: {e}")
+        return False
 
 
 async def process_zap_receipt_for_tracked_notes(user_id: str, event: dict, app=None):

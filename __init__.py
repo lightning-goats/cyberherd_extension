@@ -9,7 +9,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Depends
+from starlette.requests import HTTPConnection
 from starlette.responses import FileResponse
 from starlette.staticfiles import StaticFiles
 from lnbits.tasks import create_permanent_unique_task
@@ -27,12 +28,42 @@ from .setup import register_services
 from .tasks import start_invoice_listener
 from .services.subscriptions import cyberherd_subscription_handler
 
-# Define the extension router and include both web UI and API subrouters
-cyberherd_ext: APIRouter = APIRouter(prefix="/cyberherd", tags=["cyberherd"])
-
 # Keep track of background tasks
 scheduled_tasks: list = []
 _APP_REF = None
+
+
+def _capture_app_ref(conn: HTTPConnection) -> None:
+    """Lazily capture the FastAPI app from request/websocket context.
+
+    The LNbits core loader calls ``cyberherd_start()`` but never
+    ``init_extension(app)``, so ``_APP_REF`` is otherwise never set and the
+    WebSocket monitor manager would wait forever. Capturing ``conn.app`` here
+    provides the app as soon as any cyberherd endpoint is hit (the UI and
+    livestream overlay poll continuously), which unblocks the monitor manager.
+
+    Typed as ``HTTPConnection`` so it works on both HTTP and WebSocket routes.
+    """
+    global _APP_REF
+    if _APP_REF is None:
+        app = getattr(conn, "app", None)
+        if app is not None:
+            _APP_REF = app
+            try:
+                from . import tasks as _tasks
+                _tasks._APP_REF = app
+            except Exception:
+                pass
+
+
+# Define the extension router and include both web UI and API subrouters.
+# The router-level dependency captures the app on every request (cheap, runs
+# once) so background tasks that need app context can obtain it.
+cyberherd_ext: APIRouter = APIRouter(
+    prefix="/cyberherd",
+    tags=["cyberherd"],
+    dependencies=[Depends(_capture_app_ref)],
+)
 
 
 def cyberherd_stop():
@@ -77,17 +108,23 @@ def cyberherd_start():
                 from .services.websocket_monitor_tasks import handle_websocket_monitors
                 # Wait for app reference to be available (set by init_extension)
                 # This ensures monitors have access to app state for cache updates
+                # Wait briefly for an app reference (captured lazily from the
+                # first request via _capture_app_ref), but do not block forever.
+                # handle_websocket_monitors re-reads _APP_REF each cycle and the
+                # monitors fall back to a module-level cache when no app context
+                # is available, so realtime detection starts regardless.
                 retries = 0
-                while _APP_REF is None:
+                while _APP_REF is None and retries < 60:
                     await asyncio.sleep(1)
                     retries += 1
-                    if retries == 30:
-                        logger.warning(
-                            "Cyberherd: _APP_REF still None after waiting, "
-                            "deferring websocket monitors until app context is available"
-                        )
-                
-                # Use the captured global app reference
+                if _APP_REF is None:
+                    logger.warning(
+                        "Cyberherd: starting websocket monitors without app context "
+                        "(module-cache fallback); the app will be adopted once a "
+                        "cyberherd request arrives"
+                    )
+
+                # Use the captured global app reference (may be None)
                 await handle_websocket_monitors(_APP_REF)
             except asyncio.CancelledError:
                 logger.info("Cyberherd: WebSocket monitor task cancelled")

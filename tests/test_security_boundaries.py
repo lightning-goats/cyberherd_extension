@@ -649,12 +649,29 @@ async def test_existing_websocket_monitor_gets_late_app_context(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_websocket_monitor_start_requires_app_context(monkeypatch):
+async def test_websocket_monitor_starts_without_app_context(monkeypatch):
+    """Without app context the monitor still starts (module-cache fallback)
+    instead of raising, so realtime detection is not blocked when the core
+    loader calls cyberherd_start() but never init_extension(app)."""
     nostr_websocket_monitor._active_monitors.clear()
     nostr_websocket_monitor._app_instance = None
 
-    with pytest.raises(RuntimeError):
-        await nostr_websocket_monitor.start_monitor_for_user("user-id")
+    started = {}
+
+    async def fake_start(self):
+        started["ok"] = True
+
+    monkeypatch.setattr(
+        nostr_websocket_monitor.NostrWebSocketMonitor, "start", fake_start
+    )
+
+    monitor = await nostr_websocket_monitor.start_monitor_for_user("user-id")
+    try:
+        assert monitor is not None
+        assert monitor.app is None
+        assert started.get("ok") is True
+    finally:
+        nostr_websocket_monitor._active_monitors.clear()
 
 
 def test_process_zap_receipt_route_is_registered():
@@ -1095,3 +1112,106 @@ async def test_reaction_cannot_headbutt_when_herd_full(monkeypatch):
     assert result is None
     assert deactivated == []                 # a reaction displaces no one, even a repost-only member
     assert notified.get("failed") is True
+
+
+# ---------------------------------------------------------------------------
+# Realtime detection hardening: dedup-after-act and proxy-stall detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_process_event_retries_noop_then_caches_after_acting(monkeypatch):
+    """A note that is not (yet) actionable must NOT be cached, so a later poll
+    can retry it; once it acts it is cached and further calls short-circuit."""
+    monitor = nostr_websocket_monitor.NostrWebSocketMonitor("user-id")
+    event = {"id": "a1" + "0" * 62, "kind": 1}
+    calls = {"n": 0}
+    outcome = {"acted": False}
+
+    async def fake_note(user_id, ev, app):
+        calls["n"] += 1
+        return outcome["acted"]
+
+    monkeypatch.setattr(
+        nostr_websocket_monitor, "process_note_for_tracked_tags", fake_note
+    )
+
+    # No-op result -> not cached -> retried on the next call.
+    assert await monitor._process_event(event) is False
+    assert await monitor._process_event(event) is False
+    assert calls["n"] == 2
+    assert event["id"] not in monitor.processed_event_ids
+
+    # Now it acts -> cached -> the following call short-circuits (no re-handling).
+    outcome["acted"] = True
+    assert await monitor._process_event(event) is True
+    assert event["id"] in monitor.processed_event_ids
+    assert await monitor._process_event(event) is False
+    assert calls["n"] == 3
+
+
+@pytest.mark.anyio
+async def test_process_event_does_not_cache_on_exception(monkeypatch):
+    """A transient processing failure must not suppress the event; it stays
+    uncached so a later poll or recovery can retry it."""
+    monitor = nostr_websocket_monitor.NostrWebSocketMonitor("user-id")
+    event = {"id": "b" * 64, "kind": 7}
+    calls = {"n": 0}
+
+    async def boom(user_id, ev, app):
+        calls["n"] += 1
+        raise RuntimeError("transient")
+
+    monkeypatch.setattr(
+        nostr_websocket_monitor, "process_reaction_for_tracked_notes", boom
+    )
+
+    assert await monitor._process_event(event) is False
+    assert event["id"] not in monitor.processed_event_ids
+    assert await monitor._process_event(event) is False
+    assert calls["n"] == 2
+
+
+def test_ws_appears_stalled_detects_silent_forwarding(monkeypatch):
+    monitor = nostr_websocket_monitor.NostrWebSocketMonitor("user-id")
+    monitor.ws_stall_threshold_seconds = 90
+    monkeypatch.setattr(
+        nostr_websocket_monitor, "REALTIME_NOTE_POLL_INTERVAL_SECONDS", 10
+    )
+    now = 10_000.0
+
+    # WS silent for 200s but the reliable poll acted 5s ago -> stalled.
+    monitor.last_ws_event_at = now - 200
+    monitor.last_reliable_event_at = now - 5
+    assert monitor._ws_appears_stalled(now) is True
+
+    # Genuinely quiet (poll also idle) -> not stalled.
+    monitor.last_reliable_event_at = now - 300
+    assert monitor._ws_appears_stalled(now) is False
+
+    # WS recently delivered -> not stalled.
+    monitor.last_ws_event_at = now - 5
+    monitor.last_reliable_event_at = now - 5
+    assert monitor._ws_appears_stalled(now) is False
+
+    # Poll has never produced a fresh event -> not stalled.
+    monitor.last_ws_event_at = now - 200
+    monitor.last_reliable_event_at = 0.0
+    assert monitor._ws_appears_stalled(now) is False
+
+
+@pytest.mark.anyio
+async def test_force_reconnect_closes_socket_and_resets_marker():
+    monitor = nostr_websocket_monitor.NostrWebSocketMonitor("user-id")
+    closed = {"n": 0}
+
+    class FakeWS:
+        async def close(self):
+            closed["n"] += 1
+
+    monitor.ws = FakeWS()
+    monitor.last_ws_event_at = 0.0
+    await monitor._force_reconnect()
+
+    assert closed["n"] == 1
+    assert monitor.last_ws_event_at > 0.0
