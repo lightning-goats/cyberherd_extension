@@ -1,6 +1,6 @@
 {
   "name": "Cyberherd",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "short_description": "Cyberherd extension (local development)",
   "tile": "/cyberherd/static/tile.png",
   "min_lnbits_version": "1.3.0",

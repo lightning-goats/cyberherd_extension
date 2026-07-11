@@ -288,7 +288,7 @@ def _prepare_bundle_args(event_type: str, values: dict[str, Any] | None) -> dict
             ch_item["headbutt_info"] = values.get("headbutt_info")
 
     # Event-specific enrichment
-    if event_type in {"headbutt_success", "headbutt_failure"}:
+    if event_type in {"headbutt_success", "headbutt_failure", "join_below_minimum", "repost_displaces"}:
         for key in (
             "attacker_name",
             "attacker_amount",
@@ -305,9 +305,11 @@ def _prepare_bundle_args(event_type: str, values: dict[str, Any] | None) -> dict
         if event_type == "headbutt_success":
             if "next_headbutt_info" not in ch_item and isinstance(values.get("next_headbutt_info"), dict):
                 ch_item["next_headbutt_info"] = dict(values["next_headbutt_info"])
-        else:  # headbutt_failure specific fields
+        elif event_type in {"headbutt_failure", "join_below_minimum"}:
+            # amount-vs-required fields (both placeholder spellings)
             _setdefault("required_amount", "required_amount", "required_sats")
             _setdefault("required_sats", "required_sats", "required_amount")
+            _setdefault("difference", "difference")
 
     if event_type == "headbutt_info":
         _setdefault("required_sats", "required_sats", "required_amount")
@@ -602,6 +604,8 @@ async def make_messages(event_type: str, **kwargs) -> dict:
         "zapper_displaces_kind_7": "zapper_displaces_kind_7",
         "kind_6_headbutt_failure": "kind_6_headbutt_failure",
         "kind_7_headbutt_failure": "kind_7_headbutt_failure",
+        "join_below_minimum": "join_below_minimum",
+        "repost_displaces": "repost_displaces",
         # Additional mappings for zap-specific messages
         "variations": "variations",
     }
@@ -1280,6 +1284,8 @@ async def publish_event_message(
         "zapper_displaces_kind_7": "zapper_displaces_kind_7",
         "kind_6_headbutt_failure": "kind_6_headbutt_failure",
         "kind_7_headbutt_failure": "kind_7_headbutt_failure",
+        "join_below_minimum": "join_below_minimum",
+        "repost_displaces": "repost_displaces",
         "sats_received": "sats_received",
         "feeder_triggered": "feeder_trigger",
         "feeder_trigger_bolt12": "feeder_trigger",

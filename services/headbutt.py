@@ -1141,14 +1141,14 @@ class EnhancedHeadbuttService:
                 logger.info(
                     f"AdmissionGuard min_threshold: amount={getattr(attacker, 'amount', 0)} required_min={min_required} (pubkey={attacker.pubkey[:8]}...)"
                 )
+                # A free spot is available; the attacker simply contributed less
+                # than the join minimum. Use the dedicated "join_below_minimum"
+                # category so the message does not imply a displacement.
                 await self._send_headbutt_failure_notification(
                     attacker,
-                    {
-                        "display_name": "lowest",
-                        "amount": min_required - 1,
-                        "pubkey": "",
-                    },
+                    {"display_name": "Anon", "amount": 0, "pubkey": ""},
                     min_required,
+                    event_type_override="join_below_minimum",
                 )
                 return None
 
@@ -1903,10 +1903,14 @@ class EnhancedHeadbuttService:
                 return "headbutt_failure"
 
             if base == "headbutt_success":
-                # If attacker didn't pay (amount == 0) treat as repost or reaction join
+                # This selector runs in the *displacement* context (a member was
+                # bumped). A non-paying repost that displaces a member uses the
+                # dedicated "repost_displaces" category so the message reflects
+                # the displacement rather than a plain repost join. (A pure
+                # reaction can never headbutt, so kind 7 here is defensive only.)
                 if attacker_amount == 0 and attacker_kinds_set:
                     if 6 in attacker_kinds_set:
-                        return "kind_6_repost"
+                        return "repost_displaces"
                     if 7 in attacker_kinds_set:
                         return "kind_7_reaction"
 
@@ -1958,7 +1962,8 @@ class EnhancedHeadbuttService:
         await self.db.add_new_active_member(member_data, user_id=self.user_id)
 
     async def _send_headbutt_failure_notification(
-        self, attacker: Any, victim: dict[str, Any], required_amount: int
+        self, attacker: Any, victim: dict[str, Any], required_amount: int,
+        event_type_override: str | None = None,
     ):
         try:
             existing_attacker = None
@@ -1994,7 +1999,9 @@ class EnhancedHeadbuttService:
             e_tags = [note_id] if note_id else []
             p_tags = [p for p in (getattr(attacker, "pubkey", None), victim.get("pubkey")) if p]
 
-            template_key = self._select_template_key_for_headbutt(
+            # A caller may force a specific category (e.g. "join_below_minimum"
+            # for a free-spot rejection, which must not use "displace" wording).
+            template_key = event_type_override or self._select_template_key_for_headbutt(
                 "headbutt_failure", attacker=attacker, victim=victim, headbutt_result=None
             )
 

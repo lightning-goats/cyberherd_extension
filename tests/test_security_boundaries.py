@@ -379,8 +379,9 @@ async def test_open_slot_zap_enforces_configured_membership_minimum(monkeypatch)
         admitted["called"] = True
         return "new"
 
-    async def fake_failure(self, attacker, victim, required):
+    async def fake_failure(self, attacker, victim, required, event_type_override=None):
         admitted["required"] = required
+        admitted["event_type_override"] = event_type_override
 
     monkeypatch.setattr(headbutt.crud, "is_pubkey_banned", fake_is_pubkey_banned)
     monkeypatch.setattr(
@@ -418,6 +419,9 @@ async def test_open_slot_zap_enforces_configured_membership_minimum(monkeypatch)
     assert result is None
     assert admitted["called"] is False
     assert admitted.get("required") == 50
+    # A free-spot below-minimum rejection uses the dedicated category, not the
+    # generic "displace" headbutt_failure message.
+    assert admitted.get("event_type_override") == "join_below_minimum"
 
 
 @pytest.mark.anyio
