@@ -503,6 +503,19 @@ async def _append_today(user_id: str | None, eff_pub: str | None, tags: list[str
                 if settings:
                     current_tracked = getattr(settings, 'tracked_event_ids', []) or []
                     updated_tracked = current_tracked if eid in current_tracked else current_tracked + [eid]
+                    # Prune notes from previous local days (e.g. a stale id left
+                    # behind by a missed midnight reset) so they stop being tracked
+                    # the moment today's note is detected.
+                    if getattr(settings, "midnight_reset_enabled", True):
+                        try:
+                            from .time_utils import prune_stale_tracked_ids
+                            ts_existing = getattr(settings, 'tracked_event_timestamps', {}) or {}
+                            pruned = prune_stale_tracked_ids(updated_tracked, ts_existing)
+                            if eid not in pruned:
+                                pruned.append(eid)
+                            updated_tracked = pruned
+                        except Exception:
+                            pass
                     is_long_form = False
                     try:
                         is_long_form = int(event.get("kind") or 0) == 30311
@@ -521,18 +534,22 @@ async def _append_today(user_id: str | None, eff_pub: str | None, tags: list[str
                             getattr(settings, 'tracked_event_addresses', {}) or {}
                         )
 
-                    if eid not in current_tracked or addresses_changed:
+                    if updated_tracked != current_tracked or addresses_changed:
                         settings.tracked_event_ids = updated_tracked
-                        
-                        # Store event timestamp for optimized recovery scanning
+
+                        # Store this event's timestamp for optimized recovery
+                        # scanning, then drop timestamps for any pruned notes.
                         timestamps = dict(getattr(settings, 'tracked_event_timestamps', {}) or {})
                         try:
                             created_at = int(event.get("created_at") or 0)
                             if created_at > 0:
                                 timestamps[eid] = created_at
-                                settings.tracked_event_timestamps = timestamps
                         except Exception:
                             pass
+                        timestamps = {
+                            k: v for k, v in timestamps.items() if k in updated_tracked
+                        }
+                        settings.tracked_event_timestamps = timestamps
 
                         if is_long_form and pruned_addresses is not None:
                             settings.tracked_event_addresses = pruned_addresses

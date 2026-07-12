@@ -1760,6 +1760,39 @@ async def api_get_today_cyberherd_notes(request: Request, auth=Depends(auth_wall
     except Exception as e:
         logger.warning(f"Failed to merge from in-memory cache: {e}")
 
+    # Only surface notes from today's LOCAL day. The in-memory cache is keyed by
+    # UTC day and is not cleared at the local-midnight reset, so in a timezone
+    # behind UTC an evening note (which lands on the next UTC day) — or a stale
+    # tracked id left behind by a missed reset — could otherwise be shown the
+    # following local day. Drop any id whose recorded timestamp is outside today's
+    # local window; ids with no timestamp are kept only when they are in the
+    # (reset-cleared) DB set, so manually-added notes still show.
+    if getattr(s, "midnight_reset_enabled", True):
+        try:
+            day_bounds = get_day_boundaries_utc(days_ago=0)
+            ts_map = getattr(s, "tracked_event_timestamps", {}) or {}
+            db_ids = {
+                str(n).strip().lower()
+                for n in (getattr(s, "tracked_event_ids", []) or [])
+                if isinstance(n, str)
+            }
+
+            def _is_today_note(nid) -> bool:
+                key = str(nid).strip().lower()
+                ts = ts_map.get(nid)
+                if ts is None:
+                    ts = ts_map.get(key)
+                if ts is None:
+                    return key in db_ids
+                try:
+                    return day_bounds.is_timestamp_in_local_day(int(ts))
+                except Exception:
+                    return key in db_ids
+
+            tracked_ids = [n for n in tracked_ids if _is_today_note(n)]
+        except Exception as e:
+            logger.warning(f"today_notes: failed to filter to local day: {e}")
+
     logger.debug(
         f"api_get_today_cyberherd_notes user={user_id} "
         f"tracked_ids_len={len(tracked_ids)}"

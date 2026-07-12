@@ -174,6 +174,33 @@ def get_day_boundaries_utc(days_ago: int = 0) -> DayBoundaries:
     )
 
 
+def prune_stale_tracked_ids(
+    tracked_ids: list, timestamps: dict | None, days_ago: int = 0
+) -> list:
+    """Return only the tracked note ids that belong to today's LOCAL day.
+
+    A #CyberHerd note is valid only for the day it was posted (the herd resets at
+    local midnight). Ids whose recorded created_at is before today's local window
+    are dropped so a note from a previous day stops being tracked. Ids with no
+    recorded timestamp are kept (their age is unknown — fail open rather than
+    dropping a possibly-current note).
+    """
+    boundaries = get_day_boundaries_utc(days_ago=days_ago)
+    ts_map = timestamps if isinstance(timestamps, dict) else {}
+    kept = []
+    for nid in tracked_ids or []:
+        ts = ts_map.get(nid)
+        if ts is None:
+            kept.append(nid)
+            continue
+        try:
+            if boundaries.is_timestamp_in_local_day(int(ts)):
+                kept.append(nid)
+        except Exception:
+            kept.append(nid)
+    return kept
+
+
 def get_day_boundaries_local(days_ago: int = 0) -> DayBoundaries:
     """LEGACY: Get day boundaries with local-first calculation.
     

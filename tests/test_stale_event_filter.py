@@ -1,8 +1,26 @@
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from lnbits.extensions.cyberherd.services import subscriptions
+from lnbits.extensions.cyberherd.services import time_utils
+
+
+# --- Unit: prune stale tracked note ids ----------------------------------
+
+
+def test_prune_stale_tracked_ids_drops_previous_day_notes():
+    now = int(time.time())
+    old = now - 3 * 86400  # clearly before today's local window
+    tracked = ["today_note", "old_note", "unknown_note"]
+    timestamps = {"today_note": now, "old_note": old}
+
+    kept = time_utils.prune_stale_tracked_ids(tracked, timestamps)
+
+    assert "today_note" in kept          # today's note stays
+    assert "old_note" not in kept        # a previous day's note is dropped
+    assert "unknown_note" in kept        # no recorded timestamp -> fail open
 
 
 # --- Unit: the freshness predicate ---------------------------------------
