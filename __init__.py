@@ -92,7 +92,21 @@ def cyberherd_stop():
 
 
 def cyberherd_start():
-    """Start cyberherd background tasks using LNbits task system."""
+    """Catch up the local membership day before starting any event intake."""
+    async def _start_after_day_recovery():
+        from .tasks import ensure_membership_day
+
+        await ensure_membership_day(app=_APP_REF)
+        _start_daily_ready_background_tasks()
+
+    task = create_permanent_unique_task(
+        "ext_cyberherd_startup", _start_after_day_recovery
+    )
+    scheduled_tasks.append(task)
+
+
+def _start_daily_ready_background_tasks():
+    """Register monitors only after durable day recovery succeeds."""
     logger.info("🚀 Cyberherd: Starting background tasks...")
     
     # Create permanent task for subscription handler (like nwcprovider does)
@@ -256,6 +270,8 @@ def init_extension(app):
         import asyncio
         async def _run_multi_start():
             try:
+                from .tasks import ensure_membership_day
+                await ensure_membership_day(app=app)
                 # Wait for nostrclient to initialize relays first
                 # This prevents race condition where monitors start before relays are ready
                 logger.info("Cyberherd: waiting for nostrclient relay initialization...")
@@ -315,7 +331,7 @@ def init_extension(app):
                     logger.info(f"Cyberherd: zap monitor startup complete - {started} started")
             except Exception as e:  # pragma: no cover
                 logger.warning(f"Cyberherd multi zap monitoring init failed: {e}")
-        asyncio.create_task(_run_multi_start())
+        scheduled_tasks.append(asyncio.create_task(_run_multi_start()))
     except Exception as e:  # pragma: no cover
         logger.warning(f"Cyberherd zap monitoring scheduling failed: {e}")
 
@@ -330,7 +346,7 @@ def init_extension(app):
             except Exception as e:  # pragma: no cover
                 logger.warning(f"Cyberherd warm start inner error: {e}")
         logger.info("Cyberherd: scheduling warm start task")
-        asyncio.create_task(_run_warm())
+        scheduled_tasks.append(asyncio.create_task(_run_warm()))
         logger.info("Cyberherd: warm start task scheduled")
     except Exception as e:
         logger.warning(f"Cyberherd warm start failed to schedule: {e}")
@@ -426,6 +442,8 @@ def _register_services(app):
 
 async def _start_zap_monitoring_if_enabled(app):
     """Start zap monitoring service if it's enabled in settings."""
+    from .tasks import ensure_membership_day
+    await ensure_membership_day(app=app)
     try:
         logger.info("Cyberherd: Starting zap monitoring check...")
         # Prefer a user-scoped settings row with tracking enabled; fall back to global
@@ -473,6 +491,8 @@ async def _warm_start_today_cache_and_recovery(app):
     3. Query and process engagement events (reposts/reactions)
     4. Query and process zap receipts
     """
+    from .tasks import ensure_membership_day
+    await ensure_membership_day(app=app)
     try:
         from . import crud
         from .services.subscriptions import force_requery_for_user

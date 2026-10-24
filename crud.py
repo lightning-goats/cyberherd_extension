@@ -5,6 +5,9 @@ import time
 from datetime import datetime, timezone
 import asyncio
 from typing import Any
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from sqlalchemy.sql import text
 
 from loguru import logger
 
@@ -14,11 +17,94 @@ from .services.shares import compute_member_share_percentages
 from .utils.common import extract_t_tags_from_event, coerce_bool
 
 db = Database("ext_cyberherd")
+# Bind a non-autocommitting connection only to the task owning an admission.
+# Child tasks inherit ContextVars but must never inherit this connection.
+_admission_context: ContextVar[Any] = ContextVar("cyberherd_admission", default=None)
+
+
+class _AdmissionConnection:
+    def __init__(self, connection):
+        self.connection = connection
+
+    async def execute(self, query, values=None):
+        conn = self.connection
+        return await conn.conn.execute(
+            text(conn.rewrite_query(query)), conn.rewrite_values(values or {})
+        )
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+
+def _current_admission():
+    state = _admission_context.get()
+    return state if state and state[0] is asyncio.current_task() else None
+
+
+def in_admission_transaction() -> bool:
+    return _current_admission() is not None
+
+
+def _db():
+    state = _current_admission()
+    return state[1] if state else db
+
+
+def defer_after_commit(callback) -> None:
+    state = _current_admission()
+    if state is None:
+        raise RuntimeError("after-commit callback requires an admission transaction")
+    state[2].append(callback)
+
+
+@asynccontextmanager
+async def admission_transaction(*, after_commit=None):
+    """Commit membership, processed identity and totals together, or roll back all.
+
+    LNbits Connection.execute normally commits each statement; the scoped wrapper
+    bypasses that behavior while preserving LNbits SQL/value normalization.
+    Deferred notifications run only after the connection and context are released.
+    """
+    if in_admission_transaction():
+        yield
+        return
+    callbacks = []
+    async with db.connect() as connection:
+        token = _admission_context.set(
+            (asyncio.current_task(), _AdmissionConnection(connection), callbacks)
+        )
+        try:
+            yield
+            await connection.conn.commit()
+        except BaseException:
+            await connection.conn.rollback()
+            raise
+        finally:
+            _admission_context.reset(token)
+    if after_commit is not None:
+        after_commit.extend(callbacks)
+        return
+    for callback in callbacks:
+        try:
+            await callback()
+        except Exception as exc:
+            logger.warning(f"CyberHerd after-commit notification failed: {exc}")
+
+
+@asynccontextmanager
+async def _admission_write_lock():
+    # The transaction already serializes this DB connection. Acquiring the
+    # ordinary CRUD lock here could deadlock with a writer waiting on db.lock.
+    yield
+
+
 # Serialize critical write operations in this module to reduce sqlite locking
 _crud_write_lock: asyncio.Lock | None = None
 
 
-def _get_crud_write_lock() -> asyncio.Lock:
+def _get_crud_write_lock():
+    if in_admission_transaction():
+        return _admission_write_lock()
     global _crud_write_lock
     if _crud_write_lock is None:
         _crud_write_lock = asyncio.Lock()
@@ -88,7 +174,7 @@ async def get_settings(user_id: str | None = None) -> CyberherdSettings:
         # Attempt direct fetch by user first (multi-tenant row)
         row = None
         if user_id:
-            row = await db.fetchone(
+            row = await _db().fetchone(
                 f"SELECT * FROM {db.references_schema}settings WHERE user_id = :user_id",
                 {"user_id": user_id},
             )
@@ -104,7 +190,7 @@ async def get_settings(user_id: str | None = None) -> CyberherdSettings:
         # configured wallets/settings instead of returning an empty defaults object.
         if not row:
             try:
-                legacy_row = await db.fetchone(
+                legacy_row = await _db().fetchone(
                     f"SELECT * FROM {db.references_schema}settings WHERE user_id IS NULL ORDER BY rowid LIMIT 1"
                 )
             except Exception:
@@ -138,7 +224,7 @@ async def get_all_settings() -> list[CyberherdSettings]:
         List of CyberherdSettings objects for all users
     """
     try:
-        rows = await db.fetchall(
+        rows = await _db().fetchall(
             f"SELECT * FROM {db.references_schema}settings"
         )
         return [_row_to_settings(row) for row in rows]
@@ -201,7 +287,7 @@ async def _bootstrap_settings_storage():
                         except Exception:
                             pass
                         continue
-            await db.execute(s)
+            await _db().execute(s)
             try:
                 logger.debug(f"Cyberherd bootstrap executed: {s[:50]}...")
             except Exception:
@@ -219,13 +305,13 @@ async def _bootstrap_settings_storage():
         has_tracked = await _column_exists(table_name, "tracked_event_ids")
         if has_manual and not has_tracked:
             try:
-                await db.execute(f"ALTER TABLE {table_name} ADD COLUMN tracked_event_ids TEXT;")
+                await _db().execute(f"ALTER TABLE {table_name} ADD COLUMN tracked_event_ids TEXT;")
             except Exception:
                 # ignore if another process added it concurrently
                 pass
             try:
                 # Perform per-row migration so we can normalize legacy formats.
-                rows = await db.fetchall(f"SELECT user_id, manual_event_ids, tracked_event_ids FROM {table_name}")
+                rows = await _db().fetchall(f"SELECT user_id, manual_event_ids, tracked_event_ids FROM {table_name}")
                 migrated = 0
                 for r in rows or []:
                     try:
@@ -252,13 +338,13 @@ async def _bootstrap_settings_storage():
                         normalized = json.dumps([str(x) for x in parsed if x])
 
                         if r.get("user_id"):
-                            await db.execute(
+                            await _db().execute(
                                 f"UPDATE {table_name} SET tracked_event_ids = :te WHERE user_id = :uid AND (tracked_event_ids IS NULL OR tracked_event_ids = '')",
                                 {"te": normalized, "uid": r.get("user_id")},
                             )
                         else:
                             # legacy single-row (no user_id)
-                            await db.execute(
+                            await _db().execute(
                                 f"UPDATE {table_name} SET tracked_event_ids = :te WHERE user_id IS NULL AND (tracked_event_ids IS NULL OR tracked_event_ids = '')",
                                 {"te": normalized},
                             )
@@ -298,7 +384,7 @@ async def _column_exists(schema_table: str, column: str) -> bool:
         # Try PostgreSQL information_schema first (works for both cases)
         try:
             if schema:
-                row = await db.fetchone(
+                row = await _db().fetchone(
                     """
                     SELECT 1 FROM information_schema.columns
                     WHERE table_schema = :schema AND table_name = :table AND column_name = :col
@@ -308,7 +394,7 @@ async def _column_exists(schema_table: str, column: str) -> bool:
                 )
             else:
                 # No schema specified - check cyberherd schema first, then public for PostgreSQL
-                row = await db.fetchone(
+                row = await _db().fetchone(
                     """
                     SELECT 1 FROM information_schema.columns
                     WHERE table_schema = 'cyberherd' AND table_name = :table AND column_name = :col
@@ -318,7 +404,7 @@ async def _column_exists(schema_table: str, column: str) -> bool:
                 )
                 if not row:
                     # Fallback to public schema
-                    row = await db.fetchone(
+                    row = await _db().fetchone(
                         """
                         SELECT 1 FROM information_schema.columns
                         WHERE table_schema = 'public' AND table_name = :table AND column_name = :col
@@ -334,7 +420,7 @@ async def _column_exists(schema_table: str, column: str) -> bool:
         
         # Fallback to SQLite PRAGMA
         try:
-            rows = await db.fetchall(f"PRAGMA table_info({table})")
+            rows = await _db().fetchall(f"PRAGMA table_info({table})")
             for r in rows:
                 try:
                     if (r.get("name") or r.get("Name")) == column:
@@ -355,7 +441,7 @@ async def get_settings_for_source_wallet(source_wallet: str) -> CyberherdSetting
     Falls back to global settings if no user mapping found.
     """
     try:
-        row = await db.fetchone(
+        row = await _db().fetchone(
             f"SELECT * FROM {db.references_schema}settings WHERE user_id IN (SELECT user FROM wallets WHERE id = :wid)",
             {"wid": source_wallet},
         )
@@ -369,7 +455,7 @@ async def get_settings_for_source_wallet(source_wallet: str) -> CyberherdSetting
             pass
     # If the above lookup didn't succeed (no wallets table or no mapping), try direct match
     try:
-        row = await db.fetchone(
+        row = await _db().fetchone(
             f"SELECT * FROM {db.references_schema}settings WHERE source_wallet = :wid",
             {"wid": source_wallet},
         )
@@ -388,7 +474,7 @@ async def get_settings_for_herd_wallet(herd_wallet: str) -> CyberherdSettings:
     Useful for mapping incoming payments to the correct user context.
     """
     try:
-        row = await db.fetchone(
+        row = await _db().fetchone(
             f"SELECT * FROM {db.references_schema}settings WHERE herd_wallet = :wid",
             {"wid": herd_wallet},
         )
@@ -406,11 +492,11 @@ async def list_settings_with_tracking(require_herd_wallet: bool = True) -> list[
     """
     try:
         if require_herd_wallet:
-            rows = await db.fetchall(
+            rows = await _db().fetchall(
                 f"SELECT * FROM {db.references_schema}settings WHERE zap_tracking_enabled = 1 AND herd_wallet IS NOT NULL AND TRIM(herd_wallet) != ''"
             )
         else:
-            rows = await db.fetchall(
+            rows = await _db().fetchall(
                 f"SELECT * FROM {db.references_schema}settings WHERE zap_tracking_enabled = 1"
             )
     except Exception:
@@ -421,7 +507,7 @@ async def list_settings_with_tracking(require_herd_wallet: bool = True) -> list[
 async def get_cyberherd_settings_for_all_users() -> list[CyberherdSettings]:
     """Get all cyberherd settings for all users."""
     try:
-        rows = await db.fetchall(f"SELECT * FROM {db.references_schema}settings")
+        rows = await _db().fetchall(f"SELECT * FROM {db.references_schema}settings")
     except Exception:
         rows = []
     return [_row_to_settings(r) for r in rows]
@@ -528,7 +614,7 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
     existing = None
     if user_id:
         try:
-            existing = await db.fetchone(
+            existing = await _db().fetchone(
                 f"SELECT 1 FROM {db.references_schema}settings WHERE user_id = :user_id", {"user_id": user_id}
             )
         except Exception as e:
@@ -546,9 +632,9 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
         for attempt in range(retries):
             try:
                 if params is None:
-                    await db.execute(sql)
+                    await _db().execute(sql)
                 else:
-                    await db.execute(sql, params)
+                    await _db().execute(sql, params)
                 return
             except Exception as exc:
                 last_exc = exc
@@ -863,7 +949,7 @@ async def upsert_settings(settings: CyberherdSettings, user_id: str | None = Non
 
 
 async def get_members() -> list[LegacyCyberherdMember]:
-    return await db.fetchall(
+    return await _db().fetchall(
         f"SELECT * FROM {db.references_schema}members ORDER BY added_at DESC",
         model=LegacyCyberherdMember,
     )
@@ -873,19 +959,19 @@ async def add_member(member: LegacyCyberherdMember):
     # Ensure added_at timestamp
     if not getattr(member, "added_at", None):
         member.added_at = int(time.time())
-    await db.insert("members", member)
+    await _db().insert("members", member)
 
 
 async def update_member(pubkey: str, alias: str | None = None):
     # Only alias is editable for now
-    await db.execute(
+    await _db().execute(
     f"UPDATE {db.references_schema}members SET alias = :alias WHERE pubkey = :pubkey",
     {"alias": alias, "pubkey": pubkey},
     )
 
 
 async def delete_member(pubkey: str):
-    await db.execute(
+    await _db().execute(
         f"DELETE FROM {db.references_schema}members WHERE pubkey = :pubkey",
         {"pubkey": pubkey},
     )
@@ -909,7 +995,7 @@ async def get_all_cyberherd_members(user_id: str | None = None) -> list[dict]:
         return []
     
     try:
-        rows = await db.fetchall(
+        rows = await _db().fetchall(
             f"SELECT * FROM {db.references_schema}cyber_herd WHERE user_id = :user_id",
             {"user_id": user_id}
         )
@@ -919,7 +1005,7 @@ async def get_all_cyberherd_members(user_id: str | None = None) -> list[dict]:
         if "undefinedtable" in msg or "does not exist" in msg or "no such table" in msg:
             await _bootstrap_cyberherd_tables()
             try:
-                rows = await db.fetchall(
+                rows = await _db().fetchall(
                     f"SELECT * FROM {db.references_schema}cyber_herd WHERE user_id = :user_id",
                     {"user_id": user_id}
                 )
@@ -939,6 +1025,8 @@ async def recompute_member_payouts(user_id: str | None = None) -> dict[str, floa
     try:
         members = await get_all_cyberherd_members(user_id)
     except Exception as exc:
+        if in_admission_transaction():
+            raise
         logger.debug(f"cyberherd: recompute_member_payouts failed to load members: {exc}")
         return {}
 
@@ -949,13 +1037,17 @@ async def recompute_member_payouts(user_id: str | None = None) -> dict[str, floa
         settings = await get_settings(user_id)
         zap_wallet = getattr(settings, "zap_wallet", None)
     except Exception as exc:
+        if in_admission_transaction():
+            raise
         logger.debug(f"cyberherd: recompute_member_payouts could not load settings: {exc}")
         settings = None
         zap_wallet = None
 
     member_allocation_percent = getattr(settings, "member_allocation_percent", 10 if zap_wallet else 100)
     member_total = member_allocation_percent if zap_wallet else 100
-    shares_percent = compute_member_share_percentages(members, member_total)
+    from .utils.common import is_valid_lightning_address
+    eligible = [row for row in members if is_valid_lightning_address(row.get("lud16"))]
+    shares_percent = compute_member_share_percentages(eligible, member_total)
 
     results: dict[str, float] = {}
     async with _get_crud_write_lock():
@@ -963,15 +1055,17 @@ async def recompute_member_payouts(user_id: str | None = None) -> dict[str, floa
             pubkey = (row.get("pubkey") or "").strip().lower()
             if not pubkey:
                 continue
-            percent_value = int(shares_percent.get(pubkey, 0))
-            payout_value = round(percent_value / 100.0, 6)
+            percent_value = float(shares_percent.get(pubkey, 0))
+            payout_value = round(percent_value / 100.0, 8)
             results[pubkey] = payout_value
             try:
-                await db.execute(
+                await _db().execute(
                     f"UPDATE {db.references_schema}cyber_herd SET payouts = :payouts WHERE pubkey = :pubkey AND user_id = :user_id",
                     {"payouts": payout_value, "pubkey": pubkey, "user_id": user_id},
                 )
             except Exception as exc:
+                if in_admission_transaction():
+                    raise
                 logger.debug(
                     f"cyberherd: failed to update payouts for {pubkey[:8]}...: {exc}"
                 )
@@ -999,7 +1093,7 @@ async def get_cyberherd_member_by_pubkey(pubkey: str, user_id: str | None = None
 
     try:
         # Only return user-scoped rows. Legacy global rows are no longer supported.
-        row = await db.fetchone(
+        row = await _db().fetchone(
             f"SELECT * FROM {db.references_schema}cyber_herd WHERE pubkey = :pubkey AND user_id = :user_id",
             {"pubkey": normalized_pubkey, "user_id": user_id},
         )
@@ -1008,7 +1102,7 @@ async def get_cyberherd_member_by_pubkey(pubkey: str, user_id: str | None = None
         # If table is missing, attempt runtime bootstrap once then retry
         if any(t in str(e).lower() for t in ["undefinedtable", "does not exist", "no such table"]):
             await _bootstrap_cyberherd_tables()
-            row = await db.fetchone(
+            row = await _db().fetchone(
                 f"SELECT * FROM {db.references_schema}cyber_herd WHERE pubkey = :pubkey AND user_id = :user_id",
                 {"pubkey": normalized_pubkey, "user_id": user_id},
             )
@@ -1030,7 +1124,7 @@ async def get_active_cyberherd_members(user_id: str | None = None) -> list[dict]
         return []
     
     try:
-        rows = await db.fetchall(
+        rows = await _db().fetchall(
             f"SELECT * FROM {db.references_schema}cyber_herd WHERE is_active = 1 AND user_id = :user_id",
             {"user_id": user_id}
         )
@@ -1038,7 +1132,7 @@ async def get_active_cyberherd_members(user_id: str | None = None) -> list[dict]
     except Exception as e:
         if any(t in str(e).lower() for t in ["undefinedtable", "does not exist", "no such table"]):
             await _bootstrap_cyberherd_tables()
-            rows = await db.fetchall(
+            rows = await _db().fetchall(
                 f"SELECT * FROM {db.references_schema}cyber_herd WHERE is_active = 1 AND user_id = :user_id",
                 {"user_id": user_id}
             )
@@ -1060,7 +1154,7 @@ async def get_active_cyberherd_size(user_id: str | None = None) -> int:
         return 0
     
     try:
-        row = await db.fetchone(
+        row = await _db().fetchone(
             f"SELECT COUNT(*) as count FROM {db.references_schema}cyber_herd WHERE is_active = 1 AND user_id = :user_id",
             {"user_id": user_id}
         )
@@ -1068,7 +1162,7 @@ async def get_active_cyberherd_size(user_id: str | None = None) -> int:
     except Exception as e:
         if any(t in str(e).lower() for t in ["undefinedtable", "does not exist", "no such table"]):
             await _bootstrap_cyberherd_tables()
-            row = await db.fetchone(
+            row = await _db().fetchone(
                 f"SELECT COUNT(*) as count FROM {db.references_schema}cyber_herd WHERE is_active = 1 AND user_id = :user_id",
                 {"user_id": user_id}
             )
@@ -1087,7 +1181,7 @@ async def deactivate_cyberherd_member(pubkey: str, user_id: str | None = None):
         logger.warning("deactivate_cyberherd_member called without user_id, skipping")
         return
     
-    await db.execute(
+    await _db().execute(
         f"""
         UPDATE {db.references_schema}cyber_herd
         SET is_active = 0, amount = 0, payouts = 0.0, event_id = NULL,
@@ -1099,6 +1193,8 @@ async def deactivate_cyberherd_member(pubkey: str, user_id: str | None = None):
     try:
         await recompute_member_payouts(user_id)
     except Exception as exc:
+        if in_admission_transaction():
+            raise
         logger.debug(f"cyberherd: recompute after deactivate failed: {exc}")
     # After deactivation, recompute and update split targets if a source wallet is configured
     try:
@@ -1107,7 +1203,10 @@ async def deactivate_cyberherd_member(pubkey: str, user_id: str | None = None):
         s = await get_settings(user_id)
         sw = getattr(s, "source_wallet", None)
         if sw:
-            await schedule_split_recompute(str(sw), user_id=user_id)
+            if in_admission_transaction():
+                defer_after_commit(lambda sw=sw, user_id=user_id: schedule_split_recompute(str(sw), user_id=user_id))
+            else:
+                await schedule_split_recompute(str(sw), user_id=user_id)
     except Exception as e:
         logger.warning(e)
 
@@ -1126,7 +1225,7 @@ async def deactivate_all_cyberherd_members(user_id: str | None = None):
         return 0
     
     # First, count how many members will be deactivated
-    count_result = await db.fetchone(
+    count_result = await _db().fetchone(
         f"""
         SELECT COUNT(*) as count FROM {db.references_schema}cyber_herd
         WHERE is_active = 1 AND user_id = :user_id
@@ -1136,7 +1235,7 @@ async def deactivate_all_cyberherd_members(user_id: str | None = None):
     member_count = count_result.get("count", 0) if count_result else 0
     
     # Now deactivate them
-    await db.execute(
+    await _db().execute(
         f"""
         UPDATE {db.references_schema}cyber_herd
         SET is_active = 0, amount = 0, payouts = 0.0, event_id = NULL,
@@ -1156,7 +1255,10 @@ async def deactivate_all_cyberherd_members(user_id: str | None = None):
         s = await get_settings(user_id)
         sw = getattr(s, "source_wallet", None)
         if sw:
-            await schedule_split_recompute(str(sw), user_id=user_id)
+            if in_admission_transaction():
+                defer_after_commit(lambda sw=sw, user_id=user_id: schedule_split_recompute(str(sw), user_id=user_id))
+            else:
+                await schedule_split_recompute(str(sw), user_id=user_id)
     except Exception as e:
         logger.warning(e)
     
@@ -1178,7 +1280,7 @@ async def is_pubkey_banned(pubkey: str, user_id: str | None = None) -> bool:
     normalized_pubkey = str(pubkey).strip().lower()
     
     try:
-        result = await db.fetchone(
+        result = await _db().fetchone(
             f"""
             SELECT banned FROM {db.references_schema}cyber_herd
             WHERE pubkey = :pubkey AND user_id = :user_id
@@ -1217,7 +1319,7 @@ async def set_member_ban_status(pubkey: str, banned: bool, user_id: str | None =
     try:
         # If banning, also deactivate the member
         if banned:
-            await db.execute(
+            await _db().execute(
                 f"""
                 UPDATE {db.references_schema}cyber_herd
                 SET banned = :banned, is_active = 0
@@ -1227,7 +1329,7 @@ async def set_member_ban_status(pubkey: str, banned: bool, user_id: str | None =
             )
             logger.info(f"Banned and deactivated member {normalized_pubkey[:16]}... for user {user_id}")
         else:
-            await db.execute(
+            await _db().execute(
                 f"""
                 UPDATE {db.references_schema}cyber_herd
                 SET banned = :banned
@@ -1248,7 +1350,10 @@ async def set_member_ban_status(pubkey: str, banned: bool, user_id: str | None =
             s = await get_settings(user_id)
             sw = getattr(s, "source_wallet", None)
             if sw:
-                await schedule_split_recompute(str(sw), user_id=user_id)
+                if in_admission_transaction():
+                    defer_after_commit(lambda sw=sw, user_id=user_id: schedule_split_recompute(str(sw), user_id=user_id))
+                else:
+                    await schedule_split_recompute(str(sw), user_id=user_id)
         except Exception as e:
             logger.warning(f"Failed to schedule split recompute after ban status change: {e}")
         
@@ -1426,7 +1531,7 @@ async def ensure_inactive_cyberherd_member(
 
     for attempt in range(2):
         try:
-            await db.execute(insert_sql, values)
+            await _db().execute(insert_sql, values)
             break
         except Exception as e:
             err_msg = str(e).lower()
@@ -1565,7 +1670,7 @@ async def add_new_active_member(member_data: dict, user_id: str | None = None):
     # previous engagement categories (e.g. keep both zap=9735 and reaction=7)
     existing_kinds_row = None
     try:
-        existing_kinds_row = await db.fetchone(
+        existing_kinds_row = await _db().fetchone(
             f"SELECT kinds FROM {db.references_schema}cyber_herd WHERE pubkey = :pubkey AND user_id = :user_id",
             {"pubkey": normalized_pubkey, "user_id": user_id},
         )
@@ -1623,7 +1728,7 @@ async def add_new_active_member(member_data: dict, user_id: str | None = None):
             """
     for attempt in range(2):
         try:
-            await db.execute(insert_sql, values)
+            await _db().execute(insert_sql, values)
             break
         except Exception as e:
             err_msg = str(e).lower()
@@ -1642,6 +1747,8 @@ async def add_new_active_member(member_data: dict, user_id: str | None = None):
     try:
         await recompute_member_payouts(user_id)
     except Exception as exc:
+        if in_admission_transaction():
+            raise
         logger.debug(f"cyberherd: recompute after add member skipped: {exc}")
 
     # After successful insert/update, recompute split targets (idempotent) so the
@@ -1656,7 +1763,10 @@ async def add_new_active_member(member_data: dict, user_id: str | None = None):
             s = await get_settings(user_id)
             sw = getattr(s, "source_wallet", None)
             if sw:
-                await schedule_split_recompute(str(sw), user_id=user_id)
+                if in_admission_transaction():
+                    defer_after_commit(lambda sw=sw, user_id=user_id: schedule_split_recompute(str(sw), user_id=user_id))
+                else:
+                    await schedule_split_recompute(str(sw), user_id=user_id)
         else:
             try:
                 logger.debug("cyberherd: add_new_active_member: new member has no lud16; skipping split recompute")
@@ -1696,7 +1806,7 @@ async def update_and_activate_member(
     
     # Best-effort enrichment if the row is missing nprofile
     try:
-        row = await db.fetchone(
+        row = await _db().fetchone(
             f"SELECT nprofile FROM {db.references_schema}cyber_herd WHERE pubkey = :pubkey AND user_id = :user_id",
             {"pubkey": normalized_pubkey, "user_id": user_id},
         )
@@ -1711,7 +1821,7 @@ async def update_and_activate_member(
                 except Exception as e:
                     logger.debug(f"Cyberherd CRUD (update) hex_to_nprofile failed: {e}")
                 if nprof:
-                    await db.execute(
+                    await _db().execute(
                         f"""
                         UPDATE {db.references_schema}cyber_herd
                         SET nprofile = :nprofile
@@ -1770,7 +1880,7 @@ async def update_and_activate_member(
     result = None
     for attempt in range(2):
         try:
-            result = await db.execute(update_sql, params)
+            result = await _db().execute(update_sql, params)
             break
         except Exception as e:
             err_msg = str(e).lower()
@@ -1794,6 +1904,8 @@ async def update_and_activate_member(
     try:
         await recompute_member_payouts(user_id)
     except Exception as exc:
+        if in_admission_transaction():
+            raise
         logger.debug(f"cyberherd: recompute after update member skipped: {exc}")
 
     # After successful update, recompute split targets (idempotent) so the
@@ -1825,7 +1937,10 @@ async def update_and_activate_member(
                 s = await get_settings(user_id)
                 sw = getattr(s, "source_wallet", None)
                 if sw:
-                    await schedule_split_recompute(str(sw), user_id=user_id)
+                    if in_admission_transaction():
+                        defer_after_commit(lambda sw=sw, user_id=user_id: schedule_split_recompute(str(sw), user_id=user_id))
+                    else:
+                        await schedule_split_recompute(str(sw), user_id=user_id)
         else:
             try:
                 logger.debug("cyberherd: update_and_activate_member: member has no lud16 and eligible members exist; skipping split recompute")
@@ -1869,7 +1984,7 @@ async def update_and_activate_member(
 
             if new_kinds_set:
                 # Fetch existing kinds
-                row = await db.fetchone(
+                row = await _db().fetchone(
                     f"SELECT kinds FROM {db.references_schema}cyber_herd WHERE pubkey = :pubkey AND user_id = :user_id",
                     {"pubkey": normalized_pubkey, "user_id": user_id},
                 )
@@ -1886,11 +2001,13 @@ async def update_and_activate_member(
                 else:
                     merged_str = None
 
-                await db.execute(
+                await _db().execute(
                     f"UPDATE {db.references_schema}cyber_herd SET kinds = :kinds WHERE pubkey = :pubkey AND user_id = :user_id",
                     {"kinds": merged_str, "pubkey": normalized_pubkey, "user_id": user_id},
                 )
         except Exception as e:
+            if in_admission_transaction():
+                raise
             try:
                 logger.debug(f"cyberherd: failed to merge kinds for {normalized_pubkey[:8]}...: {e}")
             except Exception:
@@ -1908,7 +2025,7 @@ async def delete_cyberherd_member_by_pubkey(pubkey: str, user_id: str | None = N
         logger.warning("delete_cyberherd_member_by_pubkey called without user_id, skipping")
         return
     
-    await db.execute(
+    await _db().execute(
         f"DELETE FROM {db.references_schema}cyber_herd WHERE pubkey = :pubkey AND user_id = :user_id",
         {"pubkey": pubkey, "user_id": user_id},
     )
@@ -1923,7 +2040,10 @@ async def delete_cyberherd_member_by_pubkey(pubkey: str, user_id: str | None = N
         s = await get_settings(user_id)
         sw = getattr(s, "source_wallet", None)
         if sw:
-            await schedule_split_recompute(str(sw), user_id=user_id)
+            if in_admission_transaction():
+                defer_after_commit(lambda sw=sw, user_id=user_id: schedule_split_recompute(str(sw), user_id=user_id))
+            else:
+                await schedule_split_recompute(str(sw), user_id=user_id)
     except Exception as e:
         logger.warning(f"Failed to schedule split recompute after member deletion: {e}")
 
@@ -1973,7 +2093,7 @@ async def delete_cyberherd_members_without_lud16(user_id: str | None = None) -> 
 
     deleted = 0
     try:
-        row = await db.fetchone(count_sql, params)
+        row = await _db().fetchone(count_sql, params)
         if row:
             try:
                 deleted = int(row.get("count") or 0)
@@ -1982,7 +2102,7 @@ async def delete_cyberherd_members_without_lud16(user_id: str | None = None) -> 
                     deleted = int(row["count"])  # type: ignore[index]
                 except Exception:
                     deleted = 0
-        await db.execute(delete_sql, params)
+        await _db().execute(delete_sql, params)
     except Exception as e:
         logger.warning(f"delete_cyberherd_members_without_lud16 failed for user {user_id}: {e}")
         return 0
@@ -1998,7 +2118,10 @@ async def delete_cyberherd_members_without_lud16(user_id: str | None = None) -> 
         s = await get_settings(user_id)
         sw = getattr(s, "source_wallet", None)
         if sw:
-            await schedule_split_recompute(str(sw), user_id=user_id)
+            if in_admission_transaction():
+                defer_after_commit(lambda sw=sw, user_id=user_id: schedule_split_recompute(str(sw), user_id=user_id))
+            else:
+                await schedule_split_recompute(str(sw), user_id=user_id)
     except Exception as e:
         logger.warning(f"Failed to schedule split recompute after delete_members_without_lud16: {e}")
 
@@ -2018,7 +2141,7 @@ async def update_cyberherd_member_allocation(pubkey: str, allocation_percentage:
         return
     
     try:
-        await db.execute(
+        await _db().execute(
             f"""
             UPDATE {db.references_schema}cyber_herd
             SET allocation_percentage = :allocation
@@ -2083,7 +2206,7 @@ async def _bootstrap_cyberherd_tables():
             lud16 TEXT,
             nip05 TEXT,
             notified INTEGER DEFAULT 0,
-            payouts REAL DEFAULT 0,
+            payouts DOUBLE PRECISION DEFAULT 0,
             amount INTEGER DEFAULT 0,
             picture TEXT,
             relays TEXT,
@@ -2159,7 +2282,7 @@ async def _bootstrap_cyberherd_tables():
     )
     for s in stmts:
         try:
-            await db.execute(s)
+            await _db().execute(s)
         except Exception:
             pass
     processed_zaps_table = f"{db.references_schema}processed_zaps"
@@ -2184,7 +2307,7 @@ async def _bootstrap_cyberherd_tables():
             has_column = False
         if not has_column:
             try:
-                await db.execute(
+                await _db().execute(
                     f"ALTER TABLE {processed_zaps_table} ADD COLUMN {column} {column_type};"
                 )
             except Exception:
@@ -2196,7 +2319,7 @@ async def _bootstrap_cyberherd_tables():
     ]
     for stmt in index_statements:
         try:
-            await db.execute(stmt)
+            await _db().execute(stmt)
         except Exception:
             pass
     unique_statements = [
@@ -2205,11 +2328,11 @@ async def _bootstrap_cyberherd_tables():
     ]
     for stmt in unique_statements:
         try:
-            await db.execute(stmt)
+            await _db().execute(stmt)
         except Exception:
             pass
     try:
-        await db.execute(
+        await _db().execute(
             f"ALTER TABLE {processed_zaps_table} ALTER COLUMN processed_at TYPE TEXT USING processed_at::text;"
         )
     except Exception:
@@ -2217,7 +2340,7 @@ async def _bootstrap_cyberherd_tables():
         pass
     try:
         if not await _column_exists(schema_table, "nip05"):
-            await db.execute(f"ALTER TABLE {table_name} ADD COLUMN nip05 TEXT;")
+            await _db().execute(f"ALTER TABLE {table_name} ADD COLUMN nip05 TEXT;")
     except Exception:
         pass
     try:
@@ -2286,7 +2409,7 @@ async def get_zap_totals_row(user_id: str, zapper_pubkey: str) -> dict | None:
         return None
     zapper = zapper_pubkey.strip().lower()
     try:
-        row = await db.fetchone(
+        row = await _db().fetchone(
             f"""
             SELECT * FROM {db.references_schema}zap_totals
             WHERE user_id = :user_id AND zapper_pubkey = :zapper_pubkey
@@ -2297,7 +2420,7 @@ async def get_zap_totals_row(user_id: str, zapper_pubkey: str) -> dict | None:
     except Exception as e:
         if any(t in str(e).lower() for t in ["undefinedtable", "does not exist", "no such table"]):
             await _bootstrap_cyberherd_tables()
-            row = await db.fetchone(
+            row = await _db().fetchone(
                 f"""
                 SELECT * FROM {db.references_schema}zap_totals
                 WHERE user_id = :user_id AND zapper_pubkey = :zapper_pubkey
@@ -2334,7 +2457,7 @@ async def upsert_zap_totals_row(
         "target_pubkey": target_pubkey.strip().lower() if target_pubkey else None,
     }
     try:
-        await db.execute(
+        await _db().execute(
             f"""
             INSERT INTO {db.references_schema}zap_totals (
                 user_id, zapper_pubkey, total_sats, event_count,
@@ -2359,7 +2482,7 @@ async def upsert_zap_totals_row(
     except Exception as e:
         if any(t in str(e).lower() for t in ["undefinedtable", "does not exist", "no such table"]):
             await _bootstrap_cyberherd_tables()
-            await db.execute(
+            await _db().execute(
                 f"""
                 INSERT INTO {db.references_schema}zap_totals (
                     user_id, zapper_pubkey, total_sats, event_count,
@@ -2397,7 +2520,7 @@ async def set_member_notified(pubkey: str, notified_ts: int, user_id: str | None
         logger.warning("set_member_notified called without user_id, skipping")
         return
     
-    await db.execute(
+    await _db().execute(
         f"""
         UPDATE {db.references_schema}cyber_herd
         SET notified = :ts
@@ -2418,7 +2541,7 @@ async def clear_member_notified(pubkey: str, user_id: str | None = None) -> None
         logger.warning("clear_member_notified called without user_id, skipping")
         return
     
-    await db.execute(
+    await _db().execute(
         f"""
         UPDATE {db.references_schema}cyber_herd
         SET notified = 0
@@ -2431,7 +2554,7 @@ async def clear_member_notified(pubkey: str, user_id: str | None = None) -> None
 async def get_processed_zap(user_id: str, event_id: str):
     """Get a processed zap by event ID."""
     try:
-        row = await db.fetchone(
+        row = await _db().fetchone(
             f"SELECT * FROM {db.references_schema}processed_zaps WHERE user_id = :user_id AND event_id = :event_id",
             {"user_id": user_id, "event_id": event_id},
         )
@@ -2452,7 +2575,7 @@ async def get_processed_zap(user_id: str, event_id: str):
         ):
             try:
                 await _bootstrap_cyberherd_tables()
-                row = await db.fetchone(
+                row = await _db().fetchone(
                     f"SELECT * FROM {db.references_schema}processed_zaps WHERE user_id = :user_id AND event_id = :event_id",
                     {"user_id": user_id, "event_id": event_id},
                 )
@@ -2462,6 +2585,26 @@ async def get_processed_zap(user_id: str, event_id: str):
                 return None
         logger.error(f"Error getting processed zap: {e}")
         return None
+
+async def account_zap_payment(*, user_id: str, payment_hash: str,
+                              zapper_pubkey: str, amount_sats: int,
+                              note_id: str | None = None, processed_at: int | None = None) -> bool:
+    """Record the settled invoice identity included in historical totals.
+
+    This ledger is separate from the admission claim: a history refresh may
+    include a settled invoice whose membership update has not run yet.
+    """
+    result = await _db().execute(
+        f"""INSERT INTO {db.references_schema}processed_zaps
+        (user_id,event_id,note_id,zapper_pubkey,amount,processed_at)
+        VALUES (:user_id,:hash,:note,:zapper,:amount,:timestamp)
+        ON CONFLICT DO NOTHING""",
+        {"user_id": user_id, "hash": payment_hash, "note": note_id,
+         "zapper": zapper_pubkey, "amount": amount_sats,
+         "timestamp": str(processed_at or int(time.time()))},
+    )
+    return result.rowcount == 1
+
 
 async def create_processed_zap(processed_zap_data: dict):
     """Create a processed zap record."""
@@ -2499,7 +2642,7 @@ async def create_processed_zap(processed_zap_data: dict):
     payload["processed_at"] = processed_at
 
     try:
-        await db.execute(
+        await _db().execute(
             f"""INSERT INTO {db.references_schema}processed_zaps (user_id, event_id, note_id, zapper_pubkey, amount, processed_at)
             VALUES (:user_id, :event_id, :note_id, :zapper_pubkey, :amount, :processed_at)
             """,
@@ -2521,7 +2664,7 @@ async def create_processed_zap(processed_zap_data: dict):
         ):
             try:
                 await _bootstrap_cyberherd_tables()
-                await db.execute(
+                await _db().execute(
                     f"""INSERT INTO {db.references_schema}processed_zaps (user_id, event_id, note_id, zapper_pubkey, amount, processed_at)
                     VALUES (:user_id, :event_id, :note_id, :zapper_pubkey, :amount, :processed_at)
                     """,
@@ -2589,7 +2732,7 @@ async def fetch_processed_zaps(
     sql += " LIMIT :limit"
 
     try:
-        rows = await db.fetchall(sql, params)
+        rows = await _db().fetchall(sql, params)
         candidate_rows: list[dict[str, Any]] = []
         for row in rows or []:
             data = dict(row)
@@ -2658,7 +2801,7 @@ async def count_processed_zaps(user_id: str) -> int:
     params = {"user_id": user_id}
 
     async def _fetch() -> int:
-        row = await db.fetchone(sql, params)
+        row = await _db().fetchone(sql, params)
         if not row:
             return 0
         try:
@@ -2709,7 +2852,7 @@ async def get_monitoring_totals(user_id: str) -> dict[str, int]:
     params = {"user_id": user_id}
 
     async def _fetch() -> None:
-        rows = await db.fetchall(sql, params)
+        rows = await _db().fetchall(sql, params)
         for row in rows or []:
             event_type_raw = row.get("event_type")
             try:
@@ -2778,13 +2921,13 @@ async def is_payment_processed(
         if note_id is not None:
             # Check for specific (event, note) pair
             # Use COALESCE to handle both NULL and empty string note_id values
-            row = await db.fetchone(
+            row = await _db().fetchone(
                 f"SELECT 1 FROM {db.references_schema}processed_events WHERE user_id = :user_id AND event_hash = :event_hash AND COALESCE(note_id, '') = :note_id",
                 {"user_id": user_id, "event_hash": payment_hash, "note_id": note_id or ''},
             )
         else:
             # Check if event was processed for any note (backward compatible behavior)
-            row = await db.fetchone(
+            row = await _db().fetchone(
                 f"SELECT 1 FROM {db.references_schema}processed_events WHERE user_id = :user_id AND event_hash = :event_hash",
                 {"user_id": user_id, "event_hash": payment_hash},
             )
@@ -2797,12 +2940,12 @@ async def is_payment_processed(
             try:
                 await _bootstrap_cyberherd_tables()
                 if note_id is not None:
-                    row = await db.fetchone(
+                    row = await _db().fetchone(
                         f"SELECT 1 FROM {db.references_schema}processed_events WHERE user_id = :user_id AND event_hash = :event_hash AND COALESCE(note_id, '') = :note_id",
                         {"user_id": user_id, "event_hash": payment_hash, "note_id": note_id or ''},
                     )
                 else:
-                    row = await db.fetchone(
+                    row = await _db().fetchone(
                         f"SELECT 1 FROM {db.references_schema}processed_events WHERE user_id = :user_id AND event_hash = :event_hash",
                         {"user_id": user_id, "event_hash": payment_hash},
                     )
@@ -2845,7 +2988,7 @@ async def register_processed_payment(
             try:
                 # Check existence first - include note_id in the check for the new schema
                 # Use COALESCE to handle both NULL and empty string note_id values
-                row = await db.fetchone(
+                row = await _db().fetchone(
                     f"SELECT 1 FROM {db.references_schema}processed_events WHERE user_id = :user_id AND event_hash = :event_hash AND COALESCE(note_id, '') = :note_id",
                     {"user_id": user_id, "event_hash": payment_hash, "note_id": normalized_note_id},
                 )
@@ -2854,7 +2997,7 @@ async def register_processed_payment(
 
                 # Not present — insert and report True
                 # The unique constraint is now on (user_id, event_hash, note_id)
-                await db.execute(
+                await _db().execute(
                     f"""INSERT INTO {db.references_schema}processed_events (user_id, event_hash, note_id, pubkey, processed_at, event_type)
                     VALUES (:user_id, :event_hash, :note_id, :pubkey, :processed_at, :event_type)
                     """,
@@ -2887,13 +3030,13 @@ async def register_processed_payment(
                     try:
                         await _bootstrap_cyberherd_tables()
                         # After bootstrap, perform the check-insert again
-                        row = await db.fetchone(
+                        row = await _db().fetchone(
                             f"SELECT 1 FROM {db.references_schema}processed_events WHERE user_id = :user_id AND event_hash = :event_hash AND COALESCE(note_id, '') = :note_id",
                             {"user_id": user_id, "event_hash": payment_hash, "note_id": normalized_note_id},
                         )
                         if row:
                             return False
-                        await db.execute(
+                        await _db().execute(
                             f"""INSERT INTO {db.references_schema}processed_events (user_id, event_hash, note_id, pubkey, processed_at, event_type)
                             VALUES (:user_id, :event_hash, :note_id, :pubkey, :processed_at, :event_type)
                             """,
@@ -2940,7 +3083,7 @@ async def clear_processed_zaps_for_user(user_id: str | None):
     if not user_id:
         return
     try:
-        await db.execute(
+        await _db().execute(
             f"DELETE FROM {db.references_schema}processed_zaps WHERE user_id = :user_id",
             {"user_id": user_id},
         )
@@ -2949,7 +3092,7 @@ async def clear_processed_zaps_for_user(user_id: str | None):
         if any(t in msg for t in ("undefinedtable", "does not exist", "no such table")):
             try:
                 await _bootstrap_cyberherd_tables()
-                await db.execute(
+                await _db().execute(
                     f"DELETE FROM {db.references_schema}processed_zaps WHERE user_id = :user_id",
                     {"user_id": user_id},
                 )
@@ -2967,7 +3110,7 @@ async def clear_processed_events_for_user(user_id: str | None):
     if not user_id:
         return
     try:
-        await db.execute(
+        await _db().execute(
             f"DELETE FROM {db.references_schema}processed_events WHERE user_id = :user_id",
             {"user_id": user_id},
         )
@@ -2976,7 +3119,7 @@ async def clear_processed_events_for_user(user_id: str | None):
         if any(t in msg for t in ("undefinedtable", "does not exist", "no such table")):
             try:
                 await _bootstrap_cyberherd_tables()
-                await db.execute(
+                await _db().execute(
                     f"DELETE FROM {db.references_schema}processed_events WHERE user_id = :user_id",
                     {"user_id": user_id},
                 )
@@ -3036,7 +3179,7 @@ async def delete_processed_event(
 
     try:
         if note_id is not None:
-            await db.execute(
+            await _db().execute(
                 f"""
                 DELETE FROM {db.references_schema}processed_events
                 WHERE user_id = :user_id
@@ -3050,7 +3193,7 @@ async def delete_processed_event(
                 },
             )
         else:
-            await db.execute(
+            await _db().execute(
                 f"""
                 DELETE FROM {db.references_schema}processed_events
                 WHERE user_id = :user_id AND event_hash = :event_hash
@@ -3076,7 +3219,7 @@ async def get_member_by_pubkey(user_id: str, pubkey: str):
         logger.warning("get_member_by_pubkey called without valid pubkey, returning None")
         return None
     try:
-        row = await db.fetchone(
+        row = await _db().fetchone(
             f"SELECT * FROM {db.references_schema}cyber_herd WHERE pubkey = :pubkey AND user_id = :user_id",
             {"pubkey": normalized_pubkey, "user_id": user_id}
         )

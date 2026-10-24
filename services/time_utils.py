@@ -44,6 +44,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import os
+from pathlib import Path
 try:
     # Python 3.9+
     from zoneinfo import ZoneInfo
@@ -95,20 +96,35 @@ class DayBoundaries:
 
 
 def _get_system_local_timezone():
-    """Return the system local timezone, preserving DST rules when possible."""
-    tz_name = os.environ.get("TZ")
-    if ZoneInfo is not None and tz_name:
-        candidate = tz_name.strip()
-        if candidate and not candidate.startswith(":"):
+    """Load the configured zone, including transition rules when TZ is unset."""
+    tz_name = os.environ.get("TZ", "").strip().lstrip(":")
+    if ZoneInfo is not None:
+        if tz_name:
             try:
-                return ZoneInfo(candidate)
-            except Exception:
+                if os.path.isabs(tz_name):
+                    with open(tz_name, "rb") as zone_file:
+                        return ZoneInfo.from_file(zone_file, key=tz_name)
+                return ZoneInfo(tz_name)
+            except (OSError, ValueError, KeyError):
                 pass
-
-    try:
-        return datetime.now().astimezone().tzinfo or timezone.utc
-    except Exception:
-        return timezone.utc
+        # Most Linux hosts link localtime to the named zoneinfo entry.
+        try:
+            localtime_path = str(Path("/etc/localtime").resolve())
+            if "/zoneinfo/" in localtime_path:
+                return ZoneInfo(localtime_path.split("/zoneinfo/", 1)[1])
+        except (OSError, ValueError, KeyError):
+            pass
+        # A copied TZif file still contains DST rules even without a zone name.
+        try:
+            with open("/etc/localtime", "rb") as zone_file:
+                return ZoneInfo.from_file(zone_file, key="localtime")
+        except (OSError, ValueError):
+            pass
+        try:
+            return ZoneInfo(Path("/etc/timezone").read_text().strip())
+        except (OSError, ValueError, KeyError):
+            pass
+    return timezone.utc
 
 
 def get_day_boundaries_utc(days_ago: int = 0) -> DayBoundaries:
@@ -247,11 +263,7 @@ def format_timestamp_local(timestamp: int, fmt: str = "%Y-%m-%d %H:%M:%S %Z") ->
         Formatted string in system's local timezone
     """
     dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-    # Use system's local timezone
-    try:
-        local_tz = datetime.now().astimezone().tzinfo
-    except Exception:
-        local_tz = timezone.utc
+    local_tz = _get_system_local_timezone()
 
     local_dt = dt.astimezone(local_tz)
     return local_dt.strftime(fmt)

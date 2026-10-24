@@ -50,6 +50,9 @@ async def member_db(request, monkeypatch, tmp_path):
 
 
 async def create_members(database, primary_key):
+    await database.execute(
+        f"CREATE TABLE {database.references_schema}settings (user_id TEXT PRIMARY KEY)"
+    )
     await database.execute(f"""CREATE TABLE {database.references_schema}cyber_herd (
             pubkey TEXT NOT NULL, user_id TEXT, display_name TEXT,
             event_id TEXT, note TEXT, kinds TEXT, nprofile TEXT, lud16 TEXT,
@@ -75,6 +78,9 @@ async def migrate_from_35(database, monkeypatch):
         await helpers.run_migration(
             connection, migrations, "cyberherd", type("Version", (), {"version": 35})()
         )
+    # Column type upgrades invalidate asyncpg prepared SELECT metadata. A real
+    # extension upgrade starts with fresh connections; mirror that boundary.
+    await database.engine.dispose()
     return versions
 
 
@@ -113,7 +119,7 @@ async def test_members_join_after_version_35_key_repair(member_db, monkeypatch, 
         {"user_id": "other-owner", "kinds": str(kind), "is_active": 1},
         {"user_id": "owner", "kinds": str(kind), "is_active": 1},
     ]
-    assert versions == [36]
+    assert versions == [36, 37, 38]
 
 
 @pytest.mark.anyio
@@ -125,7 +131,7 @@ async def test_key_repair_is_idempotent(member_db, monkeypatch):
         )
     )
     for _ in range(2):
-        assert await migrate_from_35(member_db, monkeypatch) == [36]
+        assert await migrate_from_35(member_db, monkeypatch) == [36, 37, 38]
         assert (
             dict(
                 await member_db.fetchone(

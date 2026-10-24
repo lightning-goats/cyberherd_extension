@@ -1,20 +1,15 @@
 import asyncio
 import json
+from contextlib import nullcontext
 from datetime import datetime, time, timezone
 from typing import Any
 
 from loguru import logger
+from sqlalchemy import text
 
 from lnbits.core.crud import get_wallet
 from lnbits.tasks import create_permanent_unique_task, wait_for_paid_invoices
 
-from .crud import (
-    clear_processed_events_for_user,
-    clear_processed_zaps_for_user,
-    deactivate_all_cyberherd_members,
-    list_settings_with_tracking,
-    upsert_settings,
-)
 from .services.splits import reset_splits_to_predefined_wallet
 from .services.payment_coordinator import (
     get_payment_coordinator as get_zap_monitor,
@@ -283,135 +278,106 @@ async def _restart_kind1_subscriptions_for_user(
     return restarted
 
 
-async def midnight_reset_job(app: Any | None = None):
-    if app is None:
-        app = _APP_REF
-    """Deactivate all members and reset splits for every tracking-enabled settings row.
+_membership_day_lock = asyncio.Lock()
 
-    Previously only the first/global row was handled which could skip multi-tenant users
-    and skip split resets when `source_wallet` wasn't present on the legacy row. Now we:
-      1. Deactivate members for each user (iterate all settings).
-      2. Iterate each settings row with zap tracking enabled and a source wallet and reset
-         its splits to the predefined zap wallet (100%) or clear if none present.
+
+async def ensure_membership_day(
+    user_id: str | None = None, app: Any | None = None, *, admission_lock_held: bool = False
+) -> list[str]:
+    """Catch up opted-in local days before admission, payout, or monitor startup.
+
+    Missing markers initialize today without erasing legacy membership. Database
+    reset and day advancement commit together; failed split resets remain pending
+    and block intake until a retry succeeds. Idempotency ledgers survive rollover.
     """
-    start_time = utc_now()
-    logger.info(f"🕛 CyberHerd midnight reset starting at {start_time.isoformat()}")
-    
-    total_users = 0
-    total_members_deactivated = 0
-    total_wallets_reset = 0
-    total_processed_cleared = 0
-    total_tracked_reset = 0
-    total_subscriptions_restarted = 0
-    errors = []
-    
-    try:
-        # Get all settings rows to iterate through all users
-        settings_rows = await list_settings_with_tracking(require_herd_wallet=False)
-        if not settings_rows:
-            logger.info("CyberHerd midnight reset: no tracking-enabled settings rows found")
-            return
-        
-        total_users = len(settings_rows)
-        logger.info(f"CyberHerd midnight reset: processing {total_users} user(s)")
-        
-        # Deactivate members for each user (only if they opted into midnight reset)
-        for s in settings_rows:
-            try:
-                if not getattr(s, "midnight_reset_enabled", True):
-                    logger.debug(f"CyberHerd midnight reset: skipping user {getattr(s,'user_id',None)[:12] + '...' if getattr(s,'user_id',None) else 'global'} - midnight_reset_enabled=False")
-                    continue
-            except Exception:
-                # If attribute access fails, default to performing the reset
-                pass
-            user_id = getattr(s, "user_id", None)
-            if user_id:
-                try:
-                    result = await deactivate_all_cyberherd_members(user_id)
-                    # Count how many members were deactivated
-                    # deactivate_all_cyberherd_members may return count or None
-                    member_count = result if isinstance(result, int) else 0
-                    total_members_deactivated += member_count
-                    logger.info(f"CyberHerd: deactivated {member_count} member(s) for user {user_id[:12]}...")
-                except Exception as e:
-                    error_msg = f"Failed to deactivate members for user {user_id[:12]}...: {e}"
-                    logger.warning(f"CyberHerd midnight reset: {error_msg}")
-                    errors.append(error_msg)
-                # Clear processed zap/event history (idempotency reset)
-                try:
-                    await clear_processed_events_for_user(user_id)
-                    await clear_processed_zaps_for_user(user_id)
-                    total_processed_cleared += 1
-                except Exception as e:
-                    error_msg = f"Failed to clear processed events for user {user_id[:12]}...: {e}"
-                    logger.warning(f"CyberHerd midnight reset: {error_msg}")
-                    errors.append(error_msg)
-                # Reset tracked events/timestamps for fresh detection next day
-                try:
-                    setattr(s, "tracked_event_ids", [])
-                    setattr(s, "tracked_event_addresses", {})
-                    setattr(s, "tracked_event_timestamps", {})
-                    await upsert_settings(s, user_id)
-                    total_tracked_reset += 1
-                except Exception as e:
-                    error_msg = f"Failed to reset tracked events for user {user_id[:12]}...: {e}"
-                    logger.warning(f"CyberHerd midnight reset: {error_msg}")
-                    errors.append(error_msg)
+    from .services.time_utils import get_day_boundaries_utc
+    from .services.headbutt import _get_headbutt_lock
 
-                # Restart kind 1/30311 note subscriptions so the new day begins fresh
-                try:
-                    restarted = await _restart_kind1_subscriptions_for_user(user_id, app)
-                    if restarted:
-                        total_subscriptions_restarted += 1
-                    else:
-                        error_msg = f"Note subscriptions not restarted for user {user_id[:12]}..."
-                        logger.warning(f"CyberHerd midnight reset: {error_msg}")
-                        errors.append(error_msg)
-                except Exception as e:
-                    error_msg = f"Failed to restart note subscriptions for user {user_id[:12]}...: {e}"
-                    logger.warning(f"CyberHerd midnight reset: {error_msg}")
-                    errors.append(error_msg)
-        
-        # Reset splits for each source wallet (only for settings that opted in)
-        for s in settings_rows:
-            try:
-                if not getattr(s, "midnight_reset_enabled", True):
-                    logger.debug(f"CyberHerd midnight reset: skipping split reset for user {getattr(s,'user_id',None)[:12] + '...' if getattr(s,'user_id',None) else 'global'} - midnight_reset_enabled=False")
-                    continue
-            except Exception:
-                pass
-            sw = getattr(s, "source_wallet", None)
-            if not sw:
-                logger.debug("CyberHerd midnight reset: skipping row without source_wallet")
+    reset_users = []
+    # Admission callers hold this lock already and recheck the day after queuing.
+    admission_lock = nullcontext() if admission_lock_held else _get_headbutt_lock()
+    async with admission_lock, _membership_day_lock:
+        database = crud_module.db
+        schema = database.references_schema
+        query = f"SELECT * FROM {schema}settings WHERE midnight_reset_enabled = 1"
+        params = {}
+        if user_id is not None:
+            query += " AND user_id = :user_id"
+            params["user_id"] = user_id
+        # Do not fail open when storage is unavailable.
+        settings_rows = await database.fetchall(query, params)
+        today = get_day_boundaries_utc().local_day_str
+        for row in settings_rows:
+            uid = row.get("user_id")
+            if not uid:
                 continue
-            try:
-                uid = getattr(s, "user_id", None)
-                result = await reset_splits_to_predefined_wallet(sw, user_id=uid)
-                targets = result.get("targets", []) if isinstance(result, dict) else []
-                logger.info(
-                    f"CyberHerd midnight reset: splits reset for source_wallet={sw} targets={len(targets)}"
+            values = {"user_id": uid, "local_day": today}
+            source_wallet = row.get("source_wallet")
+            async with database.connect() as conn:
+                # Connection.execute commits automatically; use the underlying
+                # transaction so membership and its durable day advance together.
+                async def execute(query, values):
+                    await conn.conn.execute(
+                        text(conn.rewrite_query(query)), conn.rewrite_values(values)
+                    )
+
+                async with conn.conn.begin():
+                    await execute(
+                        f"""INSERT INTO {schema}membership_reset_days (user_id, local_day)
+                        VALUES (:user_id, :local_day) ON CONFLICT (user_id) DO NOTHING""",
+                        values,
+                    )
+                    marker = await conn.fetchone(
+                        f"SELECT local_day, splits_pending FROM {schema}membership_reset_days WHERE user_id = :user_id"
+                        + (" FOR UPDATE" if database.type != "SQLITE" else ""),
+                        {"user_id": uid},
+                    )
+                    if marker["local_day"] < today:
+                        await execute(
+                            f"""UPDATE {schema}cyber_herd SET is_active = 0, amount = 0,
+                            payouts = 0.0, event_id = NULL, note = NULL, kinds = NULL
+                            WHERE user_id = :user_id""", {"user_id": uid},
+                        )
+                        await execute(
+                            f"""UPDATE {schema}settings SET tracked_event_ids = '[]',
+                            tracked_event_addresses = '{{}}', tracked_event_timestamps = '{{}}'
+                            WHERE user_id = :user_id""", {"user_id": uid},
+                        )
+                        await execute(
+                            f"""UPDATE {schema}membership_reset_days SET local_day = :local_day,
+                            splits_pending = :pending WHERE user_id = :user_id""",
+                            {**values, "pending": int(bool(source_wallet))},
+                        )
+                        reset_users.append(uid)
+                        pending = bool(source_wallet)
+                    else:
+                        pending = bool(marker["splits_pending"])
+            if uid in reset_users:
+                await clear_monitor_cache_for_user(uid)
+            if pending:
+                if source_wallet:
+                    await reset_splits_to_predefined_wallet(source_wallet, user_id=uid)
+                await database.execute(
+                    f"UPDATE {schema}membership_reset_days SET splits_pending = 0 WHERE user_id = :user_id",
+                    {"user_id": uid},
                 )
-                total_wallets_reset += 1
-            except Exception as e:  # pragma: no cover
-                error_msg = f"Split reset failed for source_wallet={sw}: {e}"
-                logger.warning(f"CyberHerd midnight reset: {error_msg}")
-                errors.append(error_msg)
-    except Exception as e:  # pragma: no cover
-        logger.error(f"CyberHerd midnight reset job failed: {e}")
-        errors.append(f"Job failed: {e}")
-    
-    # Final summary log
-    duration = (utc_now() - start_time).total_seconds()
-    logger.success(
-        f"✅ CyberHerd midnight reset completed in {duration:.2f}s | "
-        f"Users: {total_users} | Members deactivated: {total_members_deactivated} | "
-        f"Wallets reset: {total_wallets_reset} | Processed clears: {total_processed_cleared} | "
-        f"Tracked resets: {total_tracked_reset} | Subscriptions restarted: {total_subscriptions_restarted} | "
-        f"Errors: {len(errors)}"
+    return reset_users
+
+
+async def midnight_reset_job(app: Any | None = None):
+    """Apply due local-day resets, including social-only opted-in users."""
+    app = app if app is not None else _APP_REF
+    reset_users = await ensure_membership_day(app=app)
+    # Intake can win the midnight race and advance the day first. Refresh every
+    # opted-in user's subscriptions even if no database reset remains due.
+    database = crud_module.db
+    rows = await database.fetchall(
+        f"SELECT user_id FROM {database.references_schema}settings WHERE midnight_reset_enabled = 1"
     )
-    
-    if errors:
-        logger.warning(f"CyberHerd midnight reset errors: {errors}")
+    for row in rows:
+        if row.get("user_id"):
+            await _restart_kind1_subscriptions_for_user(row["user_id"], app)
+    logger.info(f"CyberHerd daily reset: {len(reset_users)} herd(s) advanced")
 
 
 async def wait_for_midnight():
@@ -429,7 +395,7 @@ async def wait_for_midnight():
     # named zone (not a fixed offset) so the reset fires at real local midnight
     # on DST transition days.
     local_tz = _get_system_local_timezone()
-    now_local = datetime.now(local_tz)
+    now_local = now_utc.astimezone(local_tz)
     local_tz_name = now_local.tzname() or "Local"
 
     # Build next local midnight using tz-aware time (handles DST correctly)
@@ -456,8 +422,8 @@ async def schedule_midnight_reset():
     Schedules the midnight reset job to run daily.
     """
     while True:
-        await wait_for_midnight()
         await midnight_reset_job(app=_APP_REF)
+        await wait_for_midnight()
 
 
 def cyberherd_tasks(app: Any | None = None):
@@ -479,8 +445,9 @@ def cyberherd_tasks(app: Any | None = None):
         from datetime import timedelta
 
         now_utc = utc_now()
-        now_local = datetime.now().astimezone()
-        local_tz = now_local.tzinfo
+        from .services.time_utils import _get_system_local_timezone
+        local_tz = _get_system_local_timezone()
+        now_local = now_utc.astimezone(local_tz)
         local_tz_name = now_local.tzname() or "Local"
 
         next_midnight_local = datetime.combine(now_local.date(), time(0, 0, tzinfo=local_tz))

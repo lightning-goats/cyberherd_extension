@@ -978,7 +978,7 @@ async def publish_shared_template(
     # Check if Nostr publishing is enabled; if not, we'll only broadcast to websockets
     nostr_enabled = True
     try:
-        nostr_enabled = await _msg.is_nostr_publishing_enabled()
+        nostr_enabled = await _msg.is_nostr_publishing_enabled(user_id=owner_user_id)
     except Exception:
         nostr_enabled = True
 
@@ -1093,6 +1093,7 @@ async def publish_shared_template(
 async def try_publish_note(
     content: str,
     *,
+    owner_user_id: str | None = None,
     e_tags: list[str] | None = None,
     p_tags: list[str] | None = None,
     websocket_topic: str = "cyberherd",
@@ -1126,7 +1127,7 @@ async def try_publish_note(
     try:
         nostr_enabled = True
         try:
-            nostr_enabled = await _msg.is_nostr_publishing_enabled()
+            nostr_enabled = await _msg.is_nostr_publishing_enabled(user_id=owner_user_id)
         except Exception:
             nostr_enabled = True
 
@@ -1136,6 +1137,7 @@ async def try_publish_note(
             logger.debug(f"cyberherd: publishing content='{content[:100]}...' e_tags={e_tags} p_tags={p_tags}")
             ok = await _msg.publish_note(
                 content,
+                user_id=owner_user_id,
                 e_tags=e_tags,
                 p_tags=p_tags,
                 reply_to_30311_event=reply_to_30311_event,
@@ -1335,6 +1337,7 @@ async def publish_event_message(
             # Publish to nostr
             nostr_ok = await try_publish_note(
                 content_str,
+                owner_user_id=owner_user_id,
                 e_tags=e_tags,
                 p_tags=p_tags,
 
@@ -1432,6 +1435,7 @@ async def publish_event_message(
         )
         nostr_ok = await try_publish_note(
             content_str,
+            owner_user_id=owner_user_id,
             e_tags=e_tags,
             p_tags=p_tags,
             websocket_topic=websocket_topic,

@@ -143,6 +143,10 @@ def _would_event_be_tracked(event: dict, eff_pub: str | None, tags: list[str]) -
     in _append_today.
     """
     try:
+        if not isinstance(event, dict) or not _normalize_tracked_event_id(event.get("id")):
+            return False
+        if event.get("kind") not in (1, 30311) or not nostr_helpers.verify_event_signature(event):
+            return False
         if not eff_pub:
             return False
         if event.get('pubkey') != eff_pub:
@@ -436,6 +440,8 @@ async def _append_today(user_id: str | None, eff_pub: str | None, tags: list[str
     - Gets boundaries using get_day_boundaries_utc() for consistency
     - Checks event.created_at against LOCAL day boundaries (user's "today" concept)
     """
+    if not _would_event_be_tracked(event, eff_pub, tags):
+        return False
     eid = event.get("id")
     if not eid:
         _dbg("_append_today: event has no id")
@@ -1362,16 +1368,8 @@ async def _resolve_tracked_event(settings, identifier: str, cache: dict | None, 
     if event_id:
         return event_id, None
 
-    # Attempt to resolve via tracked_event_addresses (note_id -> address mapping)
-    addresses = dict(getattr(settings, 'tracked_event_addresses', {}) or {})
-    for note_id, addr in addresses.items():
-        if not isinstance(addr, str) or not addr:
-            continue
-        if addr == identifier:
-            resolved_hex = _normalize_tracked_event_id(note_id)
-            if resolved_hex:
-                return resolved_hex, {'address': addr, 'note_id': note_id}
-
+    # Stored address mappings locate candidates but do not authenticate the
+    # coordinate. Resolve it against signed event metadata below.
     # Fallback: try to look up the address via nostr_helpers
     try:
         if identifier and ':' in identifier:
@@ -1393,7 +1391,20 @@ async def _resolve_tracked_event(settings, identifier: str, cache: dict | None, 
                     if events:
                         ev = events[0]
                         ev_id = _normalize_tracked_event_id(ev.get('id'))
-                        if ev_id:
+                        if (
+                            ev_id
+                            and ev.get("kind") == kind
+                            and ev.get("pubkey") == author
+                            and any(
+                                isinstance(tag, list) and len(tag) >= 2
+                                and tag[0] == "d" and tag[1] == d_tag
+                                for tag in ev.get("tags", [])
+                            )
+                            and _would_event_be_tracked(
+                                ev, get_effective_pubkey(settings),
+                                getattr(settings, "tracked_tags", []) or [],
+                            )
+                        ):
                             return ev_id, ev
     except Exception:
         pass
@@ -1428,30 +1439,8 @@ async def _is_tracked_event(user_id: str, note_event_id: str, settings, app, cac
             (day, user_id, eff_pub, tagset),  # user-specific using caller user_id
         ]
 
-        # If the event ID is explicitly listed in settings.tracked_event_ids,
-        # treat it as tracked immediately. This covers manual IDs and
-        # automatically-detected IDs stored in settings so that zaps/reactions
-        # referencing those event IDs are processed even if the note itself
-        # wasn't seen in the in-memory cache (e.g. added manually via UI).
-        try:
-            explicit_tracked = getattr(settings, 'tracked_event_ids', []) or []
-            logger.debug(f"  Explicit tracked_event_ids ({len(explicit_tracked)}): {[e[:16]+'...' for e in explicit_tracked[:5]]}")
-            
-            if note_event_id in explicit_tracked:
-                logger.debug(f"✅ Event {note_event_id[:16]}... found in explicit tracked_event_ids!")
-                # Ensure it's present in the runtime cache for faster future checks
-                for key in cache_keys:
-                    note_ids = _get_cache_note_ids(cache, key, create=True)
-                    if note_event_id not in note_ids:
-                        note_ids.append(note_event_id)
-                return True
-            else:
-                logger.debug(f"  Event {note_event_id[:16]}... NOT in explicit tracked_event_ids")
-        except Exception as e:
-            # Fall back to cache lookup below on any error
-            logger.debug(f"  Error checking explicit tracked_event_ids: {e}")
-            pass
-
+        # Explicit IDs identify candidates; only verified daily event metadata
+        # (or today's already-validated cache) establishes entry eligibility.
         # Check cache
         for key in cache_keys:
             event_ids = _get_cache_note_ids(cache, key)
@@ -1481,7 +1470,10 @@ async def _is_tracked_event(user_id: str, note_event_id: str, settings, app, cac
                 event = events[0]
                 logger.debug("  Found event via nostr_helpers, checking if it would be tracked...")
                 # Check if this event would be tracked
-                if _would_event_be_tracked(event, eff_pub, tags):
+                if (
+                    event.get("id") == note_event_id
+                    and _would_event_be_tracked(event, eff_pub, tags)
+                ):
                     logger.debug(f"✅ Event {note_event_id[:16]}... WOULD be tracked, adding to cache")
                     # Add to cache so future checks are faster
                     for key in cache_keys:

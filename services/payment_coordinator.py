@@ -236,6 +236,21 @@ class PaymentCoordinatorService:
             
         self._running = False
     
+    async def sync_payment_for_distribution(self, payment, settings=None) -> bool:
+        """Await this invoice's durable credit before applying payout targets.
+
+        Per-call state avoids races in the shared monitor's diagnostics. Ordinary
+        donations and invalid zap metadata need no membership credit; transient
+        note, metadata or persistence failures must retry before distribution.
+        """
+        call = PaymentCoordinatorService(
+            app=self.app, db=self.db, messaging=self.messaging, user_id=self.user_id,
+        )
+        processed = await call._process_payment_for_zap(payment, settings_override=settings)
+        if not processed and call.last_error == "retryable_processing":
+            raise RuntimeError("CyberHerd payment credit unavailable; retry distribution")
+        return bool(processed)
+
     async def _process_payment_for_zap(self, payment, settings_override=None):
         """Process a payment notification to detect LNURLp zaps.
         
@@ -249,15 +264,25 @@ class PaymentCoordinatorService:
         Args:
             payment: Payment object with extra data containing zap request
         """
+        self.last_error = None
         try:
-            # Disabled in live flow; keep as no-op fast exit
+            # Intake requires explicitly enabled tracking and its scoped wallet.
             settings = settings_override or await crud.get_settings(self.user_id)
-            if not settings:
+            if not settings or not getattr(settings, 'zap_tracking_enabled', False):
+                return False
+            if not getattr(payment, 'success', False) or int(getattr(payment, 'amount', 0) or 0) <= 0:
                 return False
             herd_wallet_id = getattr(settings, 'herd_wallet', None)
-            if herd_wallet_id and payment.wallet_id != herd_wallet_id:
+            if not isinstance(herd_wallet_id, str) or not herd_wallet_id.strip() or payment.wallet_id != herd_wallet_id:
                 return False
             
+            # A completed identity already includes membership and historical
+            # accounting. Once settlement and wallet scope are confirmed, a
+            # relay outage cannot turn that committed payment into pending work.
+            identity = self._normalize_payment_hash(getattr(payment, "payment_hash", None) or getattr(payment, "checking_id", None))
+            if identity and await crud.is_payment_processed(cast(str, self.user_id), identity, strict=True):
+                return True
+
             # Extract zap request from payment.extra["nostr"] (preferred) or comment (fallback)
             zap_request = None
             zap_request_source = None
@@ -358,6 +383,10 @@ class PaymentCoordinatorService:
                 # No zap request found in payment data
                 return False
             
+            if not isinstance(zap_request, dict) or zap_request.get("kind") != 9734:
+                self.last_error = "invalid_zap_request_kind"
+                return False
+
             # Extract zapper pubkey
             zapper_pubkey = zap_request.get("pubkey")
             if not zapper_pubkey:
@@ -524,32 +553,32 @@ class PaymentCoordinatorService:
                     )
             except Exception as e:
                 logger.debug(f"Error checking existing membership for {zapper_pubkey[:8]}...: {e}")
-                is_existing_member = False
+                self.last_error = "retryable_processing"
+                return False
             
             # For existing members, only verify the note is authored by Lightning Goats (effective pubkey)
             # For new members, enforce strict tracking requirements
             if is_existing_member:
-                # Verify note author matches effective pubkey (Lightning Goats)
-                if target_author:
-                    try:
-                        eff_pub = resolve_effective_pubkey(settings)
-                        if eff_pub and target_author.lower() != eff_pub.lower():
-                            logger.info(
-                                f"Zap target {target_note_id[:8]}... by author {target_author[:8]}... "
-                                f"does not match Lightning Goats pubkey {eff_pub[:8]}... - rejecting"
-                            )
-                            self.last_error = "note_author_mismatch"
-                            return False
-                    except Exception as e:
-                        logger.debug(f"Could not verify note author: {e}")
-                        # Continue optimistically if verification fails
-                else:
-                    logger.info(
-                        f"Zap target {target_note_id[:8]}... has no author metadata; "
-                        f"cannot verify Lightning Goats ownership for existing member "
-                        f"{zapper_pubkey[:8]}... - rejecting"
-                    )
-                    self.last_error = "missing_note_author"
+                # Recipient tags are supplied by the sender. Fetch and authenticate
+                # the referenced event before accepting its claimed project author.
+                from .nostr_helpers import query_events, verify_event_signature
+                effective = resolve_effective_pubkey(settings)
+                if not effective or not target_author or target_author != effective.lower():
+                    self.last_error = "note_author_mismatch"
+                    return False
+                events = await query_events(
+                    {"ids": [target_note_id]}, limit=1, timeout=5.0,
+                    extra_relays=relay_hints or None,
+                )
+                if not events:
+                    self.last_error = "retryable_processing"
+                    return False
+                if not any(
+                    isinstance(event, dict) and event.get("id") == target_note_id
+                    and event.get("pubkey", "").lower() == effective.lower()
+                    and verify_event_signature(event) for event in (events or [])
+                ):
+                    self.last_error = "note_author_mismatch"
                     return False
             else:
                 # New member: enforce strict tracking requirements
@@ -578,7 +607,8 @@ class PaymentCoordinatorService:
                             "tracked_event_ids but is not valid for today's local window. "
                             "Ignoring zap."
                         )
-                        self.last_error = "note_not_current"
+                        if self.last_error != "retryable_processing":
+                            self.last_error = "note_not_current"
                         return False
                 
                 if not is_tracked:
@@ -634,7 +664,8 @@ class PaymentCoordinatorService:
                         f"❌ Zap target {target_note_id[:8]}... is NOT in tracked_event_ids "
                         f"({len(tracked_notes)} tracked events). Ignoring zap."
                     )
-                    self.last_error = "note_not_tracked"
+                    if self.last_error != "retryable_processing":
+                        self.last_error = "note_not_tracked"
                     return False
                 
                 # Note is validated as being in tracked_event_ids
@@ -647,78 +678,64 @@ class PaymentCoordinatorService:
             event_id_raw = getattr(payment, "payment_hash", None) or getattr(payment, "checking_id", None)
             event_id = self._normalize_payment_hash(event_id_raw)
 
-            # Atomically claim the payment hash BEFORE processing to avoid races
-            # with other detection paths. register_processed_event performs a
-            # serialized check+insert under a write lock and returns True iff
-            # this process inserted a new row (i.e., claimed the hash).
-            if event_id:
-                try:
-                    claimed = await crud.register_processed_event(
-                        cast(str, self.user_id),
-                        event_id,
-                        note_id=target_note_id,
-                        pubkey=zapper_pubkey,
-                        event_type="payment_zap",
-                    )
-                except Exception:
-                    claimed = False
+            if not event_id:
+                self.last_error = "missing_payment_identity"
+                return False
 
-                if not claimed:
-                    pid_preview = event_id[:16] + "..."
-                    nid_preview = target_note_id[:8] + "..." if isinstance(target_note_id, str) else "unknown"
-                    ppk_preview = zapper_pubkey[:8] + "..." if isinstance(zapper_pubkey, str) else "unknown"
-                    logger.debug(
-                        f"🔄 Duplicate payment detected (persisted): payment_hash={pid_preview}, note={nid_preview}, pubkey={ppk_preview} Skipping."
-                    )
-                    self.last_error = None
-                    return True
+            async def claim_payment():
+                # Called under the admission lock and its transaction. A claim
+                # never survives cancellation or a failed membership mutation.
+                if await crud.is_payment_processed(cast(str, self.user_id), event_id, strict=True):
+                    return False
+                return await crud.register_processed_event(
+                    cast(str, self.user_id), event_id, note_id=target_note_id,
+                    pubkey=zapper_pubkey, event_type="payment_zap",
+                )
+
+            async def record_total():
+                from .zap_totals import record_incremental_zap_total
+                await record_incremental_zap_total(
+                    user_id=cast(str, self.user_id), zapper_pubkey=zapper_pubkey,
+                    target_pubkey=resolve_effective_pubkey(settings),
+                    amount_sats=amount_sats,
+                    event_timestamp=self._extract_payment_timestamp(payment),
+                    event_id=event_id,
+                    skip_member_check=True,
+                    lock_already_held=True,
+                )
 
             # Trigger headbutt admission for zap (we have claimed the payment hash)
             try:
-                result = await trigger_headbutt_from_zap(
-                    user_id=cast(str, self.user_id),
-                    pubkey=zapper_pubkey,
-                    amount_sats=amount_sats,
-                    note_id=target_note_id or "",
-                    event_id=event_id or "",
-                    app=self.app,
-                )
+                # Acquire totals before the admission/database lock: refreshes hold
+                # this same totals lock while reading/writing their snapshots.
+                from .zap_totals import _get_key_lock
+                totals_lock = await _get_key_lock((cast(str, self.user_id), zapper_pubkey))
+                async with totals_lock:
+                    result = await trigger_headbutt_from_zap(
+                        user_id=cast(str, self.user_id),
+                        pubkey=zapper_pubkey,
+                        amount_sats=amount_sats,
+                        note_id=target_note_id or "",
+                        event_id=event_id or "",
+                        app=self.app,
+                        payment_effect=claim_payment,
+                        payment_success=record_total,
+                    )
             except Exception as e:
                 logger.error(f"Error triggering headbutt from payment-based zap: {e}")
+                self.last_error = "retryable_processing"
                 result = None
 
             if result:
                 # We already registered the payment hash as claimed above; update state
                 self.last_zap_at = int(time.time())
 
-                # The payment path is authoritative for zaps, but historically only
-                # updated cyber_herd.amount. The leaderboard sorts by the zap_totals
-                # table, so update it (and notify watchers) here too — otherwise the
-                # leaderboard stays stale until a manual backfill.
-                try:
-                    target_pubkey = resolve_effective_pubkey(settings)
-                except Exception:
-                    target_pubkey = None
-                if target_pubkey:
+                if result.get("status") != "duplicate":
                     try:
-                        try:
-                            event_timestamp = int(zap_request.get("created_at") or 0) or int(time.time())
-                        except Exception:
-                            event_timestamp = int(time.time())
-                        from .zap_totals import record_incremental_zap_total
                         from .leaderboard import broadcast_leaderboard_update
-
-                        await record_incremental_zap_total(
-                            user_id=cast(str, self.user_id),
-                            zapper_pubkey=zapper_pubkey,
-                            target_pubkey=target_pubkey,
-                            amount_sats=amount_sats,
-                            event_timestamp=event_timestamp,
-                            event_id=event_id or "",
-                        )
                         await broadcast_leaderboard_update(cast(str, self.user_id), settings=settings)
                     except Exception:
-                        logger.debug("Failed to update zap totals/broadcast leaderboard", exc_info=True)
+                        logger.debug("Failed to broadcast leaderboard", exc_info=True)
 
                 logger.info(
                     f"✅ Payment-based zap processed: {amount_sats} sats from {zapper_pubkey[:8]}... "
@@ -730,22 +747,11 @@ class PaymentCoordinatorService:
                     f"Headbutt processing returned no result for payment zap: "
                     f"{amount_sats} sats from {zapper_pubkey[:8]}..."
                 )
-                if event_id:
-                    try:
-                        await crud.delete_processed_event(
-                            cast(str, self.user_id),
-                            event_id,
-                            note_id=target_note_id,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to release processed marker for failed zap %s: %s",
-                            event_id[:16],
-                            exc,
-                        )
+                self.last_error = "retryable_processing"
                 return False
             
         except Exception as e:
+            self.last_error = "retryable_processing"
             logger.error(f"Error processing payment for zap: {e}")
             return False
 
@@ -988,6 +994,7 @@ class PaymentCoordinatorService:
                 extra_relays=relay_hints or None,
             )
             if not events:
+                self.last_error = "retryable_processing"
                 logger.info(
                     f"Zap monitor: target note {note_id[:8]}... was not found "
                     f"while checking tracked tags (relay_hints={len(relay_hints or [])})"
@@ -995,7 +1002,7 @@ class PaymentCoordinatorService:
             for event in events or []:
                 if not isinstance(event, dict):
                     continue
-                if event.get("id") != note_id:
+                if event.get("id") != note_id or not nostr_helpers.verify_event_signature(event):
                     continue
 
                 try:
@@ -1018,6 +1025,7 @@ class PaymentCoordinatorService:
                     "does not match today's tracked tag rules"
                 )
         except Exception as exc:
+            self.last_error = "retryable_processing"
             logger.debug(
                 "Zap monitor: failed to fetch/verify tagged note %s for user %s: %s",
                 note_id[:8],
@@ -1206,14 +1214,28 @@ class PaymentCoordinatorService:
             logger.info(f"Starting payment-based zap recovery for wallet {herd_wallet} since {since_ts}")
 
             # Fetch recent incoming payments to the herd wallet
-            payments = await get_payments(wallet_id=herd_wallet, incoming=True, since=since_ts, limit=1000)
+            from lnbits.db import Filters
+            from lnbits.core.models.payments import PaymentFilters
+
+            async def history():
+                offset = 0
+                while True:
+                    filters = Filters(model=PaymentFilters, sortby="time", direction="asc", limit=1000, offset=offset)
+                    batch = await get_payments(wallet_id=herd_wallet, incoming=True, complete=True, since=since_ts, filters=filters)
+                    if not batch:
+                        return
+                    for item in batch:
+                        yield item
+                    offset += len(batch)
+                    if len(batch) < 1000:
+                        return
 
             scanned = 0
             processed = 0
             successful = 0
             self.total_recovery_scans += 1
 
-            for payment in payments or []:
+            async for payment in history():
                 scanned += 1
                 try:
                     # Compute canonical event ids used by persistence checks

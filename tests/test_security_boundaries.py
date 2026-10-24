@@ -1,4 +1,6 @@
 import json
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
 import os
 import time
 from datetime import datetime
@@ -14,6 +16,20 @@ from lnbits.extensions.cyberherd.services import payment_coordinator
 from lnbits.extensions.cyberherd.services import time_utils
 from lnbits.extensions.cyberherd.services import nostr_websocket_monitor
 from lnbits.extensions.cyberherd.services import subscriptions
+
+
+@pytest.fixture(autouse=True)
+def isolate_new_admission_boundaries(monkeypatch):
+    # These unit tests replace CRUD with small fakes; lifecycle/transaction
+    # integration is covered by disposable database tests.
+    from lnbits.extensions.cyberherd import tasks
+
+    @asynccontextmanager
+    async def transaction(**kwargs):
+        yield
+
+    monkeypatch.setattr(tasks, "ensure_membership_day", AsyncMock(return_value=[]))
+    monkeypatch.setattr(headbutt.crud, "admission_transaction", transaction)
 
 
 def _settings(**overrides):
@@ -503,7 +519,7 @@ async def test_payment_recovery_uses_supplied_tracked_settings(monkeypatch):
     )
     captured = {}
 
-    async def fake_get_payments(wallet_id, incoming, since, limit):
+    async def fake_get_payments(wallet_id, incoming, since, filters, complete):
         return [SimpleNamespace(wallet_id="herd-wallet-id", extra={"nostr": "{}"})]
 
     async def fake_process_payment_for_zap(self, payment, settings_override=None):
@@ -536,7 +552,7 @@ async def test_payment_recovery_scans_when_tracked_ids_empty(monkeypatch):
     )
     captured = {"processed": 0}
 
-    async def fake_get_payments(wallet_id, incoming, since, limit):
+    async def fake_get_payments(wallet_id, incoming, since, filters, complete):
         return [SimpleNamespace(wallet_id="herd-wallet-id", extra={"nostr": "{}"})]
 
     async def fake_process_payment_for_zap(self, payment, settings_override=None):
@@ -766,6 +782,7 @@ async def test_fetch_tagged_note_returns_event_matching_tracked_tag(monkeypatch)
         lambda _settings: "b" * 64,
     )
 
+    monkeypatch.setattr(subscriptions.nostr_helpers, "verify_event_signature", lambda event: True)
     monitor = payment_coordinator.PaymentCoordinatorService(user_id="user-id")
 
     fetched = await monitor._fetch_tagged_note(
@@ -789,6 +806,7 @@ async def test_payment_zap_uses_relay_hints_for_opportunistic_tracking(monkeypat
     captured = {}
     note_id = "c" * 64
     zap_request = {
+        "kind": 9734,
         "pubkey": "d" * 64,
         "tags": [
             ["e", note_id],
@@ -797,6 +815,7 @@ async def test_payment_zap_uses_relay_hints_for_opportunistic_tracking(monkeypat
         ],
     }
     payment = SimpleNamespace(
+        success=True,
         wallet_id="herd-wallet-id",
         amount=33_000,
         extra={"nostr": zap_request},
@@ -851,6 +870,12 @@ async def test_payment_zap_uses_relay_hints_for_opportunistic_tracking(monkeypat
     # here since this mock zap request is unsigned.
     monkeypatch.setattr(subscriptions.nostr_helpers, "verify_event_signature", lambda event: True)
 
+    async def fake_trigger(*args, **kwargs):
+        return {"status": "duplicate"}
+    monkeypatch.setattr(payment_coordinator, "trigger_headbutt_from_zap", fake_trigger)
+    async def fake_is_payment_processed(*args, **kwargs):
+        return False
+    monkeypatch.setattr(payment_coordinator.crud, "is_payment_processed", fake_is_payment_processed)
     monitor = payment_coordinator.PaymentCoordinatorService(user_id="user-id")
 
     ok = await monitor._process_payment_for_zap(payment, settings_override=settings)
@@ -875,10 +900,12 @@ async def test_payment_recovery_rejects_previous_day_tracked_note_for_new_member
         nostr_pubkey_override=target_pubkey,
     )
     payment = SimpleNamespace(
+        success=True,
         wallet_id="herd-wallet-id",
         amount=33_000,
         extra={
             "nostr": {
+                "kind": 9734,
                 "pubkey": zapper_pubkey,
                 "tags": [["e", note_id], ["p", target_pubkey]],
             }
@@ -888,7 +915,7 @@ async def test_payment_recovery_rejects_previous_day_tracked_note_for_new_member
     )
     captured = {"headbutts": 0, "registered": 0}
 
-    async def fake_get_payments(wallet_id, incoming, since, limit):
+    async def fake_get_payments(wallet_id, incoming, since, filters, complete):
         assert since == boundaries.local_since_ts - 60
         return [payment]
 
@@ -931,6 +958,9 @@ async def test_payment_recovery_rejects_previous_day_tracked_note_for_new_member
     # check so the unsigned mock zap request reaches it.
     monkeypatch.setattr(subscriptions.nostr_helpers, "verify_event_signature", lambda event: True)
 
+    async def fake_is_payment_processed(*args, **kwargs):
+        return False
+    monkeypatch.setattr(payment_coordinator.crud, "is_payment_processed", fake_is_payment_processed)
     monitor = payment_coordinator.PaymentCoordinatorService(user_id="user-id")
 
     result = await monitor._recover_missed_payment_zaps(settings)

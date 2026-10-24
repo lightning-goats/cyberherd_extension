@@ -4,18 +4,18 @@
 
 The #CyberHerd is a community of Nostr users who collectively support the ⚡Lightning Goats⚡ project. As a herd member, you'll receive a share of all payments sent to feed the goats every time the feeder is triggered!
 
-**Important: The CyberHerd resets every night at midnight (Local Time).** All memberships and accumulated zap amounts are cleared, giving everyone a fresh start each day. This means:
+**Important: With midnight reset enabled, the CyberHerd resets every night at midnight in the server's local timezone.** All memberships and accumulated zap amounts are cleared, giving everyone a fresh start each day. This means:
 - All members are removed from the herd
 - All accumulated zap amounts reset to zero
-- New daily #CyberHerd note is posted for that day's membership
+- A current-day #CyberHerd note from the project is required; posting that note is handled by the project's separate publishing process
 
 ## How to Join the CyberHerd
 
 The CyberHerd operates continuously with automatic monitoring of Nostr interactions:
 
 1. **Find TODAY'S CyberHerd note**: Look for the current day's note tagged with #CyberHerd from the Lightning Goats project
-2. **Zap the note**: Send a zap of 10+ sats to join the herd and earn payouts
-3. **Instant processing**: Your membership is processed immediately when detected
+2. **Zap the note**: Send a zap meeting the configured minimum to join the herd and earn payouts (10 sats in the examples below)
+3. **Payment confirmation**: A zap is processed after the invoice settles and its signed request and project note are verified
 4. **Notification**: You'll be notified via public reply when you join the herd
 
 **Requirements for new membership:**
@@ -33,10 +33,10 @@ Members can join the CyberHerd without zapping by reposting or reacting to TODAY
 ### Repost (Kind 6) and Reaction (Kind 7) Rules:
 - **Free entry when slots available**: If the herd has open slots, reposts and reactions can join without paying
 - **TODAY'S note requirement**: Must repost or react to the current day's #CyberHerd note (older notes invalid)
-- **Exactly 1% for engagement**: Members with kind 6 (repost) OR kind 7 (reaction) receive exactly 1% of the member allocation. Having both kind 6 AND kind 7 still gives only 1% (not 2%)
+- **Exactly 1% for engagement**: Members with kind 6 (repost) OR kind 7 (reaction) receive exactly 1% of the full feeder payment. Having both kind 6 AND kind 7 still gives only 1% (not 2%)
 - **Zapper bonus**: Members who have zaps AND kind 6/7 events receive their 1% engagement share PLUS their proportional zap share from the remaining pool
 - **Valid requirements**: NIP-05 identifier (configurable, can be disabled) and Lightning address required
-- **Vulnerable to displacement**: Any zap (even 1 sat) will displace repost/reaction-only members first
+- **Vulnerable to displacement**: A new or rejoining zap that meets the configured minimum will displace repost/reaction-only members first
 - **Repost headbutting (kind 6)**: Reposts CAN headbutt other repost-only or reaction-only members (amount=0) when the herd is full
 - **Reaction no headbutting (kind 7)**: Reactions CANNOT headbutt anyone - can only join when slots are available
 - **Can upgrade to zapper**: Existing repost/reaction members can zap ANY Lightning Goats note to increase their amount and secure a larger payout share
@@ -54,9 +54,9 @@ When the herd is full:
 - **Support visibility**: Reposts amplify Lightning Goats content even if you receive no payout
 
 ### Example Progression:
-- **Day 1**: Repost TODAY'S #CyberHerd note → Join with 0 sats → Receive 1% of the member allocation
+- **Day 1**: Repost TODAY'S #CyberHerd note → Join with 0 sats → Receive 1% of the full feeder payment
 - **Day 2**: Zap 50 sats to TODAY'S #CyberHerd note → Join with 50 sats → Start receiving proportional payouts
-- **Day 3**: Already a member, zap 100 sats to any Lightning Goats post → Total becomes 150 sats → Harder to displace
+- **Later on Day 2**: Already a member, zap 100 sats to any Lightning Goats post → Total becomes 150 sats → Harder to displace
 
 ## Increasing Your Payouts (Existing Members)
 
@@ -70,7 +70,7 @@ Once you're a CyberHerd member, you have **flexible zapping options** to increas
 ### For Existing Members (Increasing payouts):
 - **Zap ANY Lightning Goats note**: You can zap any note authored by the Lightning Goats project to increase your payout share
 - **No #CyberHerd tag required**: Support any Lightning Goats content - technical posts, goat updates, educational content, etc.
-- **Cumulative increases**: Every qualifying zap increases your total contribution and payout share
+- **Cumulative increases**: Every settled qualifying zap increases your total contribution and payout share; duplicate delivery of the same payment counts once
 - **Threaded responses**: Thank you messages will appear as replies to whatever note you zapped
 
 ### How It Works:
@@ -81,28 +81,28 @@ Once you're a CyberHerd member, you have **flexible zapping options** to increas
 
 ## How Payouts Work
 
-**Daily Reset Notice**: Remember that the CyberHerd resets every night at midnight (Local Time), so all accumulated zaps and memberships start fresh each day.
+**Daily Reset Notice**: When midnight reset is enabled, membership and its daily contribution scores start fresh at midnight in the server's configured local timezone. If the service misses midnight, it catches up before processing new admissions or distributions after restart. Lifetime zap history and replay-protection records are retained.
 
-When the Lightning Goats feeder activates (around 850 sats), payments are automatically split:
+After the feeder integration successfully requests a feed at its configured threshold, the available herd balance is distributed:
 
-- **Engagement = exactly 1%** - Members with kind 6 (repost) or kind 7 (reaction) receive exactly 1% of the member allocation
+- **Engagement = exactly 1%** - Members with kind 6 (repost) or kind 7 (reaction) receive exactly 1% of the full feeder payment
 - **Zaps distributed proportionally** - The remaining pool (after engagement allocation) is distributed proportionally by zap amount
 - **Zapper + engagement bonus** - Members with BOTH zaps AND engagement receive their 1% engagement share PLUS their proportional zap share
 - **Only Lightning Goats content** - Zaps to other people's notes don't count
-- **Payments when feeder triggers** - You don't get paid immediately, but when the feeder activates
+- **Feeder-triggered payments** - Reaching a balance threshold alone does not distribute funds. A blocked, failed, or unknown feeder request does not authorize a payout
 - **Bigger contributions = bigger share** - The more you've zapped, the larger your piece of the available allocation
 - **Your zaps add up over time** - Every qualifying zap increases your total and future payouts
 - **Direct to your Lightning address** - No need to claim anything, payments are automatic
-- **Maximum 3 members** - Limited spots make membership valuable
-- **90% feeds goats, 10% to herd** - Most money goes to the goats, which is the point!
+- **Configurable maximum members** - Limited spots make membership valuable
+- **Configurable member allocation** - Examples below use 10% for members and the remainder for goats; the operator may configure a different percentage
 - **Existing members have flexibility** - Once you're in, you can zap any Lightning Goats content to increase payouts
 
 ## How Payments Work
 
-When someone feeds the goats and the feeder activates (around 850 sats), the payment gets automatically split:
+After a successful feeder request, the herd balance is split using the current members and configured allocation:
 
-- **90% feeds the goats** - Goes directly to goat food and operations
-- **10% goes to CyberHerd members** - Automatically divided based on how much you've zapped
+- **Goat allocation** - The remainder after payable member shares goes to goat food and operations (90% in these examples)
+- **Member allocation** - A configurable percentage (10% in these examples) is divided by engagement and zap amounts
 
 ### Your Share
 The more you've zapped Lightning Goats content, the bigger your share of that 10%! Your payment gets sent directly to your Lightning address when the feeder triggers.
@@ -135,38 +135,38 @@ Here's how your share gets calculated:
 **Example 4 - Repost member receives exactly 1%:**
 - Herd members: [Repost only (0 sats), Zap (300 sats), Zap (700 sats)]
 - Feeder triggers with 10,000 sats → 1,000 sats to CyberHerd (10%)
-- Engagement allocation: 1% = 10 sats (repost member gets exactly 1%)
-- Zap pool: 9% = 90 sats (distributed proportionally by zap amount)
-- Repost member: 10 sats (exactly 1% for engagement)
-- Zap member 1: 27 sats (300/1000 * 90)
-- Zap member 2: 63 sats (700/1000 * 90)
+- Engagement allocation: 1% = 100 sats (repost member gets exactly 1%)
+- Zap pool: 9% = 900 sats (distributed proportionally by zap amount)
+- Repost member: 100 sats (exactly 1% for engagement)
+- Zap member 1: 270 sats (300/1000 * 900)
+- Zap member 2: 630 sats (700/1000 * 900)
 
 **Example 5 - Zapper with engagement bonus:**
 - Herd members: [Zap+Repost (500 sats, has kind 6), Zap only (300 sats), Zap only (200 sats)]
 - Feeder triggers with 10,000 sats → 1,000 sats to CyberHerd (10%)
-- Engagement allocation: 1% = 10 sats (member 1 gets exactly 1%)
-- Zap pool: 9% = 90 sats (distributed proportionally by zap amount)
-- Member 1 (500 sats + kind 6): 10 + 45 = 55 sats (1% engagement + 500/1000 * 90)
-- Member 2 (300 sats): 27 sats (300/1000 * 90)
-- Member 3 (200 sats): 18 sats (200/1000 * 90)
+- Engagement allocation: 1% = 100 sats (member 1 gets exactly 1%)
+- Zap pool: 9% = 900 sats (distributed proportionally by zap amount)
+- Member 1 (500 sats + kind 6): 100 + 450 = 550 sats (1% engagement + 500/1000 * 900)
+- Member 2 (300 sats): 270 sats (300/1000 * 900)
+- Member 3 (200 sats): 180 sats (200/1000 * 900)
 
 **Example 6 - Multiple members with engagement:**
 - Herd members: [Zap+Repost (400 sats, has kind 6), Zap+React (400 sats, has kind 7), Zap only (200 sats)]
 - Feeder triggers with 10,000 sats → 1,000 sats to CyberHerd (10%)
-- Engagement allocation: 2% = 20 sats (1% each to members 1 and 2)
-- Zap pool: 8% = 80 sats (distributed proportionally by zap amount)
-- Member 1 (400 sats + kind 6): 10 + 32 = 42 sats (1% engagement + 400/1000 * 80)
-- Member 2 (400 sats + kind 7): 10 + 32 = 42 sats (1% engagement + 400/1000 * 80)
-- Member 3 (200 sats): 16 sats (200/1000 * 80)
+- Engagement allocation: 2% = 200 sats (1% each to members 1 and 2)
+- Zap pool: 8% = 800 sats (distributed proportionally by zap amount)
+- Member 1 (400 sats + kind 6): 100 + 320 = 420 sats (1% engagement + 400/1000 * 800)
+- Member 2 (400 sats + kind 7): 100 + 320 = 420 sats (1% engagement + 400/1000 * 800)
+- Member 3 (200 sats): 160 sats (200/1000 * 800)
 
 **Example 7 - Member with BOTH kind 6 AND kind 7 (still only 1%):**
 - Herd members: [Zap+Repost+React (600 sats, has kind 6+7), Zap only (200 sats), Zap only (200 sats)]
 - Feeder triggers with 10,000 sats → 1,000 sats to CyberHerd (10%)
-- Engagement allocation: 1% = 10 sats (member 1 gets exactly 1%, not 2%)
-- Zap pool: 9% = 90 sats (distributed proportionally by zap amount)
-- Member 1 (600 sats + kind 6+7): 10 + 54 = 64 sats (1% engagement + 600/1000 * 90)
-- Member 2 (200 sats): 18 sats (200/1000 * 90)
-- Member 3 (200 sats): 18 sats (200/1000 * 90)
+- Engagement allocation: 1% = 100 sats (member 1 gets exactly 1%, not 2%)
+- Zap pool: 9% = 900 sats (distributed proportionally by zap amount)
+- Member 1 (600 sats + kind 6+7): 100 + 540 = 640 sats (1% engagement + 600/1000 * 900)
+- Member 2 (200 sats): 180 sats (200/1000 * 900)
+- Member 3 (200 sats): 180 sats (200/1000 * 900)
 
 ## The ⚡Headbutting⚡ Mechanism
 
@@ -206,7 +206,7 @@ When the CyberHerd reaches maximum capacity, new members can still join by "head
 - Current herd: [Repost (0 sats), Zap (100 sats), Zap (200 sats)]
 - You zap: 10 sats to TODAY'S #CyberHerd note → You replace the repost member
 - New herd: [Zap (10 sats), Zap (100 sats), Zap (200 sats)]
-- Zaps always displace repost/reaction members first, regardless of zap amount
+- Zaps meeting the configured minimum displace repost/reaction members first; this example assumes a 10-sat minimum
 
 **Scenario 6 - Repost/reaction joining open slots:**
 - Current herd: [Zap (500 sats), empty, empty]
@@ -236,13 +236,13 @@ When the CyberHerd reaches maximum capacity, new members can still join by "head
 - **Build your total**: Multiple zaps accumulate, making you harder to headbutt
 - **Monitor the herd**: Check current members' contributions before zapping
 - **Stay active**: Regular zapping increases your "headbutt resistance"
-- **Risk awareness**: Getting headbutted means losing ALL accumulated sats - they don't carry over if you rejoin
+- **Risk awareness**: Getting headbutted resets your accumulated payout score; prior donations are not refunded or carried over when you rejoin
 
 ### Headbutting Rules:
 - **New members only**: Only new members can attempt headbutting by zapping TODAY'S #CyberHerd note or reposting it
 - **Daily note requirement**: Must use the current day's #CyberHerd note (older notes invalid due to daily reset)
-- **Existing member flexibility**: Current members can increase payouts by zapping ANY Lightning Goats note
-- **Minimum zap for headbutting**: 10 sats required to headbutt via zap
+- **Existing member flexibility**: Current members can increase payouts by zapping ANY Lightning Goats note with any positive amount
+- **Minimum zap for new or rejoining members**: The configured minimum applies even when displacing a free member. Existing active members may add any positive amount
 - **Repost headbutting (kind 6)**: Reposts can join and headbutt repost-only or reaction-only members when herd is full
 - **Reaction bypass (kind 7)**: Reactions can only join when herd has open slots (cannot headbutt)
 - **Zap priority**: Zaps always displace repost/reaction members first before competing with other zaps
@@ -257,8 +257,8 @@ When the CyberHerd reaches maximum capacity, new members can still join by "head
 The CyberHerd works automatically behind the scenes:
 
 - **Always watching**: Continuously monitors for zaps to Lightning Goats content
-- **Instant updates**: Your membership and contributions are updated immediately
-- **Safe and reliable**: Built with safeguards to prevent errors
+- **Confirmed updates**: Settled qualifying zaps and authenticated reposts/reactions update membership; pending invoices do not count
+- **Replay protection**: Repeated delivery of the same payment or social event counts once, including after a restart
 - **Public notifications**: You'll get public replies when you join, get headbutted, or other important events happen
 
 ## Getting Started
@@ -287,14 +287,25 @@ The CyberHerd works automatically behind the scenes:
 - **New members via zap**: Must zap TODAY'S #CyberHerd tagged note to join (minimum sats configurable, typically 10+)
 - **New members via repost**: Can repost TODAY'S #CyberHerd note to join with 0 sats (can headbutt other repost/reaction members)
 - **New members via reaction**: Can react to TODAY'S #CyberHerd note to join with 0 sats (only when slots available, cannot headbutt)
-- **Existing members**: Can zap ANY Lightning Goats note to increase payouts (minimum sats configurable, typically 10+)
+- **Existing members**: Can zap ANY Lightning Goats note to increase payouts with any positive amount
 - **Maximum members**: Configurable (typically 3) - full herd requires headbutting out lowest member to join
 - **Zap priority**: Zaps always displace repost/reaction-only members first before competing with other zaps
 - **Repost headbutting**: Reposts (kind 6) can displace repost-only or reaction-only members (amount=0)
 - **Reaction limitation**: Reactions (kind 7) cannot headbutt - can only join when open slots available
-- **Engagement = exactly 1%**: Members with kind 6 (repost) or kind 7 (reaction) receive exactly 1% of the member allocation. Having both kind 6 AND kind 7 still gives only 1%
+- **Engagement = exactly 1%**: Members with kind 6 (repost) or kind 7 (reaction) receive exactly 1% of the full feeder payment. Having both kind 6 AND kind 7 still gives only 1%
 - **Zaps distributed proportionally**: The remaining pool after engagement allocation is distributed proportionally by zap amount
 - **Zapper + engagement**: Members with zaps AND kind 6/7 events receive their 1% engagement PLUS proportional zap share
 - **Headbutt consequences**: Getting headbutted resets your accumulated payout score to zero
-- **Feeder-triggered payouts**: Payments sent when feeder activates (threshold configurable, typically ~850 sats), not immediately
-- **90/10 split**: 90% feeds goats, 10% distributed among CyberHerd members
+- **Feeder-triggered payouts**: Payments follow a successful feeder request at the configured threshold, with current member targets applied before distribution
+- **Configurable split**: The configured member allocation limits the CyberHerd pool; unused member allocation goes to the goat wallet. Engagement-enabled configurations reserve at least one percentage point per possible member
+
+Payout examples show amounts before routing fees and whole-satoshi rounding by the payment service. Proportional split targets retain six decimal places of percentage precision. A successful OpenHAB rule request authorizes distribution; physical delivery requires separate feeder telemetry.
+
+## Payment and history rules
+
+- Only settled incoming payments to the configured herd wallet count as zaps. The signed request must identify the sender and reference an authentic project note. Tracking must be enabled.
+- New and returning members use today's project-tagged note and satisfy the current entry requirements. An old database record does not bypass those requirements.
+- Active members may add any positive zap to any authentic project-authored note; a #CyberHerd tag is not required for those additions.
+- Each paid invoice counts once. Separate settled invoices count separately even if they reuse the same signed zap request. Re-delivering the same repost or reaction does not create another headbutt.
+- A settled qualifying zap can appear in lifetime history even when it is insufficient to join or displace someone. It does not grant a membership score for a rejected admission. History refresh uses verified settled payments held by this installation; relay receipts alone do not prove payment.
+- Payout targets include only members with a valid Lightning address. A missing or malformed address does not receive a target; remaining allocation follows the configured goat-wallet rules. Address syntax validation cannot guarantee that a remote payment provider is available.

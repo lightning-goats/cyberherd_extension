@@ -1354,6 +1354,15 @@ async def api_put_settings(
             send_splits_enabled, getattr(settings, "send_splits_enabled", False)
         )
 
+    if (
+        getattr(settings, "repost_tracking_enabled", True)
+        or getattr(settings, "likes_tracking_enabled", True)
+    ) and int(getattr(settings, "member_allocation_percent", 10)) < int(getattr(settings, "max_members", 3)):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="member_allocation_percent must cover 1% per max_members while engagement tracking is enabled",
+        )
+
     # Pre-compute effective pubkey before the upsert to avoid recomputation later.
     try:
         settings.computed_effective_pubkey = _get_effective_pubkey(settings)
@@ -2314,6 +2323,9 @@ async def api_put_member(
     if not pubkey:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="pubkey required")
 
+    if payload.amount is not None and payload.amount < 0:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="amount cannot be negative")
+
     payload_dict = {}
     try:
         payload_dict = payload.dict(exclude_unset=True)
@@ -2526,21 +2538,6 @@ async def api_put_member(
     return {"ok": True}
 
 
-@cyberherd_api_router.delete("/api/v1/members/{pubkey}")
-async def api_delete_member(
-    request: Request,
-    pubkey: str,
-    wallet_info: WalletTypeInfo = Depends(require_admin_key),
-):
-    try:
-        user_id = wallet_info.wallet.user
-        await crud.delete_cyberherd_member_by_pubkey(pubkey, user_id)
-        return {"ok": True}
-    except Exception as e:
-        logger.warning(f"Cyberherd: delete member failed {pubkey[:8]}…: {e}")
-        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="delete failed")
-
-
 @cyberherd_api_router.delete("/api/v1/members/prune_without_lud16")
 async def api_delete_members_without_lud16(
     request: Request,
@@ -2559,6 +2556,21 @@ async def api_delete_members_without_lud16(
     except Exception as e:
         logger.warning(f"Cyberherd: prune members without lud16 failed for user {wallet_info.wallet.user}: {e}")
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="prune failed")
+
+
+@cyberherd_api_router.delete("/api/v1/members/{pubkey}")
+async def api_delete_member(
+    request: Request,
+    pubkey: str,
+    wallet_info: WalletTypeInfo = Depends(require_admin_key),
+):
+    try:
+        user_id = wallet_info.wallet.user
+        await crud.delete_cyberherd_member_by_pubkey(pubkey, user_id)
+        return {"ok": True}
+    except Exception as e:
+        logger.warning(f"Cyberherd: delete member failed {pubkey[:8]}…: {e}")
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="delete failed")
 
 
 @cyberherd_api_router.post("/api/v1/members/{pubkey}/activate")
@@ -2755,57 +2767,31 @@ async def api_get_shares(request: Request, auth=Depends(auth_wallet_or_admin_dep
                         share["percent"] = 100.0 - total_split_percent
                         break
 
-        # If no split targets configured, fall back to legacy behavior
+        # Derive the same configured allocation used by SplitPayments when
+        # targets have not yet been created.
         if not split_targets:
-            # Eligible members are those with a lud16 (otherwise they can't receive payouts)
-            eligible = []
-            for m in active_list:
-                lud16 = (m.get("lud16") or "").strip()
-                if not lud16:
+            from .services.shares import compute_member_share_percentages
+            from .utils.common import is_valid_lightning_address
+            eligible = [m for m in active_list if is_valid_lightning_address(m.get("lud16"))]
+            member_total = int(getattr(settings, "member_allocation_percent", 10)) if zap_wallet else 100
+            member_pcts = compute_member_share_percentages(eligible, member_total)
+            for m in eligible:
+                pct = float(member_pcts.get(str(m.get("pubkey") or "").lower(), 0))
+                if pct <= 0:
                     continue
-                amt = int(m.get("amount", 0) or 0)
-                eligible.append((m, amt))
-
-            # Legacy logic: zap wallet gets 90% if members eligible
-            if zap_wallet and eligible:
-                # Members share 10%
-                weights = [amt for (_m, amt) in eligible]
-                from .services.splits import _proportional_percentages  # type: ignore
-                member_pcts = _proportional_percentages(weights, total=10)
-                # Update zap wallet percentage
+                shares.append({
+                    "pubkey": m.get("pubkey"),
+                    "display_name": m.get("display_name") or "Anon",
+                    "lud16": m.get("lud16"),
+                    "amount": int(m.get("amount", 0) or 0),
+                    "percent": pct,
+                    "type": "member",
+                })
+            if zap_wallet:
                 for share in shares:
                     if share.get("type") == "zap_wallet":
-                        share["percent"] = 90.0
+                        share["percent"] = 100.0 - sum(float(p) for p in member_pcts.values())
                         break
-                for (m, amt), pct in zip(eligible, member_pcts):
-                    shares.append({
-                        "pubkey": m.get("pubkey"),
-                        "display_name": m.get("display_name") or "Anon",
-                        "lud16": (m.get("lud16") or "").strip() or None,
-                        "amount": amt,  # Already sats
-                        "percent": float(pct),
-                        "type": "member"
-                    })
-            elif zap_wallet and not eligible:
-                # 100% zap wallet (no eligible members) - already set above
-                pass
-            else:
-                # No zap wallet configured: show proportional distribution among eligible members (100%)
-                if eligible:
-                    weights = [amt for (_m, amt) in eligible]
-                    from .services.splits import _proportional_percentages  # type: ignore
-                    member_pcts = _proportional_percentages(weights, total=100)
-                    # Remove zap wallet from shares since it's not configured
-                    shares = [s for s in shares if s.get("type") != "zap_wallet"]
-                    for (m, amt), pct in zip(eligible, member_pcts):
-                        shares.append({
-                            "pubkey": m.get("pubkey"),
-                            "display_name": m.get("display_name") or "Anon",
-                            "lud16": (m.get("lud16") or "").strip() or None,
-                            "amount": amt,  # Already sats
-                            "percent": float(pct),
-                            "type": "member"
-                        })
 
         # Sort descending percent for UI
         shares.sort(key=lambda s: s.get("percent", 0), reverse=True)

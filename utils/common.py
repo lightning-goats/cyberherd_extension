@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -390,3 +391,23 @@ def is_valid_pubkey(pubkey: str | None) -> bool:
         True if valid 64-character hex string
     """
     return is_valid_hex_string(pubkey, 64) if pubkey else False
+
+
+def is_valid_lightning_address(value: Any) -> bool:
+    """Accept a Lightning address, excluding URLs and malformed recipients."""
+    if not isinstance(value, str) or value != value.strip() or len(value) > 254:
+        return False
+    if value.count("@") != 1:
+        return False
+    name, domain = value.split("@")
+    if not re.fullmatch(r"[A-Za-z0-9_.+\-]+", name) or len(name) > 64:
+        return False
+    try:
+        domain = domain.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    labels = domain.split(".")
+    return len(labels) >= 2 and all(
+        re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?", label)
+        for label in labels
+    )

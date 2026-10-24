@@ -114,6 +114,8 @@ __all__ = [
     'm034_fix_processed_events_unique_constraint',  # Fix unique constraint to include note_id for multi-note events
     'm035_fix_cyber_herd_user_pubkey_key',  # Scope member identity by user_id + pubkey
     'm036_repair_postgres_member_key',
+    'm037_add_membership_reset_days',
+    'm038_preserve_payout_precision',
 ]
 
 logger.info(f"CYBERHERD MIGRATIONS: Registered {len(__all__)} migrations: {__all__}")
@@ -917,3 +919,34 @@ async def m036_repair_postgres_member_key(db: Database):
         'ADD PRIMARY KEY (user_id, pubkey)'
     )
     logger.info("CYBERHERD m036: repaired PostgreSQL member key to (user_id, pubkey)")
+
+
+async def m037_add_membership_reset_days(db: Database):
+    """Baseline legacy herds today without guessing or deleting existing membership.
+
+    The pre-upgrade reset history is unknown. A baseline is not a performed reset;
+    subsequent local-day changes trigger durable catch-up before event intake.
+    """
+    from .services.time_utils import get_day_boundaries_utc
+
+    await db.execute(f"""CREATE TABLE IF NOT EXISTS {db.references_schema}membership_reset_days (
+        user_id TEXT PRIMARY KEY,
+        local_day TEXT NOT NULL,
+        splits_pending INTEGER NOT NULL DEFAULT 0
+    )""")
+    await db.execute(
+        f"""INSERT INTO {db.references_schema}membership_reset_days (user_id, local_day)
+        SELECT user_id, :local_day FROM {db.references_schema}settings
+        WHERE user_id IS NOT NULL AND user_id != ''
+        ON CONFLICT (user_id) DO NOTHING""",
+        {"local_day": get_day_boundaries_utc().local_day_str},
+    )
+
+
+async def m038_preserve_payout_precision(db: Database):
+    """Store fractional payout shares with the same precision as split targets."""
+    if db.type == POSTGRES:
+        await db.execute(
+            f"ALTER TABLE {db.references_schema}cyber_herd "
+            "ALTER COLUMN payouts TYPE DOUBLE PRECISION"
+        )

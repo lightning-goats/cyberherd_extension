@@ -111,6 +111,14 @@ async def scenario(social_db, monkeypatch):
     async def websocket_topic(self):
         return "test-topic"
 
+    async def query_note_events(*args, **kwargs):
+        from lnbits.extensions.cyberherd.services.time_utils import get_day_boundaries_utc
+        return [{"id": NOTE, "pubkey": "f" * 64, "kind": 1,
+                 "created_at": get_day_boundaries_utc().local_since_ts + 1,
+                 "tags": [], "content": ""}]
+
+    monkeypatch.setattr(subscriptions.nostr_helpers, "check_availability", lambda: True)
+    monkeypatch.setattr(subscriptions.nostr_helpers, "query_events", query_note_events)
     monkeypatch.setattr(crud, "get_settings", get_settings)
     monkeypatch.setattr(subscriptions, "get_effective_pubkey", lambda s: "f" * 64)
     monkeypatch.setattr(

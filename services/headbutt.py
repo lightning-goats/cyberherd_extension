@@ -24,7 +24,7 @@ from loguru import logger
 from .. import crud
 from . import nostr_helpers
 from .note_metadata import refresh_tracked_event_addresses
-from ..utils.common import parse_int_env, extract_t_tags_from_event
+from ..utils.common import parse_int_env, extract_t_tags_from_event, is_valid_lightning_address
 from bech32 import bech32_decode, convertbits
 
 try:
@@ -435,7 +435,7 @@ def _normalize_event_id(value: Any) -> str | None:
 
     if candidate.startswith(("note1", "nevent1")):
         from ..utils.common import get_nip19_decoder
-        
+
         nip19 = get_nip19_decoder()
 
         try:
@@ -700,6 +700,12 @@ class EnhancedHeadbuttService:
             logger.info(f"📬 Query returned {len(events or [])} events")
             matched: list[tuple[str, int]] = []
             for ev in events or []:
+                if not isinstance(ev, dict) or not _normalize_event_id(ev.get("id")):
+                    continue
+                if not nostr_helpers.verify_event_signature(ev):
+                    continue
+                if ev.get("pubkey") != eff_pub or ev.get("kind") not in (1, 30311):
+                    continue
                 try:
                     ca = int(ev.get("created_at") or 0)
                 except Exception:
@@ -802,17 +808,17 @@ class EnhancedHeadbuttService:
             if getattr(item, "amount", 0) and item.amount > 0:
                 headbutt_attempts.append(item)
                 continue
-            
+
             # Check if it's a repost (kind 6) - allow headbutting
             kinds = getattr(item, "kinds", [])
             if 6 in kinds:
                 # Repost can headbutt
                 headbutt_attempts.append(item)
                 continue
-            
+
             # Kind 7 only (reactions) - skip, should never headbutt
             # (implicitly excluded by not adding to headbutt_attempts)
-        
+
         if not headbutt_attempts:
             return []
 
@@ -865,326 +871,356 @@ class EnhancedHeadbuttService:
             f"Recorded {event_type} event {event_id[:16]}... for user {self.user_id}"
         )
 
-    async def attempt_headbutt(self, attacker: Any) -> dict[str, Any] | None:
+    async def _after_commit(self, callback, *args, **kwargs):
+        if crud.in_admission_transaction():
+            crud.defer_after_commit(lambda: callback(*args, **kwargs))
+        else:
+            await callback(*args, **kwargs)
+
+    async def attempt_headbutt(self, attacker: Any, *, payment_effect=None, payment_success=None) -> dict[str, Any] | None:
+        from ..tasks import ensure_membership_day
+
+        class RejectedPayment(Exception):
+            pass
+
+        callbacks = []
         async with _get_headbutt_lock():
-            # Check again while holding the admission lock: queued deliveries
-            # can outlive subscription checks and member kinds reset on eviction.
-            identity = self._social_event_identity(attacker)
-            if identity is not None:
-                event_id, note_id, _ = identity
-                if await self.db.is_event_processed(
-                    self.user_id, event_id, note_id=note_id, strict=True
-                ):
-                    logger.info(
-                        f"Skipping processed social event {event_id[:16]}... "
-                        f"for note {note_id[:16]}... (user {self.user_id})"
-                    )
-                    return None
-            if self._in_cooldown():
-                logger.info("AdmissionGuard cooldown: in_cooldown=True")
-                return None
-
-            # Reject actions from the effective pubkey (operator's own reposts/likes/zaps)
-            settings = None
+            day_settings = await self.db.get_settings(self.user_id)
+            if getattr(day_settings, "midnight_reset_enabled", True):
+                await ensure_membership_day(self.user_id, self.app, admission_lock_held=True)
             try:
-                from ..views_api import _get_effective_pubkey
-                settings = await self.db.get_settings(self.user_id)
-                eff_pub = _get_effective_pubkey(settings)
-                if eff_pub and attacker.pubkey == eff_pub:
-                    logger.info(
-                        f"AdmissionGuard: rejecting action from effective pubkey (operator's own action) "
-                        f"pubkey={attacker.pubkey[:16]}..."
-                    )
-                    return None
-            except Exception as e:
-                logger.warning(f"Could not check effective pubkey: {e}")
-
-            # Honor the operator-configured membership minimum. This is the floor
-            # for open-slot zap admission and for the headbutt exceed-lowest
-            # threshold (required = max(minimum_sats, lowest + 1)). Falls back to
-            # the service default when the setting is unavailable.
-            try:
-                if settings is not None:
-                    configured_min = getattr(settings, "minimum_sats", None)
-                    if configured_min is not None:
-                        self.headbutt_min_sats = int(configured_min)
-            except Exception:
-                logger.debug("Could not read minimum_sats; using default headbutt minimum")
-
-            # Check if pubkey is banned
-            try:
-                if await crud.is_pubkey_banned(attacker.pubkey, self.user_id):
-                    logger.info(
-                        f"AdmissionGuard: rejecting action from banned pubkey "
-                        f"pubkey={attacker.pubkey[:16]}..."
-                    )
-                    return None
-            except Exception as e:
-                logger.warning(f"Could not check if pubkey is banned: {e}")
-
-            active_members = await self.db.get_active_cyberherd_members(user_id=self.user_id)
-            max_members = await self._get_max_members()
-
-            # Prefer explicit boolean flags set on _Attacker, fallback to membership checks
-            is_repost = getattr(attacker, "is_repost", False) or (
-                getattr(attacker, "kinds", None) and 6 in getattr(attacker, "kinds", [])
-            )
-            is_reaction = getattr(attacker, "is_reaction", False) or (
-                getattr(attacker, "kinds", None) and 7 in getattr(attacker, "kinds", [])
-            )
-            if is_repost or is_reaction:
-                # For reposts and reactions, set amount to 0
-                if not (is_repost and is_reaction):
-                    attacker.amount = 0
-
-            is_existing_member = any(
-                m.get("pubkey") == attacker.pubkey for m in active_members
-            )
-
-            if is_existing_member:
-                # Existing members: reposts/reactions should update kinds and
-                # trigger small cumulative payouts (no amount increase), rather
-                # than being ignored. Zaps (amount>0) still increase amount.
-                logger.info(
-                    f"AdmissionGuard existing_member: cumulative_update (member {attacker.pubkey[:8]}...)"
-                )
-                
-                # Get the current member data before update for message generation
-                existing_member = await self.db.get_cyberherd_member_by_pubkey(attacker.pubkey, user_id=self.user_id)
-                old_amount = existing_member.get('amount', 0) if existing_member else 0
-                was_active = bool(existing_member and existing_member.get('is_active'))
-                
-                # Check if this is a repost or reaction event
-                attacker_kinds = getattr(attacker, 'kinds', []) or []
-                is_repost_event = 6 in attacker_kinds
-                is_reaction_event = 7 in attacker_kinds
-                
-                # Get existing kinds from the member record
-                existing_kinds_set = set()
-                if existing_member:
-                    kinds_raw = existing_member.get('kinds')
-                    if kinds_raw:
-                        if isinstance(kinds_raw, str):
-                            # Parse comma-separated string like "6,7"
-                            for part in kinds_raw.split(','):
-                                try:
-                                    existing_kinds_set.add(int(part.strip()))
-                                except Exception:
-                                    pass
-                        elif isinstance(kinds_raw, (list, tuple)):
-                            for k in kinds_raw:
-                                try:
-                                    existing_kinds_set.add(int(k))
-                                except Exception:
-                                    pass
-                
-                # Skip processing if this is a duplicate repost or reaction
-                # Reposts and reactions should only be counted once per user
-                if is_repost_event and 6 in existing_kinds_set:
-                    logger.info(
-                        f"⏭️  Skipping duplicate kind 6 (repost) for existing member {attacker.pubkey[:8]}... "
-                        f"(already has kind 6 recorded)"
-                    )
-                    return None
-                
-                if is_reaction_event and 7 in existing_kinds_set:
-                    logger.info(
-                        f"⏭️  Skipping duplicate kind 7 (reaction) for existing member {attacker.pubkey[:8]}... "
-                        f"(already has kind 7 recorded)"
-                    )
-                    return None
-                
-                # Normalize the attacker metadata before templating:
-                # Copy display_name, nprofile, lud16, picture, etc. from existing_member onto attacker when missing
-                if existing_member:
-                    if not getattr(attacker, 'display_name', None):
-                        attacker.display_name = existing_member.get('display_name')
-                    if not getattr(attacker, 'nprofile', None):
-                        attacker.nprofile = existing_member.get('nprofile')
-                    if not getattr(attacker, 'lud16', None):
-                        attacker.lud16 = existing_member.get('lud16')
-                    if not getattr(attacker, 'picture', None):
-                        attacker.picture = existing_member.get('picture')
-                
-                increase_amount = attacker.amount  # The amount of this specific zap
-
-                # Payouts are fully recomputed by recompute_member_payouts()
-                # inside update_and_activate_member, so no per-event payout
-                # calculation is needed here — just update the amount.
-                if int(increase_amount or 0) == 0:
-                    event_type_name = "reaction" if is_reaction_event else "repost"
-                    logger.info(f"💰 {event_type_name.capitalize()} (kind {'7' if is_reaction_event else '6'}) for existing member")
-                else:
-                    logger.info(f"💰 Zap for existing member: {increase_amount} sat zap")
-
-                await self.db.update_and_activate_member(
-                    attacker.pubkey,
-                    int(increase_amount or 0),
-                    user_id=self.user_id,
-                    kinds=getattr(attacker, 'kinds', None),
-                )
-                
-                # Fetch the refreshed row once to compute new_total defensively
-                updated_member = await self.db.get_cyberherd_member_by_pubkey(attacker.pubkey, user_id=self.user_id)
-                if updated_member and updated_member.get('amount') is not None:
-                    new_total = updated_member.get('amount', 0)
-                else:
-                    # Fallback if fresh row unavailable or amount is None
-                    new_total = old_amount + increase_amount
-                
-                member_nprofile = getattr(attacker, 'nprofile', None) or (updated_member or {}).get("nprofile")
-                member_display_name = (
-                    getattr(attacker, "display_name", None)
-                    or (updated_member or {}).get("display_name")
-                    or "Member"
-                )
-                member_name = f"nostr:{member_nprofile}" if member_nprofile else member_display_name
-                member_pubkey = attacker.pubkey if attacker.pubkey else None
-                raw_note_id = getattr(attacker, "note", None) or getattr(attacker, "note_id", None)
-                note_id = _normalize_event_id(raw_note_id)
-                raw_event_id = getattr(attacker, "event_id", None)
-                event_id_value = _normalize_event_id(raw_event_id) or raw_event_id
-                
-                # Determine the base event type (new member vs increase)
-                base_event_type = "member_increase" if was_active else "new_member"
-                
-                # Determine the source event type (what triggered this: zap, repost, or reaction)
-                # Check attacker.kinds to see if it's a kind 6 (repost) or kind 7 (reaction)
-                attacker_kinds = getattr(attacker, 'kinds', []) or []
-                is_repost = 6 in attacker_kinds
-                is_reaction = 7 in attacker_kinds
-                
-                # Select the appropriate event_type for messaging:
-                # - For new members: use "new_member" (generic) since we want consistent welcome messages
-                # - For existing members: use dedicated existing-member categories for
-                #   repost/reaction so the message acknowledges continued support rather
-                #   than welcoming them as a new join. (kind_6_repost / kind_7_reaction
-                #   stay reserved for genuinely NEW members in _maybe_publish_new_member.)
-                if base_event_type == "member_increase":
-                    if is_repost:
-                        event_type = "existing_member_repost"  # Existing member reposted again
-                    elif is_reaction:
-                        event_type = "existing_member_reaction"  # Existing member reacted again
+                async with crud.admission_transaction(after_commit=callbacks):
+                    if payment_effect is not None and not await payment_effect():
+                        result = {"status": "duplicate"}
                     else:
-                        event_type = "member_increase"  # Existing member zapped (or other)
-                else:
-                    # New member - could use specific types here too if desired
-                    event_type = base_event_type  # "new_member"
-                
-                message_event_id = None
-                if event_id_value:
-                    event_id_str = str(event_id_value)
-                    message_event_id = event_id_str if event_id_str.startswith("msg:") else f"msg:{event_id_str}"
-                increase_amount_int = int(increase_amount or 0)
-                new_total_int = int(new_total or 0)
-                member_picture = (
-                    getattr(attacker, "picture", None)
-                    or (updated_member or {}).get("picture")
-                    or (existing_member or {}).get("picture")
-                )
-                await self._record_social_event(attacker)
-                await self._publish_membership_event(
-                    event_type,
-                    member_pubkey=member_pubkey,
-                    member_name=member_name,
-                    member_display_name=member_display_name,
-                    member_nprofile=member_nprofile,
-                    increase_amount=increase_amount_int,
-                    new_total=new_total_int,
-                    initial_amount=increase_amount_int if not was_active else None,
-                    note_id=note_id,
-                    event_id=message_event_id,
-                    source_event_id=event_id_value,
-                    member_picture=member_picture,
-                )
-
-                await self._post_admission_tasks(attacker.pubkey, event_id=event_id_value, note_id=note_id)
-                return {
-                    "updated": attacker.pubkey,
-                    "reason": "cumulative_zap",
-                    "status": "updated",
-                }
-
-            # New members MUST zap today's #CyberHerd note (which are the Tracked Note IDs).
-            # Fetch today's notes for validation, but allow fallback if note_id is provided.
-            todays_notes = await self._get_today_cyberherd_notes()
-            attacker_note_id_raw = getattr(attacker, "note", None) or getattr(attacker, "note_id", None)
-            attacker_note_id_norm = _normalize_event_id(attacker_note_id_raw)
-            attacker_note_id = attacker_note_id_norm or attacker_note_id_raw
-
-            settings_for_tracking = None
-            tracked_event_ids_raw: list[str] = []
+                        self._permanent_rejection = None
+                        result = await self._attempt_headbutt_locked(attacker)
+                        if payment_effect is not None and not result:
+                            if self._permanent_rejection:
+                                result = {"status": "rejected", "reason": self._permanent_rejection}
+                            else:
+                                raise RejectedPayment()
+                        if result and payment_success is not None:
+                            await payment_success()
+            except RejectedPayment:
+                result = None
+        # Notifications can trigger downstream work that needs admission/day
+        # locks, so they run after both the DB transaction and lock release.
+        for callback in callbacks:
             try:
-                settings_for_tracking = await self.db.get_settings(self.user_id)
-                tracked_event_ids_raw = getattr(settings_for_tracking, "tracked_event_ids", []) or []
-            except Exception:
-                tracked_event_ids_raw = []
+                await callback()
+            except Exception as exc:
+                logger.warning(f"CyberHerd after-commit notification failed: {exc}")
+        return result
 
-            tracked_event_ids = {
-                _normalize_event_id(t) or (t.strip().lower() if isinstance(t, str) else None)
-                for t in tracked_event_ids_raw
-            }
-            tracked_event_ids.discard(None)
-
-            # Check if tracked_tags are configured
-            tracked_tags = getattr(settings_for_tracking, "tracked_tags", []) or []
-            has_tracked_tags = bool([t for t in tracked_tags if t and t.strip()])
-
-            # If tracked_tags are NOT set AND no tracked_event_ids exist, accept any note
-            # If tracked_tags ARE set (even if no notes detected yet), require validation
-            if not has_tracked_tags and not tracked_event_ids:
+    async def _attempt_headbutt_locked(self, attacker: Any) -> dict[str, Any] | None:
+        # Check again while holding the admission lock: queued deliveries
+        # can outlive subscription checks and member kinds reset on eviction.
+        identity = self._social_event_identity(attacker)
+        if identity is not None:
+            event_id, note_id, _ = identity
+            if await self.db.is_event_processed(
+                self.user_id, event_id, note_id=note_id, strict=True
+            ):
                 logger.info(
-                    "AdmissionGuard: no tracked tags or notes configured — accepting any note from author"
-                )
-                # Allow admission without specific note validation
-                # The note_id check below will be skipped
-            elif not tracked_event_ids:
-                # Tracked tags are set but no notes detected yet - deny until notes exist
-                logger.info(
-                    f"AdmissionGuard: tracked tags configured but no notes detected yet — denying admission "
-                    f"(tracked_tags={len(tracked_tags)}, pubkey={attacker.pubkey[:16]}...)"
+                    f"Skipping processed social event {event_id[:16]}... "
+                    f"for note {note_id[:16]}... (user {self.user_id})"
                 )
                 return None
-            elif not attacker_note_id_norm or attacker_note_id_norm not in tracked_event_ids:
+        if self._in_cooldown():
+            logger.info("AdmissionGuard cooldown: in_cooldown=True")
+            return None
+
+        # Reject actions from the effective pubkey (operator's own reposts/likes/zaps)
+        settings = None
+        try:
+            from ..views_api import _get_effective_pubkey
+            settings = await self.db.get_settings(self.user_id)
+            eff_pub = _get_effective_pubkey(settings)
+            if eff_pub and attacker.pubkey == eff_pub:
                 logger.info(
-                    f"AdmissionGuard tracking_mismatch: note_not_registered "
-                    f"(note_id={attacker_note_id[:16] if attacker_note_id else 'none'}, "
-                    f"tracked_count={len(tracked_event_ids)}, pubkey={attacker.pubkey[:16]}...)"
+                    f"AdmissionGuard: rejecting action from effective pubkey (operator's own action) "
+                    f"pubkey={attacker.pubkey[:16]}..."
+                )
+                return None
+        except Exception as e:
+            logger.warning(f"Could not check effective pubkey: {e}")
+
+        # Honor the operator-configured membership minimum. This is the floor
+        # for open-slot zap admission and for the headbutt exceed-lowest
+        # threshold (required = max(minimum_sats, lowest + 1)). Falls back to
+        # the service default when the setting is unavailable.
+        try:
+            if settings is not None:
+                configured_min = getattr(settings, "minimum_sats", None)
+                if configured_min is not None:
+                    self.headbutt_min_sats = int(configured_min)
+        except Exception:
+            logger.debug("Could not read minimum_sats; using default headbutt minimum")
+
+        # Check if pubkey is banned
+        try:
+            if await crud.is_pubkey_banned(attacker.pubkey, self.user_id):
+                self._permanent_rejection = "banned"
+                logger.info(
+                    f"AdmissionGuard: rejecting action from banned pubkey "
+                    f"pubkey={attacker.pubkey[:16]}..."
+                )
+                return None
+        except Exception as e:
+            logger.warning(f"Could not check if pubkey is banned: {e}")
+
+        active_members = await self.db.get_active_cyberherd_members(user_id=self.user_id)
+        max_members = await self._get_max_members()
+
+        # Prefer explicit boolean flags set on _Attacker, fallback to membership checks
+        is_repost = getattr(attacker, "is_repost", False) or (
+            getattr(attacker, "kinds", None) and 6 in getattr(attacker, "kinds", [])
+        )
+        is_reaction = getattr(attacker, "is_reaction", False) or (
+            getattr(attacker, "kinds", None) and 7 in getattr(attacker, "kinds", [])
+        )
+        if is_repost or is_reaction:
+            # For reposts and reactions, set amount to 0
+            if not (is_repost and is_reaction):
+                attacker.amount = 0
+
+        is_existing_member = any(
+            m.get("pubkey") == attacker.pubkey for m in active_members
+        )
+
+        if is_existing_member:
+            # Existing members: reposts/reactions should update kinds and
+            # trigger small cumulative payouts (no amount increase), rather
+            # than being ignored. Zaps (amount>0) still increase amount.
+            logger.info(
+                f"AdmissionGuard existing_member: cumulative_update (member {attacker.pubkey[:8]}...)"
+            )
+
+            # Get the current member data before update for message generation
+            existing_member = await self.db.get_cyberherd_member_by_pubkey(attacker.pubkey, user_id=self.user_id)
+            old_amount = existing_member.get('amount', 0) if existing_member else 0
+            was_active = bool(existing_member and existing_member.get('is_active'))
+
+            # Check if this is a repost or reaction event
+            attacker_kinds = getattr(attacker, 'kinds', []) or []
+            is_repost_event = 6 in attacker_kinds
+            is_reaction_event = 7 in attacker_kinds
+
+            # Get existing kinds from the member record
+            existing_kinds_set = set()
+            if existing_member:
+                kinds_raw = existing_member.get('kinds')
+                if kinds_raw:
+                    if isinstance(kinds_raw, str):
+                        # Parse comma-separated string like "6,7"
+                        for part in kinds_raw.split(','):
+                            try:
+                                existing_kinds_set.add(int(part.strip()))
+                            except Exception:
+                                pass
+                    elif isinstance(kinds_raw, (list, tuple)):
+                        for k in kinds_raw:
+                            try:
+                                existing_kinds_set.add(int(k))
+                            except Exception:
+                                pass
+
+            # Skip processing if this is a duplicate repost or reaction
+            # Reposts and reactions should only be counted once per user
+            if is_repost_event and 6 in existing_kinds_set:
+                logger.info(
+                    f"⏭️  Skipping duplicate kind 6 (repost) for existing member {attacker.pubkey[:8]}... "
+                    f"(already has kind 6 recorded)"
                 )
                 return None
 
-            if not todays_notes:
-                # Cannot fetch today's notes - but if we have a note_id, trust it
-                # (it was already validated by the zap monitor's tracked notes registry)
-                if attacker_note_id:
-                    logger.info(
-                        f"AdmissionGuard today_notes_unavailable: proceeding_with_note_id "
-                        f"(cannot fetch today's notes but note_id provided, note_id={attacker_note_id[:16] if attacker_note_id else 'none'}, pubkey={attacker.pubkey[:16]}...)"
-                    )
-                    # Proceed with admission checks below
-                else:
-                    # No today's notes AND no note_id - must deny
-                    logger.info(
-                        f"AdmissionGuard missing_note: no_today_note_and_no_attacker_note "
-                        f"(cannot fetch today's notes and no note_id provided, pubkey={attacker.pubkey[:16]}...)"
-                    )
-                    return None
+            if is_reaction_event and 7 in existing_kinds_set:
+                logger.info(
+                    f"⏭️  Skipping duplicate kind 7 (reaction) for existing member {attacker.pubkey[:8]}... "
+                    f"(already has kind 7 recorded)"
+                )
+                return None
+
+            # Normalize the attacker metadata before templating:
+            # Copy display_name, nprofile, lud16, picture, etc. from existing_member onto attacker when missing
+            if existing_member:
+                if not getattr(attacker, 'display_name', None):
+                    attacker.display_name = existing_member.get('display_name')
+                if not getattr(attacker, 'nprofile', None):
+                    attacker.nprofile = existing_member.get('nprofile')
+                if not getattr(attacker, 'lud16', None):
+                    attacker.lud16 = existing_member.get('lud16')
+                if not getattr(attacker, 'picture', None):
+                    attacker.picture = existing_member.get('picture')
+
+            increase_amount = attacker.amount  # The amount of this specific zap
+
+            # Payouts are fully recomputed by recompute_member_payouts()
+            # inside update_and_activate_member, so no per-event payout
+            # calculation is needed here — just update the amount.
+            if int(increase_amount or 0) == 0:
+                event_type_name = "reaction" if is_reaction_event else "repost"
+                logger.info(f"💰 {event_type_name.capitalize()} (kind {'7' if is_reaction_event else '6'}) for existing member")
             else:
-                # We have today's notes - validate the note_id is one of them
-                logger.debug(f"📋 Verifying note {attacker_note_id[:16] if attacker_note_id else 'none'}... "
-                            f"against {len(todays_notes)} tracked notes: {[n[:16]+'...' for n in todays_notes[:5]]}")
-                
-                if attacker_note_id not in todays_notes:
-                    logger.info(
-                        f"AdmissionGuard wrong_note: not_today_cyberherd_note "
-                        f"(note_id={attacker_note_id[:16] if attacker_note_id else 'none'} not in today's tracked notes, pubkey={attacker.pubkey[:16]}...)"
-                    )
-                    return None
+                logger.info(f"💰 Zap for existing member: {increase_amount} sat zap")
 
-            if len(active_members) < max_members:
-                return await self._try_admit_free_spot(attacker)
+            await self.db.update_and_activate_member(
+                attacker.pubkey,
+                int(increase_amount or 0),
+                user_id=self.user_id,
+                kinds=getattr(attacker, 'kinds', None),
+            )
 
-            return await self._try_replace_lowest(attacker, active_members)
+            # Fetch the refreshed row once to compute new_total defensively
+            updated_member = await self.db.get_cyberherd_member_by_pubkey(attacker.pubkey, user_id=self.user_id)
+            if updated_member and updated_member.get('amount') is not None:
+                new_total = updated_member.get('amount', 0)
+            else:
+                # Fallback if fresh row unavailable or amount is None
+                new_total = old_amount + increase_amount
+
+            member_nprofile = getattr(attacker, 'nprofile', None) or (updated_member or {}).get("nprofile")
+            member_display_name = (
+                getattr(attacker, "display_name", None)
+                or (updated_member or {}).get("display_name")
+                or "Member"
+            )
+            member_name = f"nostr:{member_nprofile}" if member_nprofile else member_display_name
+            member_pubkey = attacker.pubkey if attacker.pubkey else None
+            raw_note_id = getattr(attacker, "note", None) or getattr(attacker, "note_id", None)
+            note_id = _normalize_event_id(raw_note_id)
+            raw_event_id = getattr(attacker, "event_id", None)
+            event_id_value = _normalize_event_id(raw_event_id) or raw_event_id
+
+            # Determine the base event type (new member vs increase)
+            base_event_type = "member_increase" if was_active else "new_member"
+
+            # Determine the source event type (what triggered this: zap, repost, or reaction)
+            # Check attacker.kinds to see if it's a kind 6 (repost) or kind 7 (reaction)
+            attacker_kinds = getattr(attacker, 'kinds', []) or []
+            is_repost = 6 in attacker_kinds
+            is_reaction = 7 in attacker_kinds
+
+            # Select the appropriate event_type for messaging:
+            # - For new members: use "new_member" (generic) since we want consistent welcome messages
+            # - For existing members: use dedicated existing-member categories for
+            #   repost/reaction so the message acknowledges continued support rather
+            #   than welcoming them as a new join. (kind_6_repost / kind_7_reaction
+            #   stay reserved for genuinely NEW members in _maybe_publish_new_member.)
+            if base_event_type == "member_increase":
+                if is_repost:
+                    event_type = "existing_member_repost"  # Existing member reposted again
+                elif is_reaction:
+                    event_type = "existing_member_reaction"  # Existing member reacted again
+                else:
+                    event_type = "member_increase"  # Existing member zapped (or other)
+            else:
+                # New member - could use specific types here too if desired
+                event_type = base_event_type  # "new_member"
+
+            message_event_id = None
+            if event_id_value:
+                event_id_str = str(event_id_value)
+                message_event_id = event_id_str if event_id_str.startswith("msg:") else f"msg:{event_id_str}"
+            increase_amount_int = int(increase_amount or 0)
+            new_total_int = int(new_total or 0)
+            member_picture = (
+                getattr(attacker, "picture", None)
+                or (updated_member or {}).get("picture")
+                or (existing_member or {}).get("picture")
+            )
+            await self._record_social_event(attacker)
+            await self._after_commit(
+                self._publish_membership_event,
+                event_type,
+                member_pubkey=member_pubkey,
+                member_name=member_name,
+                member_display_name=member_display_name,
+                member_nprofile=member_nprofile,
+                increase_amount=increase_amount_int,
+                new_total=new_total_int,
+                initial_amount=increase_amount_int if not was_active else None,
+                note_id=note_id,
+                event_id=message_event_id,
+                source_event_id=event_id_value,
+                member_picture=member_picture,
+            )
+
+            await self._after_commit(self._post_admission_tasks, attacker.pubkey, event_id=event_id_value, note_id=note_id)
+            return {
+                "updated": attacker.pubkey,
+                "reason": "cumulative_zap",
+                "status": "updated",
+            }
+
+        # New members MUST zap today's #CyberHerd note (which are the Tracked Note IDs).
+        # Fetch today's notes for validation, but allow fallback if note_id is provided.
+        todays_notes = await self._get_today_cyberherd_notes()
+        attacker_note_id_raw = getattr(attacker, "note", None) or getattr(attacker, "note_id", None)
+        attacker_note_id_norm = _normalize_event_id(attacker_note_id_raw)
+        attacker_note_id = attacker_note_id_norm or attacker_note_id_raw
+
+        settings_for_tracking = None
+        tracked_event_ids_raw: list[str] = []
+        try:
+            settings_for_tracking = await self.db.get_settings(self.user_id)
+            tracked_event_ids_raw = getattr(settings_for_tracking, "tracked_event_ids", []) or []
+        except Exception:
+            tracked_event_ids_raw = []
+
+        tracked_event_ids = {
+            _normalize_event_id(t) or (t.strip().lower() if isinstance(t, str) else None)
+            for t in tracked_event_ids_raw
+        }
+        tracked_event_ids.discard(None)
+
+        # Check if tracked_tags are configured
+        tracked_tags = getattr(settings_for_tracking, "tracked_tags", []) or []
+        has_tracked_tags = bool([t for t in tracked_tags if t and t.strip()])
+
+        # If tracked_tags are NOT set AND no tracked_event_ids exist, accept any note
+        # If tracked_tags ARE set (even if no notes detected yet), require validation
+        if not has_tracked_tags and not tracked_event_ids:
+            logger.info(
+                "AdmissionGuard: no tracked tags or notes configured — accepting any note from author"
+            )
+            # Allow admission without specific note validation
+            # The note_id check below will be skipped
+        elif not tracked_event_ids:
+            # Tracked tags are set but no notes detected yet - deny until notes exist
+            logger.info(
+                f"AdmissionGuard: tracked tags configured but no notes detected yet — denying admission "
+                f"(tracked_tags={len(tracked_tags)}, pubkey={attacker.pubkey[:16]}...)"
+            )
+            return None
+        elif not attacker_note_id_norm or attacker_note_id_norm not in tracked_event_ids:
+            logger.info(
+                f"AdmissionGuard tracking_mismatch: note_not_registered "
+                f"(note_id={attacker_note_id[:16] if attacker_note_id else 'none'}, "
+                f"tracked_count={len(tracked_event_ids)}, pubkey={attacker.pubkey[:16]}...)"
+            )
+            return None
+
+        if not todays_notes:
+            logger.info("AdmissionGuard: no verified project note for today's entry")
+            return None
+        else:
+            # We have today's notes - validate the note_id is one of them
+            logger.debug(f"📋 Verifying note {attacker_note_id[:16] if attacker_note_id else 'none'}... "
+                        f"against {len(todays_notes)} tracked notes: {[n[:16]+'...' for n in todays_notes[:5]]}")
+
+            if attacker_note_id not in todays_notes:
+                logger.info(
+                    f"AdmissionGuard wrong_note: not_today_cyberherd_note "
+                    f"(note_id={attacker_note_id[:16] if attacker_note_id else 'none'} not in today's tracked notes, pubkey={attacker.pubkey[:16]}...)"
+                )
+                return None
+
+        if len(active_members) < max_members:
+            return await self._try_admit_free_spot(attacker)
+
+        return await self._try_replace_lowest(attacker, active_members)
 
     async def _get_max_members(self) -> int:
         try:
@@ -1216,13 +1252,15 @@ class EnhancedHeadbuttService:
         if not is_repost and not is_reaction:
             min_required = int(self.headbutt_min_sats)
             if int(getattr(attacker, "amount", 0) or 0) < min_required:
+                self._permanent_rejection = "minimum_sats"
                 logger.info(
                     f"AdmissionGuard min_threshold: amount={getattr(attacker, 'amount', 0)} required_min={min_required} (pubkey={attacker.pubkey[:8]}...)"
                 )
                 # A free spot is available; the attacker simply contributed less
                 # than the join minimum. Use the dedicated "join_below_minimum"
                 # category so the message does not imply a displacement.
-                await self._send_headbutt_failure_notification(
+                await self._after_commit(
+                self._send_headbutt_failure_notification,
                     attacker,
                     {"display_name": "Anon", "amount": 0, "pubkey": ""},
                     min_required,
@@ -1234,8 +1272,9 @@ class EnhancedHeadbuttService:
         status = await self._handle_attacker_admission(attacker)
         if status in ["new", "reactivated"]:
             await self._record_social_event(attacker)
-            await self._maybe_publish_new_member(attacker, status)
-            await self._post_admission_tasks(
+            await self._after_commit(self._maybe_publish_new_member, attacker, status)
+            await self._after_commit(
+                self._post_admission_tasks,
                 attacker.pubkey,
                 getattr(attacker, "event_id", None),
                 getattr(attacker, "note", None) or getattr(attacker, "note_id", None),
@@ -1255,7 +1294,7 @@ class EnhancedHeadbuttService:
         is_reaction = getattr(attacker, "is_reaction", False) or (
             getattr(attacker, "kinds", None) and 7 in getattr(attacker, "kinds", [])
         )
-        
+
         # Kind 7 (reactions) can NEVER headbutt when the herd is full — they may
         # only take an open slot (per cyberherd_explanation.md). A combined kind
         # 6+7 event still counts as a repost (is_repost True) and is handled by
@@ -1267,14 +1306,15 @@ class EnhancedHeadbuttService:
             )
             lowest_for_failure = self._get_lowest_member(active_members)
             required_for_failure = self._required_amount_for_victim(lowest_for_failure)
-            await self._send_headbutt_failure_notification(
+            await self._after_commit(
+                self._send_headbutt_failure_notification,
                 attacker,
                 lowest_for_failure
                 or {"display_name": "Anon", "amount": 0, "pubkey": ""},
                 required_for_failure,
             )
             return None
-        
+
         if is_repost:
             # For reposts (kind 6), can replace:
             # - Other reposts (has kind 6)
@@ -1285,7 +1325,8 @@ class EnhancedHeadbuttService:
                 logger.info("No amount=0 members (reposts/reactions) to replace — repost headbutt skipped")
                 lowest_for_failure = self._get_lowest_member(active_members)
                 required_for_failure = self._required_amount_for_victim(lowest_for_failure)
-                await self._send_headbutt_failure_notification(
+                await self._after_commit(
+                self._send_headbutt_failure_notification,
                     attacker,
                     lowest_for_failure
                     or {"display_name": "Anon", "amount": 0, "pubkey": ""},
@@ -1295,10 +1336,17 @@ class EnhancedHeadbuttService:
             lowest = self._get_lowest_member(replaceable)
             logger.info(f"Repost (kind 6) can replace any amount=0 member: {len(replaceable)} candidates")
         else:
+            if int(getattr(attacker, "amount", 0) or 0) < int(self.headbutt_min_sats):
+                self._permanent_rejection = "minimum_sats"
+                await self._after_commit(
+                self._send_headbutt_failure_notification,
+                    attacker, self._get_lowest_member(active_members), int(self.headbutt_min_sats)
+                )
+                return None
             # For zaps, prioritize displacing repost/reaction-only members first
             # Get members with only kind 6 or kind 7 events (amount=0)
             non_zap_members = [m for m in active_members if m.get("amount", 0) == 0]
-            
+
             if non_zap_members:
                 # Zaps ALWAYS displace repost/reaction-only members, regardless of zap amount
                 lowest = self._get_lowest_member(non_zap_members)
@@ -1315,10 +1363,11 @@ class EnhancedHeadbuttService:
 
                 required = max(self.headbutt_min_sats, int(lowest.get("amount", 0)) + 1)
                 if int(getattr(attacker, "amount", 0) or 0) < required:
+                    self._permanent_rejection = "headbutt_threshold"
                     logger.info(
                         f"AdmissionGuard headbutt_threshold: amount={getattr(attacker, 'amount', 0)} required={required} (pubkey={attacker.pubkey[:8]}..., target={lowest.get('pubkey', '')[:8]}...)"
                     )
-                    await self._send_headbutt_failure_notification(attacker, lowest, required)
+                    await self._after_commit(self._send_headbutt_failure_notification, attacker, lowest, required)
                     return None
 
         logger.info("Headbutt successful — replacing lowest member")
@@ -1329,11 +1378,13 @@ class EnhancedHeadbuttService:
         status = await self._handle_successful_headbutt(attacker, lowest)
         if status in ["new", "reactivated"]:
             await self._record_social_event(attacker)
-            await self._send_headbutt_success_notification(
+            await self._after_commit(
+                self._send_headbutt_success_notification,
                 attacker,
                 lowest if isinstance(lowest, dict) else {"display_name": "Anon", "amount": 0, "pubkey": ""},
             )
-            await self._post_admission_tasks(
+            await self._after_commit(
+                self._post_admission_tasks,
                 attacker.pubkey,
                 getattr(attacker, "event_id", None),
                 getattr(attacker, "note", None) or getattr(attacker, "note_id", None),
@@ -1347,53 +1398,12 @@ class EnhancedHeadbuttService:
         return None
 
     async def _handle_successful_headbutt(self, attacker: Any, lowest: dict | None) -> str | None:
-        """Replace the lowest member with the attacker, atomically in effect.
-
-        Ordering matters for correctness:
-        1. Admit the attacker through the SAME validation as the open-slot path
-           (`_handle_attacker_admission` enforces lud16 and NIP-05). If the
-           attacker fails those requirements we return the failure status and
-           never touch the victim — a headbutt must not displace a member for an
-           attacker who isn't even eligible to join.
-        2. Only after the attacker is admitted do we evict the lowest member.
-           This briefly leaves the herd at max+1 active members, which is safe
-           because the whole method runs under the process-wide headbutt lock.
-        3. If eviction fails, roll back the attacker so the herd never exceeds
-           max_members.
-        """
-        try:
-            # Step 1: validate + admit the attacker (may reactivate an existing
-            # inactive member). Returns 'new'/'reactivated' on success, or a
-            # requirement string like 'lud16_required'/'nip05_required'.
-            status = await self._handle_attacker_admission(attacker)
-            if status not in ("new", "reactivated"):
-                logger.info(
-                    f"Headbutt aborted: attacker {str(getattr(attacker, 'pubkey', ''))[:8]}... "
-                    f"failed admission ({status}); victim not displaced"
-                )
-                return status
-
-            # Step 2: free the slot by evicting the lowest member.
-            if lowest and isinstance(lowest, dict):
-                try:
-                    await self.db.deactivate_cyberherd_member(lowest.get("pubkey"), user_id=self.user_id)
-                except Exception as exc:
-                    # Step 3: eviction failed — roll back the attacker so we don't
-                    # exceed max_members.
-                    logger.error(
-                        f"Headbutt eviction failed for {str(lowest.get('pubkey'))[:8]}...: {exc}; "
-                        f"rolling back attacker admission"
-                    )
-                    try:
-                        await self.db.deactivate_cyberherd_member(attacker.pubkey, user_id=self.user_id)
-                    except Exception:
-                        logger.error("Failed to roll back attacker after eviction failure")
-                    return None
-
+        status = await self._handle_attacker_admission(attacker)
+        if status not in ("new", "reactivated"):
             return status
-        except Exception as e:
-            logger.error(f"Error in _handle_successful_headbutt: {e}")
-            return None
+        if lowest and isinstance(lowest, dict):
+            await self.db.deactivate_cyberherd_member(lowest.get("pubkey"), user_id=self.user_id)
+        return status
 
     async def _publish_membership_event(
         self,
@@ -1716,7 +1726,8 @@ class EnhancedHeadbuttService:
             else:
                 publish_type = 'new_member'
 
-            await self._publish_membership_event(
+            await self._after_commit(
+                self._publish_membership_event,
                 publish_type,
                 member_pubkey=member_pubkey,
                 member_name=member_name,
@@ -1771,7 +1782,7 @@ class EnhancedHeadbuttService:
         try:
             # Get websocket topic from settings
             websocket_topic = await self._get_websocket_topic()
-            
+
             p_tags = [pubkey] if pubkey else []
             await self.messaging.send_cyberherd_update(
                 pubkey,
@@ -1811,115 +1822,105 @@ class EnhancedHeadbuttService:
     async def _handle_attacker_admission(self, attacker: Any) -> str:
         existing = await self.db.get_cyberherd_member_by_pubkey(attacker.pubkey, user_id=self.user_id)
 
-        # Payouts are fully recomputed by recompute_member_payouts()
-        # inside update_and_activate_member / add_new_active_member.
         if existing:
-            if not getattr(attacker, "nip05", None):
-                attacker.nip05 = (existing or {}).get("nip05")
-            await self.db.update_and_activate_member(
-                attacker.pubkey,
-                attacker.amount,
-                user_id=self.user_id,
-                kinds=getattr(attacker, 'kinds', None),
-                nip05=getattr(attacker, "nip05", None),
-            )
-            return "reactivated"
+            for field in ("display_name", "lud16", "picture", "nip05", "nprofile", "relays"):
+                if not getattr(attacker, field, None):
+                    setattr(attacker, field, existing.get(field))
+        zap_amount = int(getattr(attacker, "amount", 0) or 0)
+        requires_lud16 = zap_amount <= 0
+
+        metadata, metadata_source = await self._resolve_attacker_metadata(attacker)
+        cache_entry = _metadata_cache_get(attacker.pubkey)
+        metadata_timestamp = int(cache_entry.get("fetched_at", _now())) if cache_entry else int(_now())
+
+        if metadata:
+            if not getattr(attacker, "display_name", None):
+                attacker.display_name = metadata.get("display_name") or "Anon"
+            if not getattr(attacker, "lud16", None) and metadata.get("lud16"):
+                attacker.lud16 = metadata.get("lud16")
+            if not getattr(attacker, "picture", None) and metadata.get("picture"):
+                attacker.picture = metadata.get("picture")
+            if metadata.get("relays") and not getattr(attacker, "relays", None):
+                attacker.relays = metadata.get("relays")
+            if metadata.get("nip05"):
+                attacker.nip05 = metadata.get("nip05")
         else:
-            zap_amount = int(getattr(attacker, "amount", 0) or 0)
-            requires_lud16 = zap_amount <= 0
+            logger.debug(
+                f"AdmissionGuard metadata_unavailable: pubkey={attacker.pubkey[:16]}..., source={metadata_source or 'none'}"
+            )
 
-            metadata, metadata_source = await self._resolve_attacker_metadata(attacker)
-            cache_entry = _metadata_cache_get(attacker.pubkey)
-            metadata_timestamp = int(cache_entry.get("fetched_at", _now())) if cache_entry else int(_now())
+        if not getattr(attacker, "display_name", None):
+            attacker.display_name = "Anon"
 
-            if metadata:
-                if not getattr(attacker, "display_name", None):
-                    attacker.display_name = metadata.get("display_name") or "Anon"
-                if not getattr(attacker, "lud16", None) and metadata.get("lud16"):
-                    attacker.lud16 = metadata.get("lud16")
-                if not getattr(attacker, "picture", None) and metadata.get("picture"):
-                    attacker.picture = metadata.get("picture")
-                if metadata.get("relays") and not getattr(attacker, "relays", None):
-                    attacker.relays = metadata.get("relays")
-                if metadata.get("nip05"):
-                    attacker.nip05 = metadata.get("nip05")
+        has_lud16 = is_valid_lightning_address(getattr(attacker, "lud16", None))
+        if requires_lud16 and not has_lud16:
+            logger.info(
+                f"AdmissionGuard lud16_required: missing (pubkey={attacker.pubkey[:16]}..., zap_amount={zap_amount})"
+            )
+            return "lud16_required"
+
+        # Check if NIP-05 verification is enabled in settings
+        nip05_verification_enabled = True  # Default to enabled
+        try:
+            settings = await self.db.get_settings(self.user_id)
+            nip05_verification_enabled = getattr(settings, "nip05_verification_enabled", True)
+        except Exception as e:
+            logger.debug(f"Failed to fetch NIP-05 verification setting, defaulting to enabled: {e}")
+
+        # Only enforce NIP-05 verification if it's enabled
+        if nip05_verification_enabled:
+            nip05_value = str(getattr(attacker, "nip05", "") or "").strip()
+            if not nip05_value and metadata:
+                nip05_candidate = metadata.get("nip05")
+                if isinstance(nip05_candidate, str):
+                    nip05_value = nip05_candidate.strip()
+                    if nip05_value:
+                        attacker.nip05 = nip05_value
+
+            if not nip05_value:
+                logger.info(
+                    f"AdmissionGuard nip05_required: missing (pubkey={attacker.pubkey[:16]}...)"
+                )
+                return "nip05_required"
+
+            verification_result, verification_reason = await _verify_nip05_relaxed(attacker.pubkey, nip05_value)
+            cached_verified = bool(cache_entry and cache_entry.get("verified"))
+            if verification_result is False:
+                _metadata_cache_mark_verified(attacker.pubkey, False)
+                logger.info(
+                    f"AdmissionGuard nip05_required: verification_failed (pubkey={attacker.pubkey[:16]}..., nip05={nip05_value}, reason={verification_reason})"
+                )
+                return "nip05_required"
+            if verification_result is True:
+                _metadata_cache_mark_verified(attacker.pubkey, True)
+            elif not cached_verified:
+                logger.info(
+                    f"AdmissionGuard nip05_required: verification_unconfirmed (pubkey={attacker.pubkey[:16]}..., nip05={nip05_value}, reason={verification_reason})"
+                )
+                return "nip05_required"
             else:
                 logger.debug(
-                    f"AdmissionGuard metadata_unavailable: pubkey={attacker.pubkey[:16]}..., source={metadata_source or 'none'}"
+                    f"AdmissionGuard nip05_cached_ok: using cached verification (pubkey={attacker.pubkey[:16]}..., reason={verification_reason})"
                 )
+        else:
+            logger.info(
+                f"AdmissionGuard nip05_verification_disabled: skipping NIP-05 verification (pubkey={attacker.pubkey[:16]}...)"
+            )
 
-            if not getattr(attacker, "display_name", None):
-                attacker.display_name = "Anon"
+        # Generate nprofile for attacker (without relay hints - faster and still valid)
+        try:
+            from ..utils.tlv import hex_to_nprofile  # type: ignore
 
-            has_lud16 = bool(str(getattr(attacker, "lud16", "") or "").strip())
-            if requires_lud16 and not has_lud16:
-                logger.info(
-                    f"AdmissionGuard lud16_required: missing (pubkey={attacker.pubkey[:16]}..., zap_amount={zap_amount})"
-                )
-                return "lud16_required"
+            if not getattr(attacker, "nprofile", None):
+                attacker.nprofile = hex_to_nprofile(attacker.pubkey)
+        except Exception:
+            if not getattr(attacker, "nprofile", None):
+                attacker.nprofile = None
 
-            # Check if NIP-05 verification is enabled in settings
-            nip05_verification_enabled = True  # Default to enabled
-            try:
-                settings = await self.db.get_settings(self.user_id)
-                nip05_verification_enabled = getattr(settings, "nip05_verification_enabled", True)
-            except Exception as e:
-                logger.debug(f"Failed to fetch NIP-05 verification setting, defaulting to enabled: {e}")
+        setattr(attacker, "metadata_last_checked_at", metadata_timestamp)
 
-            # Only enforce NIP-05 verification if it's enabled
-            if nip05_verification_enabled:
-                nip05_value = str(getattr(attacker, "nip05", "") or "").strip()
-                if not nip05_value and metadata:
-                    nip05_candidate = metadata.get("nip05")
-                    if isinstance(nip05_candidate, str):
-                        nip05_value = nip05_candidate.strip()
-                        if nip05_value:
-                            attacker.nip05 = nip05_value
-
-                if not nip05_value:
-                    logger.info(
-                        f"AdmissionGuard nip05_required: missing (pubkey={attacker.pubkey[:16]}...)"
-                    )
-                    return "nip05_required"
-
-                verification_result, verification_reason = await _verify_nip05_relaxed(attacker.pubkey, nip05_value)
-                cached_verified = bool(cache_entry and cache_entry.get("verified"))
-                if verification_result is False:
-                    _metadata_cache_mark_verified(attacker.pubkey, False)
-                    logger.info(
-                        f"AdmissionGuard nip05_required: verification_failed (pubkey={attacker.pubkey[:16]}..., nip05={nip05_value}, reason={verification_reason})"
-                    )
-                    return "nip05_required"
-                if verification_result is True:
-                    _metadata_cache_mark_verified(attacker.pubkey, True)
-                elif not cached_verified:
-                    logger.info(
-                        f"AdmissionGuard nip05_required: verification_unconfirmed (pubkey={attacker.pubkey[:16]}..., nip05={nip05_value}, reason={verification_reason})"
-                    )
-                    return "nip05_required"
-                else:
-                    logger.debug(
-                        f"AdmissionGuard nip05_cached_ok: using cached verification (pubkey={attacker.pubkey[:16]}..., reason={verification_reason})"
-                    )
-            else:
-                logger.info(
-                    f"AdmissionGuard nip05_verification_disabled: skipping NIP-05 verification (pubkey={attacker.pubkey[:16]}...)"
-                )
-
-            # Generate nprofile for attacker (without relay hints - faster and still valid)
-            try:
-                from ..utils.tlv import hex_to_nprofile  # type: ignore
-
-                if not getattr(attacker, "nprofile", None):
-                    attacker.nprofile = hex_to_nprofile(attacker.pubkey)
-            except Exception:
-                if not getattr(attacker, "nprofile", None):
-                    attacker.nprofile = None
-
-            setattr(attacker, "metadata_last_checked_at", metadata_timestamp)
-
-            await self._add_new_member(attacker)
-            return "new"
+        await self._add_new_member(attacker)
+        return "reactivated" if existing else "new"
 
     def _select_template_key_for_headbutt(
         self,
@@ -2104,7 +2105,7 @@ class EnhancedHeadbuttService:
                     attacker_nprofile = existing_attacker.get('nprofile') if existing_attacker else None
                 except Exception:
                     attacker_nprofile = None
-            
+
             # Get nprofile for victim
             victim_nprofile = None
             if victim.get("pubkey"):
@@ -2113,7 +2114,7 @@ class EnhancedHeadbuttService:
                     victim_nprofile = existing_victim.get('nprofile') if existing_victim else None
                 except Exception:
                     victim_nprofile = None
-            
+
             # Resolve the attacker's display name. A failed headbutt never goes
             # through _handle_attacker_admission, so attacker.display_name is
             # usually unset here (especially for reposts/reactions) — resolve it
@@ -2392,12 +2393,12 @@ class EnhancedHeadbuttService:
                 'metadata_last_checked_at': int(datetime.now(timezone.utc).timestamp()),
                 'is_active': 1,
             }
-            
+
             await self.db.add_new_active_member(data, user_id=self.user_id)
-            
+
             # Set allocation to 1% for reposts
             await self.db.update_cyberherd_member_allocation(attacker.pubkey, 1.0, user_id=self.user_id)
-            
+
             # Update splits
             try:
                 from .splits import update_split_targets_proportional
@@ -2407,14 +2408,14 @@ class EnhancedHeadbuttService:
                     await update_split_targets_proportional(str(sw), user_id=self.user_id)
             except Exception:
                 pass
-            
-            await self._post_admission_tasks(attacker.pubkey)
-            
+
+            await self._after_commit(self._post_admission_tasks, attacker.pubkey)
+
             try:
-                await self._maybe_publish_new_member(attacker, "new")
+                await self._after_commit(self._maybe_publish_new_member, attacker, "new")
             except Exception as e:
                 logger.warning(f"Error publishing repost admission message: {e}")
-            
+
             logger.info(f"Admitted reposter {attacker.pubkey[:8]}... with 1% allocation")
             return {
                 "newly_activated": attacker.pubkey,
@@ -2422,7 +2423,7 @@ class EnhancedHeadbuttService:
                 "status": "new",
                 "allocation_percentage": 1.0
             }
-            
+
         except Exception as e:
             logger.error(f"Error handling repost admission for {attacker.pubkey[:8]}...: {e}")
             return None
@@ -2496,10 +2497,12 @@ async def trigger_headbutt_from_zap(
     event_id: str,
     app,
     display_name: str | None = None,
-    nprofile: str | None = None
+    nprofile: str | None = None,
+    payment_effect=None,
+    payment_success=None,
 ) -> dict[str, Any] | None:
     """Trigger headbutt processing from a zap event.
-    
+
     Args:
         user_id: User ID for the headbutt service
         pubkey: Pubkey of the zapper
@@ -2509,14 +2512,14 @@ async def trigger_headbutt_from_zap(
         app: FastAPI app object
         display_name: Optional display name of the zapper
         nprofile: Optional nprofile of the zapper
-        
+
     Returns:
         Result dict from attempt_headbutt or None
     """
     try:
         # Import here to avoid circular dependencies
         from . import messaging as ch_msg
-        
+
         # Create headbutt service
         service = EnhancedHeadbuttService(
             db=crud,
@@ -2524,7 +2527,7 @@ async def trigger_headbutt_from_zap(
             app=app,
             user_id=user_id
         )
-        
+
         # Create attacker object for zap (kind 9735)
         attacker = _Attacker(
             pubkey=pubkey,
@@ -2535,10 +2538,10 @@ async def trigger_headbutt_from_zap(
             display_name=display_name,
             nprofile=nprofile
         )
-        
+
         # Trigger headbutt attempt
-        return await service.attempt_headbutt(attacker)
-        
+        return await service.attempt_headbutt(attacker, payment_effect=payment_effect, payment_success=payment_success)
+
     except Exception as e:
         logger.error(f"Error in trigger_headbutt_from_zap: {e}")
         return None
@@ -2555,7 +2558,7 @@ async def trigger_headbutt_from_repost(
     nprofile: str | None = None
 ) -> dict[str, Any] | None:
     """Trigger headbutt processing from a repost event.
-    
+
     Args:
         user_id: User ID for the headbutt service
         pubkey: Pubkey of the reposter
@@ -2564,7 +2567,7 @@ async def trigger_headbutt_from_repost(
         app: FastAPI app object
         display_name: Optional display name of the reposter
         nprofile: Optional nprofile of the reposter
-        
+
     Returns:
         Result dict from attempt_headbutt or None
     """
@@ -2611,7 +2614,7 @@ async def trigger_headbutt_from_reaction(
     nprofile: str | None = None
 ) -> dict[str, Any] | None:
     """Trigger headbutt processing from a reaction/like event.
-    
+
     Args:
         user_id: User ID for the headbutt service
         pubkey: Pubkey of the reactor
@@ -2620,7 +2623,7 @@ async def trigger_headbutt_from_reaction(
         app: FastAPI app object
         display_name: Optional display name of the reactor
         nprofile: Optional nprofile of the reactor
-        
+
     Returns:
         Result dict from attempt_headbutt or None
     """

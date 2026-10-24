@@ -100,7 +100,7 @@ def _proportional_percentages(weights: List[int], total: int = 100) -> List[int]
 
 def compute_member_share_percentages(
     members: Iterable[Dict[str, Any]], member_total: int
-) -> Dict[str, int]:
+) -> Dict[str, float]:
     """Compute per-member share percentages for the member allocation block.
 
     Share allocation per the CyberHerd spec:
@@ -122,12 +122,13 @@ def compute_member_share_percentages(
         member_total: Total percentage available for members (e.g. 10 or 100).
 
     Returns:
-        Mapping of normalized pubkey -> integer percentage of the member pool.
+        Mapping of normalized pubkey -> percentage of the full payment.
+        Proportional amounts retain six decimal places of percentage precision.
         Members that are inactive, missing a pubkey, or otherwise ineligible
         will appear in the mapping with a value of 0.
     """
     safe_total = max(0, int(member_total))
-    shares: Dict[str, int] = {}
+    shares: Dict[str, float] = {}
     active_records: List[Dict[str, Any]] = []
 
     for raw in members:
@@ -202,7 +203,17 @@ def compute_member_share_percentages(
 
     if zappers and total_zap_amount > 0:
         weights = [record["amount"] for record in zappers]
-        zap_percents = _proportional_percentages(weights, total=remaining_pool)
+        # Allocate micro-percentage units using exact integer division. This
+        # preserves proportional shares instead of rounding to whole percent.
+        units = remaining_pool * 1_000_000
+        allocated = [units * weight // total_zap_amount for weight in weights]
+        remainder = units - sum(allocated)
+        order = sorted(range(len(weights)),
+                       key=lambda i: (units * weights[i]) % total_zap_amount,
+                       reverse=True)
+        for index in order[:remainder]:
+            allocated[index] += 1
+        zap_percents = [value / 1_000_000 for value in allocated]
         for record, pct in zip(zappers, zap_percents):
             shares[record["pubkey"]] = shares.get(record["pubkey"], 0) + pct
     # If there are no zappers, the remaining pool is intentionally left

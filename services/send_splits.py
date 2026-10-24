@@ -44,6 +44,8 @@ async def transfer_herd_balance_to_source(settings: CyberherdSettings) -> Dict[s
     Uses a per-wallet lock to prevent concurrent transfers from racing
     (e.g. Lightning Goats feeder trigger vs CyberHerd auto-splits).
     """
+    from ..tasks import ensure_membership_day
+    await ensure_membership_day(user_id=settings.user_id)
     herd_wallet_ref = getattr(settings, "herd_wallet", None)
     target_wallet_ref = getattr(settings, "source_wallet", None)
 
@@ -136,23 +138,18 @@ async def transfer_herd_balance_to_source(settings: CyberherdSettings) -> Dict[s
 
 
 async def maybe_send_splits_for_user(
-    user_id: str, settings: Optional[CyberherdSettings] = None
+    user_id: str, settings: Optional[CyberherdSettings] = None, *, feeder_triggered: bool = False
 ) -> Optional[Dict[str, Any]]:
-    """Send splits automatically when enabled and the trigger threshold is met."""
+    """Distribute only after the feeder integration reports a successful trigger.
+
+    A balance-only invoice notification is not authorization to distribute.
+    The caller must be the feeder path, after override and trigger checks.
+    OpenHAB acceptance confirms a rule request, not physical food delivery.
+    """
+    if feeder_triggered is not True:
+        return None
     settings_obj = settings or await crud.get_settings(user_id)
     if not getattr(settings_obj, "send_splits_enabled", False):
-        return None
-
-    trigger_value = getattr(settings_obj, "feeder_trigger_sats", None)
-    try:
-        trigger_int = int(trigger_value) if trigger_value not in (None, "") else None
-    except Exception:
-        trigger_int = None
-
-    if trigger_int is None or trigger_int <= 0:
-        logger.debug(
-            "CyberHerd send-splits skipped: trigger not configured for user %s", user_id
-        )
         return None
 
     herd_wallet_ref = getattr(settings_obj, "herd_wallet", None)
@@ -179,14 +176,8 @@ async def maybe_send_splits_for_user(
     except Exception:
         balance_sats = 0
 
-    if balance_sats < trigger_int:
-        logger.debug(
-            "CyberHerd send-splits: balance %s sats below trigger %s sats for user %s",
-            balance_sats,
-            trigger_int,
-            user_id,
-        )
-        return None
+    if balance_sats <= 0:
+        return {"ok": False, "error": "Herd wallet balance is zero"}
 
     last_ts = _LAST_ATTEMPT.get(user_id, 0.0)
     now = time.time()

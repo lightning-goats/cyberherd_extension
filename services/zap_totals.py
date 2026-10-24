@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from contextlib import nullcontext
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 from loguru import logger
 
 from lnbits.utils.nostr import validate_pub_key
 
 from .. import crud
-from .nostr_helpers import query_events
+from .nostr_helpers import verify_event_signature
 from .pubkey import resolve_effective_pubkey
 from lnbits.db import Filters
 from lnbits.core.models.payments import PaymentFilters
@@ -55,6 +57,8 @@ def _normalise_pubkey(value: str) -> str:
 
 
 async def _get_key_lock(key: Tuple[str, str]) -> asyncio.Lock:
+    # One lock per owner serializes full history rebuilds with every increment.
+    key = (key[0], "all-zap-totals")
     async with _get_lock_registry_lock():
         lock = _lock_registry.get(key)
         if lock is None:
@@ -134,6 +138,8 @@ def _extract_zap_from_payment(payment: Any) -> dict | None:
     - created_at (from payment.time)
     - event_id (payment_hash/checking_id)
     """
+    if not getattr(payment, "success", False):
+        return None
     try:
         amount_msat = int(getattr(payment, "amount", 0) or 0)
     except Exception:
@@ -160,7 +166,7 @@ def _extract_zap_from_payment(payment: Any) -> dict | None:
         kind = int(nostr_payload.get("kind"))
     except Exception:
         kind = None
-    if kind != 9734:
+    if kind != 9734 or not verify_event_signature(nostr_payload):
         return None
 
     zapper = nostr_payload.get("pubkey")
@@ -204,6 +210,10 @@ def _extract_zap_from_payment(payment: Any) -> dict | None:
         event_id = getattr(payment, "checking_id", None)
         if not isinstance(event_id, str):
             event_id = None
+
+    if not isinstance(event_id, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", event_id):
+        return None
+    event_id = event_id.lower()
 
     return {
         "zapper": zapper,
@@ -282,7 +292,6 @@ async def get_zap_totals_for_zapper(
         entry_event_count = int((row or {}).get("event_count") or 0)
         entry_first_event = row.get("first_event_at") if row else None
         entry_last_event = row.get("last_event_at") if row else None
-        entry_last_event_ids = _deserialize_last_event_ids((row or {}).get("last_event_ids"))
         entry_last_updated = float((row or {}).get("last_updated_at") or 0.0)
 
         now = time.time()
@@ -305,151 +314,19 @@ async def get_zap_totals_for_zapper(
                 updated=False,
             )
 
-        if row and existing_target != watch_pubkey:
-            # Watch pubkey changed: reset accumulators
-            entry_total = 0
-            entry_event_count = 0
-            entry_first_event = None
-            entry_last_event = None
-            entry_last_event_ids = ()
-            entry_last_updated = 0.0
-
-        total_sats = entry_total
-        event_count = entry_event_count
-        first_event_at = entry_first_event
-        last_event_at = entry_last_event
-        last_event_ids_list: List[str] = list(entry_last_event_ids)
-        prev_last_event_at = entry_last_event
-        prev_last_event_ids = set(entry_last_event_ids)
-
-        seen_ids: set[str] = set()
-        updated = False
-
-        cursor = last_event_at
-        loops = 0
-
-        while loops < MAX_BATCH_LOOPS:
-            loops += 1
-            filters: Dict[str, Any] = {
-                "kinds": [9735],
-                "authors": [zapper],
-                "#p": [watch_pubkey],
-            }
-            if cursor is not None:
-                filters["since"] = int(cursor)
-
-            try:
-                events = await query_events(filters, limit=MAX_BATCH_SIZE, timeout=8.0)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning(f"zap_totals: query_events failed: {exc}")
-                break
-
-            if not events:
-                break
-
-            clean_events: List[dict] = []
-            for ev in events:
-                ev_id = ev.get("id")
-                if not isinstance(ev_id, str):
-                    continue
-                if ev_id in seen_ids:
-                    continue
-                seen_ids.add(ev_id)
-                clean_events.append(ev)
-
-            if not clean_events:
-                break
-
-            clean_events.sort(key=lambda ev: ev.get("created_at") or 0)
-
-            batch_new = 0
-            for ev in clean_events:
-                created_at = ev.get("created_at")
-                if created_at is None:
-                    continue
-                try:
-                    created_at = int(created_at)
-                except Exception:
-                    continue
-
-                ev_id = ev.get("id")
-                if prev_last_event_at is not None:
-                    if created_at < prev_last_event_at:
-                        continue
-                    if (
-                        created_at == prev_last_event_at
-                        and isinstance(ev_id, str)
-                        and ev_id in prev_last_event_ids
-                    ):
-                        continue
-
-                amount_msat = _extract_amount_msat(ev.get("tags", []))
-                if amount_msat is None:
-                    continue
-
-                sats = amount_msat // 1000
-                if sats <= 0:
-                    continue
-
-                total_sats += sats
-                event_count += 1
-                batch_new += 1
-
-                if first_event_at is None or created_at < first_event_at:
-                    first_event_at = created_at
-                if last_event_at is None or created_at > last_event_at:
-                    last_event_at = created_at
-                    last_event_ids_list = [ev_id] if isinstance(ev_id, str) else []
-                elif created_at == last_event_at and isinstance(ev_id, str):
-                    if ev_id not in last_event_ids_list:
-                        last_event_ids_list.append(ev_id)
-
-            if batch_new == 0:
-                break
-
-            updated = True
-            if last_event_at is None:
-                break
-            cursor = last_event_at
-            prev_last_event_at = last_event_at
-            prev_last_event_ids = set(last_event_ids_list)
-
-            if len(clean_events) < MAX_BATCH_SIZE:
-                break
-
-        if not updated and row:
-            # No new events but ensure last_event_ids_list reflects persisted state
-            last_event_ids_list = list(entry_last_event_ids)
-            last_event_at = entry_last_event
-            first_event_at = entry_first_event
-            total_sats = entry_total
-            event_count = entry_event_count
-
-        last_updated_at = time.time()
-
-        await crud.upsert_zap_totals_row(
-            user_id=user_id,
-            zapper_pubkey=zapper,
-            total_sats=total_sats,
-            event_count=event_count,
-            first_event_at=first_event_at,
-            last_event_at=last_event_at,
-            last_event_ids=last_event_ids_list,
-            last_updated_at=last_updated_at,
-            target_pubkey=watch_pubkey,
+        # The configured local herd wallet is the settlement authority. Relay
+        # receipt authors are providers, not senders, and receipts alone do not
+        # prove payment. Rebuild from authenticated settled incoming invoices;
+        # each payment hash is counted exactly once regardless of receipts.
+        await _rebuild_zap_totals_from_payments_locked(
+            user_id=user_id, zapper_pubkey=zapper, all_zaps=True, allow_empty=True,
         )
-
+        row = await crud.get_zap_totals_row(user_id, zapper)
         return _entry_to_result(
-            user_id=user_id,
-            zapper_pubkey=zapper,
-            target_pubkey=watch_pubkey,
-            total_sats=total_sats,
-            event_count=event_count,
-            first_event_at=first_event_at,
-            last_event_at=last_event_at,
-            last_updated_at=last_updated_at,
-            cached=False,
-            updated=updated,
+            user_id=user_id, zapper_pubkey=zapper, target_pubkey=watch_pubkey,
+            total_sats=int(row["total_sats"]), event_count=int(row["event_count"]),
+            first_event_at=row.get("first_event_at"), last_event_at=row.get("last_event_at"),
+            last_updated_at=float(row["last_updated_at"]), cached=False, updated=True,
         )
 
 
@@ -462,6 +339,7 @@ async def record_incremental_zap_total(
     event_timestamp: Optional[int] = None,
     event_id: Optional[str] = None,
     skip_member_check: bool = False,
+    lock_already_held: bool = False,
 ) -> None:
     """Incrementally update zap totals when a zap is processed via payments."""
     if not user_id or amount_sats <= 0:
@@ -484,56 +362,77 @@ async def record_incremental_zap_total(
 
     key = (user_id, zapper)
     lock = await _get_key_lock(key)
+    async with nullcontext() if lock_already_held else lock:
+        async with crud.admission_transaction():
+            if not event_id:
+                raise ZapTotalsError("settled payment identity is required")
+            counted = await crud.account_zap_payment(
+                user_id=user_id, payment_hash=event_id, zapper_pubkey=zapper,
+                amount_sats=amount_sats, processed_at=event_ts,
+            )
+            if not counted:
+                return
+            row = await crud.get_zap_totals_row(user_id, zapper)
+            existing_target = (row or {}).get("target_pubkey")
+            if existing_target:
+                existing_target = existing_target.lower()
+
+            total_sats = int((row or {}).get("total_sats") or 0)
+            event_count = int((row or {}).get("event_count") or 0)
+            first_event_at = row.get("first_event_at") if row else None
+            last_event_at = row.get("last_event_at") if row else None
+            last_event_ids = list(_deserialize_last_event_ids((row or {}).get("last_event_ids")))
+
+            if row and existing_target != target:
+                total_sats = 0
+                event_count = 0
+                first_event_at = None
+                last_event_at = None
+                last_event_ids = []
+
+            total_sats += amount_sats
+            event_count += 1
+            if first_event_at is None or event_ts < first_event_at:
+                first_event_at = event_ts
+
+            if last_event_at is None or event_ts > last_event_at:
+                last_event_at = event_ts
+                last_event_ids = [event_id] if event_id else []
+            elif event_ts == last_event_at:
+                if event_id and event_id not in last_event_ids:
+                    last_event_ids.append(event_id)
+
+            await crud.upsert_zap_totals_row(
+                user_id=user_id,
+                zapper_pubkey=zapper,
+                total_sats=total_sats,
+                event_count=event_count,
+                first_event_at=first_event_at,
+                last_event_at=last_event_at,
+                last_event_ids=last_event_ids,
+                last_updated_at=time.time(),
+                target_pubkey=target,
+            )
+
+async def rebuild_zap_totals_from_payments(
+    *, user_id: str, zapper_pubkey: str | None = None,
+    batch_size: int = 250, all_zaps: bool = False,
+) -> dict:
+    lock = await _get_key_lock((user_id, "all-zap-totals"))
     async with lock:
-        row = await crud.get_zap_totals_row(user_id, zapper)
-        existing_target = (row or {}).get("target_pubkey")
-        if existing_target:
-            existing_target = existing_target.lower()
-
-        total_sats = int((row or {}).get("total_sats") or 0)
-        event_count = int((row or {}).get("event_count") or 0)
-        first_event_at = row.get("first_event_at") if row else None
-        last_event_at = row.get("last_event_at") if row else None
-        last_event_ids = list(_deserialize_last_event_ids((row or {}).get("last_event_ids")))
-
-        if row and existing_target != target:
-            total_sats = 0
-            event_count = 0
-            first_event_at = None
-            last_event_at = None
-            last_event_ids = []
-
-        total_sats += amount_sats
-        event_count += 1
-        if first_event_at is None or event_ts < first_event_at:
-            first_event_at = event_ts
-
-        if last_event_at is None or event_ts > last_event_at:
-            last_event_at = event_ts
-            last_event_ids = [event_id] if event_id else []
-        elif event_ts == last_event_at:
-            if event_id and event_id not in last_event_ids:
-                last_event_ids.append(event_id)
-
-        await crud.upsert_zap_totals_row(
-            user_id=user_id,
-            zapper_pubkey=zapper,
-            total_sats=total_sats,
-            event_count=event_count,
-            first_event_at=first_event_at,
-            last_event_at=last_event_at,
-            last_event_ids=last_event_ids,
-            last_updated_at=time.time(),
-            target_pubkey=target,
+        return await _rebuild_zap_totals_from_payments_locked(
+            user_id=user_id, zapper_pubkey=zapper_pubkey,
+            batch_size=batch_size, all_zaps=all_zaps,
         )
 
 
-async def rebuild_zap_totals_from_payments(
+async def _rebuild_zap_totals_from_payments_locked(
     *,
     user_id: str,
     zapper_pubkey: str | None = None,
     batch_size: int = 250,
     all_zaps: bool = False,
+    allow_empty: bool = False,
 ) -> dict:
     """Scan LNbits payments for the herd wallet and rebuild zap totals.
 
@@ -587,6 +486,8 @@ async def rebuild_zap_totals_from_payments(
             )
 
     aggregates: dict[str, dict[str, Any]] = {}
+    accounted_payments = {}
+    seen_payment_ids = set()
     payments_scanned = 0
     zap_candidates = 0
     offset = 0
@@ -606,6 +507,7 @@ async def rebuild_zap_totals_from_payments(
         batch = await get_payments(
             wallet_id=herd_wallet,
             incoming=True,
+            complete=True,
             filters=filters,
         )
         if not batch:
@@ -614,8 +516,11 @@ async def rebuild_zap_totals_from_payments(
         for payment in batch:
             payments_scanned += 1
             zap = _extract_zap_from_payment(payment)
-            if not zap:
+            if not zap or getattr(payment, "wallet_id", None) != herd_wallet or zap.get("target_pubkey") != watch_pubkey:
                 continue
+            if zap["event_id"] in seen_payment_ids:
+                continue
+            seen_payment_ids.add(zap["event_id"])
             zapper = zap["zapper"]
             target_note_id = zap.get("target_note_id")
 
@@ -664,6 +569,7 @@ async def rebuild_zap_totals_from_payments(
             if amount_sats <= 0:
                 continue
             zap_candidates += 1
+            accounted_payments[zap["event_id"]] = zap
             aggregate = aggregates.setdefault(
                 zapper,
                 {
@@ -691,29 +597,37 @@ async def rebuild_zap_totals_from_payments(
                         aggregate["last_event_ids"].append(event_id)
 
     if zapper_filter and zapper_filter not in aggregates:
-        raise ZapTotalsError("no matching zaps found in payment history")
+        if not allow_empty:
+            raise ZapTotalsError("no matching zaps found in payment history")
+        aggregates[zapper_filter] = dict(total_sats=0, event_count=0, first_event_at=None, last_event_at=None, last_event_ids=[])
 
-    updated_rows: list[dict[str, Any]] = []
-    for zapper, data in aggregates.items():
-        await crud.upsert_zap_totals_row(
-            user_id=user_id,
-            zapper_pubkey=zapper,
-            total_sats=int(data["total_sats"]),
-            event_count=int(data["event_count"]),
-            first_event_at=data["first_event_at"],
-            last_event_at=data["last_event_at"],
-            last_event_ids=[eid for eid in data["last_event_ids"] if eid],
-            last_updated_at=time.time(),
-            target_pubkey=watch_pubkey,
-        )
-        updated_rows.append(
-            {
-                "zapper_pubkey": zapper,
-                "total_sats": int(data["total_sats"]),
-                "event_count": int(data["event_count"]),
-            }
-        )
-
+    async with crud.admission_transaction():
+        for payment_hash, zap in accounted_payments.items():
+            await crud.account_zap_payment(
+                user_id=user_id, payment_hash=payment_hash, zapper_pubkey=zap["zapper"],
+                amount_sats=zap["amount_sats"], note_id=zap.get("target_note_id"),
+                processed_at=zap.get("created_at"),
+            )
+        updated_rows: list[dict[str, Any]] = []
+        for zapper, data in aggregates.items():
+            await crud.upsert_zap_totals_row(
+                user_id=user_id,
+                zapper_pubkey=zapper,
+                total_sats=int(data["total_sats"]),
+                event_count=int(data["event_count"]),
+                first_event_at=data["first_event_at"],
+                last_event_at=data["last_event_at"],
+                last_event_ids=[eid for eid in data["last_event_ids"] if eid],
+                last_updated_at=time.time(),
+                target_pubkey=watch_pubkey,
+            )
+            updated_rows.append(
+                {
+                    "zapper_pubkey": zapper,
+                    "total_sats": int(data["total_sats"]),
+                    "event_count": int(data["event_count"]),
+                }
+            )
     return {
         "payments_scanned": payments_scanned,
         "zap_candidates": zap_candidates,
