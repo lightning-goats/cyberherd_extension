@@ -2754,7 +2754,9 @@ async def get_monitoring_totals(user_id: str) -> dict[str, int]:
     return totals
 
 
-async def is_payment_processed(user_id: str, payment_hash: str, note_id: str | None = None) -> bool:
+async def is_payment_processed(
+    user_id: str, payment_hash: str, note_id: str | None = None, *, strict: bool = False
+) -> bool:
     """Check if a payment/event has already been processed.
     
     Args:
@@ -2763,6 +2765,9 @@ async def is_payment_processed(user_id: str, payment_hash: str, note_id: str | N
         note_id: Optional note ID. If provided, checks for the specific (event, note) pair.
                  If not provided, checks if event was processed for ANY note.
     
+    ``strict=True`` propagates lookup failures so social admission cannot treat
+    unavailable deduplication storage as an unprocessed event.
+
     Returns:
         True if payment was already processed, False otherwise.
     """
@@ -2785,6 +2790,8 @@ async def is_payment_processed(user_id: str, payment_hash: str, note_id: str | N
             )
         return row is not None
     except Exception as e:
+        if strict:
+            raise
         msg = str(e).lower()
         if any(t in msg for t in ("undefinedtable", "does not exist", "no such table")):
             try:
@@ -2979,7 +2986,9 @@ async def clear_processed_events_for_user(user_id: str | None):
             logger.warning(f"Failed clearing processed_events for user {user_id}: {e}")
 
 
-async def is_event_processed(user_id: str, event_hash: str, note_id: str | None = None) -> bool:
+async def is_event_processed(
+    user_id: str, event_hash: str, note_id: str | None = None, *, strict: bool = False
+) -> bool:
     """Alias for is_payment_processed with clearer naming for nostr events.
 
     This exists to make calling code explicit about processing Nostr events
@@ -2989,10 +2998,11 @@ async def is_event_processed(user_id: str, event_hash: str, note_id: str | None 
     Args:
         user_id: User ID to scope the check.
         event_hash: Event ID to check.
+        strict: Propagate database lookup errors instead of returning False.
         note_id: Optional note ID. If provided, checks for the specific (event, note) pair.
                  If not provided, checks if event was processed for ANY note.
     """
-    return await is_payment_processed(user_id, event_hash, note_id=note_id)
+    return await is_payment_processed(user_id, event_hash, note_id=note_id, strict=strict)
 
 
 async def register_processed_event(

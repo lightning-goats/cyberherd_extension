@@ -827,8 +827,59 @@ class EnhancedHeadbuttService:
 
         return successful
 
+    def _social_event_identity(self, attacker: Any) -> tuple[str, str, str] | None:
+        kinds = getattr(attacker, "kinds", []) or []
+        if getattr(attacker, "is_repost", False) or 6 in kinds:
+            event_type = "repost"
+        elif getattr(attacker, "is_reaction", False) or 7 in kinds:
+            event_type = "reaction"
+        else:
+            return None
+        event_id = getattr(attacker, "event_id", None)
+        if not self.user_id or not event_id:
+            return None
+        note_id = getattr(attacker, "note", None) or getattr(attacker, "note_id", None)
+        return (
+            _normalize_event_id(event_id) or str(event_id),
+            _normalize_event_id(note_id) or str(note_id or ""),
+            event_type,
+        )
+
+    async def _record_social_event(self, attacker: Any) -> None:
+        identity = self._social_event_identity(attacker)
+        if identity is None:
+            return
+        event_id, note_id, event_type = identity
+        inserted = await self.db.register_processed_event(
+            self.user_id,
+            event_id,
+            note_id=note_id,
+            pubkey=attacker.pubkey,
+            event_type=event_type,
+        )
+        if not inserted and not await self.db.is_event_processed(
+            self.user_id, event_id, note_id=note_id, strict=True
+        ):
+            raise RuntimeError("CyberHerd could not persist the social event outcome")
+        logger.debug(
+            f"Recorded {event_type} event {event_id[:16]}... for user {self.user_id}"
+        )
+
     async def attempt_headbutt(self, attacker: Any) -> dict[str, Any] | None:
         async with _get_headbutt_lock():
+            # Check again while holding the admission lock: queued deliveries
+            # can outlive subscription checks and member kinds reset on eviction.
+            identity = self._social_event_identity(attacker)
+            if identity is not None:
+                event_id, note_id, _ = identity
+                if await self.db.is_event_processed(
+                    self.user_id, event_id, note_id=note_id, strict=True
+                ):
+                    logger.info(
+                        f"Skipping processed social event {event_id[:16]}... "
+                        f"for note {note_id[:16]}... (user {self.user_id})"
+                    )
+                    return None
             if self._in_cooldown():
                 logger.info("AdmissionGuard cooldown: in_cooldown=True")
                 return None
@@ -1031,6 +1082,7 @@ class EnhancedHeadbuttService:
                     or (updated_member or {}).get("picture")
                     or (existing_member or {}).get("picture")
                 )
+                await self._record_social_event(attacker)
                 await self._publish_membership_event(
                     event_type,
                     member_pubkey=member_pubkey,
@@ -1181,6 +1233,7 @@ class EnhancedHeadbuttService:
         logger.info("Free spot available — admitting attacker as active member")
         status = await self._handle_attacker_admission(attacker)
         if status in ["new", "reactivated"]:
+            await self._record_social_event(attacker)
             await self._maybe_publish_new_member(attacker, status)
             await self._post_admission_tasks(
                 attacker.pubkey,
@@ -1275,6 +1328,7 @@ class EnhancedHeadbuttService:
             lowest_pubkey = lowest.get("pubkey")
         status = await self._handle_successful_headbutt(attacker, lowest)
         if status in ["new", "reactivated"]:
+            await self._record_social_event(attacker)
             await self._send_headbutt_success_notification(
                 attacker,
                 lowest if isinstance(lowest, dict) else {"display_name": "Anon", "amount": 0, "pubkey": ""},

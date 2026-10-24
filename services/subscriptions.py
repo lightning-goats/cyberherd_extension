@@ -1116,6 +1116,7 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                     tracked_targets.append(resolved_id)
                     logger.info(f"✅ Found tracked event: {resolved_id[:16]}... for repost!")
 
+            handled_any = False
             if tracked_targets:
                 logger.info(f"🎬 Triggering headbutt for {len(tracked_targets)} tracked note(s) in repost event {eid[:16]}...")
                 
@@ -1129,62 +1130,32 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                     already_processed = False
                     try:
                         # Use the updated crud.is_event_processed which now supports note_id parameter
-                        already_processed = await crud.is_event_processed(user_id, eid, note_id=target_id)
+                        already_processed = await crud.is_event_processed(
+                            user_id, eid, note_id=target_id, strict=True
+                        )
                         if already_processed:
                             logger.debug(
                                 f"Skipping repost event {eid[:16]}... for note {target_id[:16]}... "
                                 f"because this (event, note) pair was already processed"
                             )
+                            handled_any = True
                             continue  # Skip this target, try next one
-                    except Exception:
-                        # If check fails, continue to attempt processing
-                        pass
+                    except Exception as exc:
+                        logger.warning(f"Cannot check processed repost {eid[:16]}...: {exc}")
+                        return False
 
                     result = await _trigger_repost_headbutt(user_id, pubkey, target_id, eid, app, recovery_mode=recovery_mode)
                     logger.info(f"🎬 Repost headbutt result for {target_id[:16]}...: {result is not None}")
                     
-                    # Persist processed status when subscription-driven processing succeeds
-                    try:
-                        if result and eid:
-                            from .. import crud
-                            try:
-                                res = await crud.register_processed_event(
-                                    user_id,
-                                    eid,
-                                    note_id=target_id,
-                                    pubkey=pubkey,
-                                    event_type="repost",
-                                )
-                                try:
-                                    st = getattr(app, 'state', app)
-                                    metrics = getattr(st, 'cyberherd_metrics', None)
-                                    if metrics is None:
-                                        metrics = {}
-                                        try:
-                                            setattr(st, 'cyberherd_metrics', metrics)
-                                        except Exception:
-                                            pass
-                                    if res:
-                                        metrics['repost_persist_success'] = metrics.get('repost_persist_success', 0) + 1
-                                    else:
-                                        metrics['repost_persist_failure'] = metrics.get('repost_persist_failure', 0) + 1
-                                except Exception:
-                                    pass
-                                if res:
-                                    logger.debug("Persisted processed repost event %s for user %s", eid, user_id)
-                                else:
-                                    logger.warning(f"Failed to persist processed repost event {eid} for user {user_id}")
-                            except Exception:
-                                # Non-fatal: processing succeeded but persistence failed
-                                logger.warning(f"Failed to persist processed repost event {eid} for user {user_id}")
-                    except Exception:
-                        pass
+                    # Admission persists success under its lock, before publishing.
+                    handled_any = handled_any or bool(result)
+
             else:
                 logger.warning(f"⚠️ Repost event {eid[:16]}... does NOT reference any tracked event for user {user_id}")
 
-            # Report whether this event matched a tracked note so callers can
-            # decide whether to cache it as handled or retry it later.
-            return bool(tracked_targets)
+            # Cache only successful or already-persisted events. A transient
+            # admission/lookup failure must remain eligible for retry.
+            return handled_any
 
         # kind 7: reactions
         elif kind == 7 and getattr(settings, "likes_tracking_enabled", False):
@@ -1232,6 +1203,7 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                 if is_tracked:
                     tracked_targets.append(resolved_id)
 
+            handled_any = False
             if tracked_targets:
                 logger.info(f"✅ Kind 7 reaction matched {len(tracked_targets)} tracked event(s)! Processing headbutt(s)...")
                 
@@ -1245,60 +1217,32 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                     already_processed = False
                     try:
                         # Use the updated crud.is_event_processed which now supports note_id parameter
-                        already_processed = await crud.is_event_processed(user_id, eid, note_id=reacted_id)
+                        already_processed = await crud.is_event_processed(
+                            user_id, eid, note_id=reacted_id, strict=True
+                        )
                         if already_processed:
                             logger.info(
                                 f"⏭️ Skipping reaction event {eid[:16]}... for note {reacted_id[:16]}... "
                                 f"because this (event, note) pair was already processed"
                             )
+                            handled_any = True
                             continue  # Skip this target, try next one
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning(f"Cannot check processed reaction {eid[:16]}...: {exc}")
+                        return False
 
                     result = await _trigger_reaction_headbutt(user_id, pubkey, reacted_id, eid, app, recovery_mode=recovery_mode)
                     logger.info(f"🎬 Reaction headbutt result for {reacted_id[:16]}...: {result is not None}")
                     
-                    # Persist processed status when subscription-driven processing succeeds
-                    try:
-                        if result and eid:
-                            from .. import crud
-                            try:
-                                res = await crud.register_processed_event(
-                                    user_id,
-                                    eid,
-                                    note_id=reacted_id,
-                                    pubkey=pubkey,
-                                    event_type="reaction",
-                                )
-                                try:
-                                    st = getattr(app, 'state', app)
-                                    metrics = getattr(st, 'cyberherd_metrics', None)
-                                    if metrics is None:
-                                        metrics = {}
-                                        try:
-                                            setattr(st, 'cyberherd_metrics', metrics)
-                                        except Exception:
-                                            pass
-                                    if res:
-                                        metrics['reaction_persist_success'] = metrics.get('reaction_persist_success', 0) + 1
-                                    else:
-                                        metrics['reaction_persist_failure'] = metrics.get('reaction_persist_failure', 0) + 1
-                                except Exception:
-                                    pass
-                                if res:
-                                    logger.debug("Persisted processed reaction event %s for user %s", eid, user_id)
-                                else:
-                                    logger.warning(f"Failed to persist processed reaction event {eid} for user {user_id}")
-                            except Exception:
-                                logger.warning(f"Failed to persist processed reaction event {eid} for user {user_id}")
-                    except Exception:
-                        pass
+                    # Admission persists success under its lock, before publishing.
+                    handled_any = handled_any or bool(result)
+
             else:
                 logger.warning(f"⚠️ Kind 7 reaction event {eid[:16] if eid else 'unknown'}... did NOT match any tracked events. Identifiers checked: {identifiers}")
 
-            # Report whether this event matched a tracked note so callers can
-            # decide whether to cache it as handled or retry it later.
-            return bool(tracked_targets)
+            # Cache only successful or already-persisted events. A transient
+            # admission/lookup failure must remain eligible for retry.
+            return handled_any
 
         return False
 

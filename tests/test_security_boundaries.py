@@ -1075,6 +1075,14 @@ async def test_reaction_cannot_headbutt_when_herd_full(monkeypatch):
     notified = {}
 
     class FakeDb:
+        async def is_event_processed(
+            self, user_id, event_hash, note_id=None, *, strict=False
+        ):
+            return False
+
+        async def register_processed_event(self, *args, **kwargs):
+            return True
+
         async def get_settings(self, user_id):
             return _settings(max_members=3, tracked_event_ids=[note_id])
 
@@ -1146,6 +1154,14 @@ async def test_existing_member_reengagement_uses_existing_member_category(
     published = {}
 
     class FakeDb:
+        async def is_event_processed(
+            self, user_id, event_hash, note_id=None, *, strict=False
+        ):
+            return False
+
+        async def register_processed_event(self, *args, **kwargs):
+            return True
+
         async def get_settings(self, user_id):
             return _settings()
 
