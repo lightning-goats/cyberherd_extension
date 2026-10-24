@@ -8,7 +8,7 @@ For existing installations, the old migrations (m001-m020) remain to ensure
 proper upgrade paths. New installations can use just m001_consolidated.
 """
 
-from lnbits.db import Database
+from lnbits.db import POSTGRES, Database
 import logging
 
 logger = logging.getLogger(__name__)
@@ -113,6 +113,7 @@ __all__ = [
     'm033_add_member_allocation_percent',  # Add member_allocation_percent for configurable split percentage
     'm034_fix_processed_events_unique_constraint',  # Fix unique constraint to include note_id for multi-note events
     'm035_fix_cyber_herd_user_pubkey_key',  # Scope member identity by user_id + pubkey
+    'm036_repair_postgres_member_key',
 ]
 
 logger.info(f"CYBERHERD MIGRATIONS: Registered {len(__all__)} migrations: {__all__}")
@@ -878,3 +879,41 @@ async def m035_fix_cyber_herd_user_pubkey_key(db: Database):
             await db.execute(f"DROP TABLE IF EXISTS {temp_table};")
         except Exception:
             pass
+
+
+async def m036_repair_postgres_member_key(db: Database):
+    """Repair PostgreSQL installs where m035 failed but was recorded as complete.
+
+    m035 catches its errors, so version 35 alone does not guarantee that the
+    member key matches CRUD's ON CONFLICT(user_id, pubkey). Change the legacy
+    key in place to preserve every row, column and index. A single ALTER keeps
+    the old key intact if adding the new key fails; propagate that failure so
+    the migration runner does not record another false success.
+    """
+    if db.type != POSTGRES:
+        return
+
+    table_name = f"{db.references_schema}cyber_herd"
+    primary_key = await db.fetchone(
+        """
+        SELECT c.conname, array_agg(a.attname ORDER BY k.ordinality) AS columns
+        FROM pg_constraint c
+        CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS k(attnum, ordinality)
+        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+        WHERE c.contype = 'p' AND c.conrelid = CAST(:table_name AS regclass)
+        GROUP BY c.conname
+        """,
+        {"table_name": table_name},
+    )
+    columns = list(primary_key["columns"]) if primary_key else []
+    if set(columns) == {"user_id", "pubkey"}:
+        return
+    if columns != ["pubkey"]:
+        raise RuntimeError(f"CyberHerd m036: unexpected member primary key: {columns}")
+
+    constraint = primary_key["conname"].replace('"', '""')
+    await db.execute(
+        f'ALTER TABLE {table_name} DROP CONSTRAINT "{constraint}", '
+        'ADD PRIMARY KEY (user_id, pubkey)'
+    )
+    logger.info("CYBERHERD m036: repaired PostgreSQL member key to (user_id, pubkey)")
