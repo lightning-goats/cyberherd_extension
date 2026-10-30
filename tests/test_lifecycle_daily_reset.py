@@ -92,6 +92,7 @@ async def lifecycle_db(request, monkeypatch, tmp_path):
     )
     await migrations._create_engagement_awards(database)
     await migrations.m043_add_treat_delivery_records(database)
+    await migrations.m044_add_prejoin_engagement_evidence(database)
     try:
         yield database
     finally:

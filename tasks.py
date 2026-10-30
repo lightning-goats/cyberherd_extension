@@ -379,10 +379,10 @@ async def ensure_membership_day(
                     if marker["local_day"] < today:
                         from uuid import uuid4
                         await execute(
-                            f"""INSERT INTO {schema}member_cycles (user_id,cycle_id)
-                            VALUES (:user_id,:token) ON CONFLICT (user_id)
-                            DO UPDATE SET cycle_id=excluded.cycle_id""",
-                            {"user_id": uid, "token": uuid4().hex},
+                            f"""INSERT INTO {schema}member_cycles (user_id,cycle_id,started_at)
+                            VALUES (:user_id,:token,:started) ON CONFLICT (user_id)
+                            DO UPDATE SET cycle_id=excluded.cycle_id,started_at=excluded.started_at""",
+                            {"user_id": uid, "token": uuid4().hex, "started": int(get_day_boundaries_utc().local_since_ts)},
                         )
                         await execute(
                             f"DELETE FROM {schema}engagement_awards WHERE user_id=:user_id",

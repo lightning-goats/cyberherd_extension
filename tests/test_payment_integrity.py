@@ -64,6 +64,7 @@ async def scenario(request, tmp_path, monkeypatch):
     await crud._bootstrap_cyberherd_tables()
     await migrations._create_engagement_awards(db)
     await migrations.m043_add_treat_delivery_records(db)
+    await migrations.m044_add_prejoin_engagement_evidence(db)
     await db.execute(f"ALTER TABLE {schema}cyber_herd ADD COLUMN allocation_percentage REAL DEFAULT 0")
     await db.execute(f"CREATE TABLE {schema}membership_reset_days (user_id TEXT PRIMARY KEY, local_day TEXT NOT NULL, splits_pending INTEGER NOT NULL DEFAULT 0)")
     await db.execute(f"INSERT INTO {schema}cyber_herd(pubkey,user_id,display_name,lud16,nprofile,amount,is_active,kinds) VALUES (:pk,:owner,'Alice','alice@example.test','nprofile-test',100,1,'9735')", {'pk': pk(ALICE), 'owner': OWNER})

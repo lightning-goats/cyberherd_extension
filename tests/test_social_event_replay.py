@@ -61,6 +61,8 @@ async def social_db(request, monkeypatch, tmp_path):
             UNIQUE (user_id, event_hash, note_id)
         )""")
         await migrations._create_engagement_awards(database)
+        await migrations.m043_add_treat_delivery_records(database)
+        await migrations.m044_add_prejoin_engagement_evidence(database)
         for pubkey in (ALICE, BOB):
             await database.execute(
                 f"INSERT INTO {schema}cyber_herd "

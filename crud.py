@@ -1778,6 +1778,7 @@ async def add_new_active_member(member_data: dict, user_id: str | None = None):
             raise
     
     await _award_member_engagements(normalized_pubkey, values["kinds"], user_id)
+    await promote_observed_engagements(normalized_pubkey, user_id)
 
     try:
         await recompute_member_payouts(user_id)
@@ -2009,6 +2010,7 @@ async def update_and_activate_member(
                 pass
 
     await _award_member_engagements(normalized_pubkey, kinds, user_id)
+    await promote_observed_engagements(normalized_pubkey, user_id)
 
     try:
         await recompute_member_payouts(user_id)
@@ -3377,3 +3379,63 @@ async def _get_detected_cyberherd_notes_for_settings(settings, since_days_ago: i
     except Exception as e:
         logger.error(f"Error in get_cyberherd_notes_for_settings: {e}", exc_info=True)
         return []
+
+
+async def observe_engagement(pubkey, kind, event_id, note_id, created_at, user_id):
+    """Persist a signature-verified, tracked-note interaction without granting a seat."""
+    from .services.treats import cycle
+
+    token = await cycle(user_id)
+    marker = await _db().fetchone(
+        f"SELECT started_at FROM {db.references_schema}member_cycles WHERE user_id=:uid",
+        {"uid": user_id},
+    )
+    if int(created_at) < int(marker["started_at"]):
+        return False
+    if kind not in (6, 7):
+        raise ValueError("Only reposts and likes can be observed")
+    await _db().execute(
+        f"""INSERT INTO {db.references_schema}engagement_observations
+        (user_id,pubkey,kind,cycle_id,event_id,note_id,created_at)
+        VALUES (:uid,:pubkey,:kind,:cycle,:event,:note,:created) ON CONFLICT DO NOTHING""",
+        {
+            "uid": user_id,
+            "pubkey": pubkey,
+            "kind": kind,
+            "cycle": token,
+            "event": event_id,
+            "note": note_id,
+            "created": int(created_at),
+        },
+    )
+    return True
+
+
+async def promote_observed_engagements(pubkey, user_id):
+    """Credit this cycle's observed social kinds only after successful activation."""
+    member = await _db().fetchone(
+        f"SELECT kinds FROM {db.references_schema}cyber_herd WHERE user_id=:uid "
+        "AND pubkey=:pubkey AND is_active=1 AND COALESCE(banned,0)=0",
+        {"uid": user_id, "pubkey": pubkey},
+    )
+    if not member:
+        return False
+    observations = await _db().fetchall(
+        f"""SELECT o.kind FROM {db.references_schema}engagement_observations o
+        JOIN {db.references_schema}member_cycles c ON c.user_id=o.user_id AND c.cycle_id=o.cycle_id
+        WHERE o.user_id=:uid AND o.pubkey=:pubkey AND o.created_at>=c.started_at""",
+        {"uid": user_id, "pubkey": pubkey},
+    )
+    earned = set(await get_engagement_kinds(pubkey, user_id))
+    observed = {int(row["kind"]) for row in observations}
+    if not observed - earned:
+        return False
+    await _award_member_engagements(pubkey, observed, user_id)
+    from .services.shares import _parse_kinds
+
+    kinds = sorted(_parse_kinds(member["kinds"]) | observed)
+    await _db().execute(
+        f"UPDATE {db.references_schema}cyber_herd SET kinds=:kinds WHERE user_id=:uid AND pubkey=:pubkey",
+        {"uid": user_id, "pubkey": pubkey, "kinds": ",".join(map(str, kinds))},
+    )
+    return True

@@ -1030,6 +1030,56 @@ async def poll_now(*args, **kwargs):  # legacy public API kept as no-op
  
 
 
+async def _observe_qualifying_engagement(user_id, event, note_id, settings):
+    """Retain validated pre-join actions; quietly recover previously rejected ones."""
+    from .headbutt import _get_headbutt_lock
+    from ..tasks import ensure_membership_day
+
+    refresh = False
+    async with _get_headbutt_lock():
+        if getattr(settings, "midnight_reset_enabled", True):
+            await ensure_membership_day(user_id, admission_lock_held=True)
+        async with crud.admission_transaction():
+            current = await crud.get_settings(user_id)
+            if note_id not in (getattr(current, "tracked_event_ids", []) or []):
+                return False
+            if get_effective_pubkey(current) != get_effective_pubkey(settings):
+                return False
+            if not await crud.observe_engagement(
+                event["pubkey"],
+                int(event["kind"]),
+                event["id"],
+                note_id,
+                event["created_at"],
+                user_id,
+            ):
+                return False
+            previous = await crud._db().fetchone(
+                f"SELECT event_type FROM {crud.db.references_schema}processed_events "
+                "WHERE user_id=:uid AND event_hash=:event AND note_id=:note",
+                {"uid": user_id, "event": event["id"], "note": note_id},
+            )
+            # A prior rejection is final for admission, but not for the points
+            # of someone who subsequently earned a valid seat.
+            if previous and previous["event_type"] == "headbutt_failure":
+                active = await crud._db().fetchone(
+                    f"SELECT 1 FROM {crud.db.references_schema}cyber_herd WHERE user_id=:uid "
+                    "AND pubkey=:pubkey AND is_active=1 AND COALESCE(banned,0)=0",
+                    {"uid": user_id, "pubkey": event["pubkey"]},
+                )
+                if active:
+                    await crud.promote_observed_engagements(event["pubkey"], user_id)
+                    await crud.recompute_member_payouts(user_id)
+                    refresh = True
+    if refresh and getattr(current, "source_wallet", None):
+        from .splits import update_split_targets_proportional
+
+        await update_split_targets_proportional(
+            current.source_wallet, user_id, strict=True
+        )
+    return True
+
+
 async def process_event_for_user(user_id: str, event: dict, settings, app, recovery_mode: bool = False):
     try:
         eid = event.get("id")
@@ -1130,6 +1180,8 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                 for target_id in tracked_targets:
                     logger.info(f"🎬 Processing repost for tracked note {target_id[:16]}...")
                     
+                    if not await _observe_qualifying_engagement(user_id, event, target_id, settings):
+                        continue
                     # Persistent dedupe: check if this specific (event, note) pair was already processed
                     # Note: We check per-note because the same repost event can reference multiple tracked notes,
                     # and we want to process each one independently.
@@ -1217,6 +1269,8 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                 for reacted_id in tracked_targets:
                     logger.info(f"🎬 Processing reaction for tracked note {reacted_id[:16]}...")
                     
+                    if not await _observe_qualifying_engagement(user_id, event, reacted_id, settings):
+                        continue
                     # Persistent dedupe: check if this specific (event, note) pair was already processed
                     # Note: We check per-note because the same reaction event can reference multiple tracked notes,
                     # and we want to process each one independently.

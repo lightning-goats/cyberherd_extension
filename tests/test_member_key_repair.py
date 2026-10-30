@@ -63,6 +63,8 @@ async def create_members(database, primary_key):
             VALUES ('existing', 'owner', 'Existing member', '9735', 42, 1.5, 1, 1)""")
     await migrations.m001_consolidated_schema(database)
     await migrations._create_engagement_awards(database)
+    await migrations.m043_add_treat_delivery_records(database)
+    await migrations.m044_add_prejoin_engagement_evidence(database)
 
 
 async def migrate_from_35(database, monkeypatch):

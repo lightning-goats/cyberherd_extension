@@ -70,11 +70,19 @@ async def put(identifier, user_id, kind, state, data, *, insert=False):
 
 async def cycle(user_id, *, reset=False):
     token = uuid4().hex
-    conflict = "DO UPDATE SET cycle_id=excluded.cycle_id" if reset else "DO NOTHING"
+    # Unknown initial cycle may predate today when daily resets are disabled.
+    # Daily rollover writes its midnight boundary; manual reset writes now.
+    started_at = int(time.time()) if reset else 0
+    conflict = (
+        "DO UPDATE SET cycle_id=excluded.cycle_id,started_at=excluded.started_at"
+        if reset
+        else "DO NOTHING"
+    )
     await crud._db().execute(
-        f"""INSERT INTO {crud.db.references_schema}member_cycles (user_id,cycle_id)
-        VALUES (:uid,:token) ON CONFLICT (user_id) {conflict}""",
-        {"uid": user_id, "token": token},
+        f"""INSERT INTO {crud.db.references_schema}member_cycles
+        (user_id,cycle_id,started_at)
+        VALUES (:uid,:token,:started) ON CONFLICT (user_id) {conflict}""",
+        {"uid": user_id, "token": token, "started": started_at},
     )
     row = await crud._db().fetchone(
         f"SELECT cycle_id FROM {crud.db.references_schema}member_cycles "

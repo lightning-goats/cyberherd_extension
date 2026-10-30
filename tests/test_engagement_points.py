@@ -368,7 +368,10 @@ async def test_concurrent_interactions_award_each_type_only_once(scenario):
     assert await crud.get_engagement_kinds(ALICE, OWNER) == [6, 7]
     row = await crud.get_member_by_pubkey(OWNER, ALICE)
     assert shares.member_point_units(row) == 40
-    assert len(scenario.announcements) == 2
+    # A like observed before admission is promoted silently; a like delivered
+    # after admission may have its ordinary existing-member notification.
+    assert 1 <= len(scenario.announcements) <= 2
+    assert sum(kind in ("kind_6_repost", "kind_7_reaction") for kind in scenario.announcements) == 1
 
 
 @pytest.mark.anyio

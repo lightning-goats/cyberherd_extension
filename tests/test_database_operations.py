@@ -665,7 +665,7 @@ async def test_real_migration_runner_records_versions_in_order(audit_db, monkeyp
     async with audit_db.connect() as connection:
         await helpers.run_migration(connection, migrations, "cyberherd")
     assert recorded == sorted(recorded)
-    assert recorded[-1] == 43
+    assert recorded[-1] == 44
     assert len(recorded) == len(migrations.__all__)
 
 

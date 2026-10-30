@@ -29,7 +29,10 @@ Contribution scores combine every distinct qualifying settled zap with the first
 repost (3 points) and first like (1 point) per membership cycle. A minimum-sized
 qualifying zap earns 10 points. Repeating a repost or like does not add another
 award. Eviction does not erase a social award; daily or manual reset starts a new
-cycle. Member percentages retain six decimal places and share one calculation
+cycle. Qualifying likes and reposts observed before admission contribute their
+points once the person joins through a qualifying zap, repost, or an open slot.
+Earlier rejected actions are credited silently; they never grant a seat by
+themselves. Member percentages retain six decimal places and share one calculation
 across the API, stored payouts and SplitPayments targets.
 
 Member updates and confirmed payout notices use a durable per-member thread for
@@ -44,7 +47,7 @@ event receipt receive an explicitly labeled member-thread anchor.
 ### Coordinated upgrade requirement
 
 Update this extension, `cyberherd_messaging`, and `lightning_goats` together.
-CyberHerd migrations 39–43 repair payment-ledger compatibility and add durable
+CyberHerd migrations 39–44 repair payment-ledger compatibility and add durable
 engagement, membership-cycle and delivery records; messaging migration 5 seeds
 editable templates without overwriting existing custom rows.
 

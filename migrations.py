@@ -147,6 +147,7 @@ __all__ = [
     'm041_repair_database_contract',
     'm042_add_engagement_awards',
     'm043_add_treat_delivery_records',
+    'm044_add_prejoin_engagement_evidence',
 ]
 
 logger.info(f"CYBERHERD MIGRATIONS: Registered {len(__all__)} migrations: {__all__}")
@@ -1014,3 +1015,32 @@ async def m043_add_treat_delivery_records(db: Database):
         await transaction.execute(f"""CREATE TABLE IF NOT EXISTS {db.references_schema}member_cycles (
             user_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL
         )""")
+
+
+async def m044_add_prejoin_engagement_evidence(db: Database):
+    """Keep qualifying social actions separate from awarded membership points."""
+    # LNbits attaches the SQLite file under a second name. Explicit main-schema
+    # DDL avoids taking incompatible locks on both aliases during ALTER TABLE.
+    schema = "main." if db.type == SQLITE else db.references_schema
+    async with _migration_transaction(db) as transaction:
+        if db.type == SQLITE:
+            columns = await transaction.fetchall(
+                "PRAGMA main.table_info(member_cycles)"
+            )
+            has_start = any(row["name"] == "started_at" for row in columns)
+        else:
+            has_start = await _column_exists(
+                transaction, f"{schema}member_cycles", "started_at"
+            )
+        if not has_start:
+            await transaction.execute(
+                f"ALTER TABLE {schema}member_cycles ADD COLUMN started_at BIGINT NOT NULL DEFAULT 0"
+            )
+        await transaction.execute(
+            f"""CREATE TABLE IF NOT EXISTS {schema}engagement_observations (
+            user_id TEXT NOT NULL, pubkey TEXT NOT NULL, kind INTEGER NOT NULL CHECK (kind IN (6,7)),
+            cycle_id TEXT NOT NULL, event_id TEXT NOT NULL, note_id TEXT NOT NULL,
+            created_at BIGINT NOT NULL,
+            PRIMARY KEY (user_id,pubkey,kind,cycle_id)
+        )"""
+        )

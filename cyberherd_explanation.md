@@ -162,13 +162,13 @@ If nobody is eligible, the configured goat wallet receives the full payment.
 - Reposting or liking again adds no points. A further distinct 5-sat zap raises A to 29 points
 
 **Once-per-cycle social awards:**
-- The first successfully admitted repost and first successfully admitted like each count once per project owner and Nostr pubkey across all qualifying notes
+- The first qualifying repost and first qualifying like each count once after the person has successfully joined per project owner and Nostr pubkey across all qualifying notes
 - Repeating the interaction, using a new event ID, restarting the service, or unliking/reposting again does not renew an award
 - Eviction or deleting a member does not erase their earned social awards or allow the same type to grant free re-entry. A previously unused social type can still qualify under the normal admission rules
 - Returning with a qualifying zap restores the previously earned social points; the eviction-reset zap score starts from the new contribution
 - Enabled midnight reset clears social awards with daily membership scores. With midnight reset disabled, awards persist until a manual reset
 - Manual reset starts a fresh cycle and clears the awards atomically with the membership state
-- Failed admissions earn no social points. Replaying an old event after a daily reset does not grant a fresh award
+- Failed admissions grant no immediate points or seat. Qualifying social actions are retained and credited if the person later earns a seat in the same cycle; this does not send a separate public message. Replaying an event from before a daily or manual reset does not grant a fresh award
 
 ## The ⚡Headbutting⚡ Mechanism
 
@@ -296,6 +296,7 @@ The CyberHerd works automatically behind the scenes:
 - **Reaction limitation**: Reactions (kind 7) cannot headbutt - can only join when open slots available
 - **Cumulative points**: A minimum qualifying zap earns 10 points; the first repost earns 3 and the first like earns 1. Every distinct qualifying settled zap adds points
 - **Proportional shares**: The member allocation is divided according to total eligible active member points
+- **Pre-join engagement counts after admission**: Qualifying likes and reposts from the current membership cycle are retained even when they cannot win a seat. Once that person joins through a qualifying zap or repost (or takes an open slot), those earlier actions contribute their once-per-cycle points. For example, a like followed by a successful repost earns 1 + 3 = 4 points; a minimum-sized joining zap after both earns 10 + 3 + 1 = 14. A like still cannot headbutt, and retrospective point credit does not send another public message.
 - **Social awards count once**: Each social type counts once per owner/pubkey/cycle and survives eviction or deletion
 - **Headbutt consequences**: Getting headbutted resets the membership zap score to zero. Social awards remain recorded and contribute again only after valid re-entry
 - **Threshold payout cycles**: Each full threshold cycle transfers exactly the configured trigger amount from the herd wallet to the CyberHerd distribution wallet. The remainder stays in the herd wallet. With a 1,000-sat trigger, 1,234 sats produces one feeding and one 1,000-sat transfer, leaving 234 sats. A 2,345-sat balance produces two feedings and two separate 1,000-sat transfers, leaving 345 sats. Each received payment produces one feeder-triggered announcement for its entire batch. At most three feeder activations are rewarded per received payment. Additional full thresholds still produce separate CyberHerd payouts: 4,345 sats means three feeder activations and four 1,000-sat transfers, leaving 345 sats. Within one payment, feeder requests are spaced six seconds apart; separate payments retain the configured cooldown. Both respect the override switch.
@@ -366,3 +367,12 @@ backend's storage rounding would push the target total above 100%, target values
 are rounded downward only as needed to fit its numeric precision. The tiny
 residual stays in the source wallet; member priority and contribution points do
 not change. Routing fees and whole-satoshi rounding still apply to payments.
+
+
+Pre-join engagement evidence (migration 44): valid signed likes and reposts on
+eligible tracked notes are retained separately from awarded points. Successful
+membership activation promotes the current cycle's retained social types exactly
+once, including when admission is through a zap. Previously processed failed
+headbutts can be reconciled silently for active members; the failed attempt
+itself never grants a seat. Cycle boundaries prevent retained actions from a
+previous daily or manual reset being promoted into a new cycle.
