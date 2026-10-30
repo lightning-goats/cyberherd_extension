@@ -67,7 +67,7 @@
                  task = asyncio.create_task(
                      pay_invoice_in_background(
                          payment_request=payment_request,
-@@ -82,32 +121,41 @@
+@@ -82,32 +121,49 @@
                          extra=extra,
                      )
                  )
@@ -101,19 +101,31 @@
  ) -> Optional[str]:
  
      rounded_amount = floor(amount_msat / 1000) * 1000
+-
+-    try:
+-        payment_request = await get_pr_from_lnurl(payoraddress, rounded_amount, memo)
 +    if rounded_amount < 1000:
 +        return None
- 
-     try:
-         payment_request = await get_pr_from_lnurl(payoraddress, rounded_amount, memo)
++
++    try:
++        payment_request = None
++        if context:
++            from lnbits.extensions.cyberherd.services.zaps import member_zap_invoice
++
++            payment_request = await member_zap_invoice(
++                context, payoraddress, wallet_id, rounded_amount
++            )
++        if payment_request is None:
++            payment_request = await get_pr_from_lnurl(payoraddress, rounded_amount, memo)
      except Exception as e:
-         logger.error(f"Error getting LNURL invoice: {e!s}")
+-        logger.error(f"Error getting LNURL invoice: {e!s}")
++        logger.error("Error getting LNURL invoice ({})", type(e).__name__)
 +        if context and await _below_receiver_minimum(payoraddress, rounded_amount):
 +            await _record_outcome(context, "too_small")
          return None
  
      invoice = bolt11.decode(payment_request)
-@@ -119,3 +167,35 @@
+@@ -119,3 +175,35 @@
          return None
  
      return payment_request

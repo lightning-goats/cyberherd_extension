@@ -24,12 +24,12 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from typing import Any, Optional
 
 from loguru import logger
 
 from . import nostr_helpers
-from .note_metadata import apply_event_address
 from .time_utils import (
     get_day_boundaries_utc,
     DayBoundaries,
@@ -149,7 +149,14 @@ def _would_event_be_tracked(event: dict, eff_pub: str | None, tags: list[str]) -
             return False
         if not eff_pub:
             return False
-        if event.get('pubkey') != eff_pub:
+        if event.get("kind") == 30311:
+            from .streams import stream_host, tags as stream_tags
+            if not stream_host(event, eff_pub):
+                return False
+            status = stream_tags(event, "status")
+            if status and status[0][1] != "live":
+                return False
+        elif event.get('pubkey') != eff_pub:
             return False
         try:
             created_at = int(event.get('created_at') or 0)
@@ -159,7 +166,8 @@ def _would_event_be_tracked(event: dict, eff_pub: str | None, tags: list[str]) -
             return False
         boundaries = _get_today_boundaries_utc()
         if not boundaries.is_timestamp_in_local_day(created_at):
-            return False
+            if event.get("kind") != 30311 or not (time.time() - 3600 <= created_at <= time.time()):
+                return False
 
         tags_norm = [t.lstrip('#').lower() for t in tags if t]
         # If no tags configured, accept any note authored by eff_pub today
@@ -440,7 +448,20 @@ async def _append_today(user_id: str | None, eff_pub: str | None, tags: list[str
     - Gets boundaries using get_day_boundaries_utc() for consistency
     - Checks event.created_at against LOCAL day boundaries (user's "today" concept)
     """
-    if not _would_event_be_tracked(event, eff_pub, tags):
+    if event.get("kind") == 30311:
+        from . import streams
+        if not await streams.authenticate(event, eff_pub):
+            return False
+        if tags and not _event_matches_tracked_tags(event, [t.lstrip("#").lower() for t in tags]):
+            return False
+        if user_id:
+            await streams.remember(user_id, event)
+    if event.get("kind") == 9041:
+        from . import tracking_targets
+        current_settings = await crud.get_settings(user_id)
+        if not current_settings or not await tracking_targets.accept_goal(user_id, current_settings, event):
+            return False
+    elif not _would_event_be_tracked(event, eff_pub, tags):
         return False
     eid = event.get("id")
     if not eid:
@@ -458,7 +479,7 @@ async def _append_today(user_id: str | None, eff_pub: str | None, tags: list[str
             f"Check nostr_pubkey_override or nsec_oracle settings."
         )
         return False
-    if event_pubkey != eff_pub:
+    if event_pubkey != eff_pub and event.get("kind") != 30311:
         logger.debug(
             f"📝 Skipping event {eid[:16] if eid else 'unknown'}... from pubkey {event_pubkey[:16] if event_pubkey else 'None'}... "
             f"(not matching effective pubkey {eff_pub[:16] if eff_pub else 'None'}...) "
@@ -479,7 +500,7 @@ async def _append_today(user_id: str | None, eff_pub: str | None, tags: list[str
         return False
     
     # Check if event is from user's local "today"
-    if not boundaries.is_timestamp_in_local_day(created_at):
+    if not boundaries.is_timestamp_in_local_day(created_at) and event.get("kind") not in (30311, 9041):
         from datetime import datetime
         logger.warning(
             f"📅 Skipping event {eid[:16]}... from {datetime.fromtimestamp(created_at).isoformat()} "
@@ -490,76 +511,44 @@ async def _append_today(user_id: str | None, eff_pub: str | None, tags: list[str
     
     # Use shared tag matching logic unless tags are empty (in which case accept all notes
     # from the effective pubkey for today's window)
-    if tags_norm and not _event_matches_tracked_tags(event, tags_norm):
+    if tags_norm and event.get("kind") != 9041 and not _event_matches_tracked_tags(event, tags_norm):
         # Extract event's tags for logging
         event_t_tags = [t[1] for t in event.get('tags', []) if isinstance(t, list) and len(t) >= 2 and t[0] == 't']
         content_preview = (event.get('content', '') or '')[:100]
         logger.debug(f"🏷️ Skipping event {eid[:16]}... with t-tags {event_t_tags} content_preview='{content_preview}'")
         return False
-    # Auto-add detected note event IDs to tracked_event_ids for repost/reaction tracking
+    # Keep only canonical entities, while retaining aliases for the current stream.
     if user_id is not None:
+        from . import tracking_targets
+        candidate_settings = await crud.get_settings(user_id)
+        if candidate_settings:
+            await tracking_targets.observe(user_id, candidate_settings, event)
         # Acquire lock to prevent read-modify-write race conditions
         lock = await _get_user_lock(user_id)
         async with lock:
             try:
-                from .. import crud
 
                 # Re-fetch settings inside lock to ensure we have the latest state
                 settings = await crud.get_settings(user_id)
                 if settings:
-                    current_tracked = getattr(settings, 'tracked_event_ids', []) or []
-                    updated_tracked = current_tracked if eid in current_tracked else current_tracked + [eid]
-                    # Prune notes from previous local days (e.g. a stale id left
-                    # behind by a missed midnight reset) so they stop being tracked
-                    # the moment today's note is detected.
-                    if getattr(settings, "midnight_reset_enabled", True):
-                        try:
-                            from .time_utils import prune_stale_tracked_ids
-                            ts_existing = getattr(settings, 'tracked_event_timestamps', {}) or {}
-                            pruned = prune_stale_tracked_ids(updated_tracked, ts_existing)
-                            if eid not in pruned:
-                                pruned.append(eid)
-                            updated_tracked = pruned
-                        except Exception:
-                            pass
-                    is_long_form = False
-                    try:
-                        is_long_form = int(event.get("kind") or 0) == 30311
-                    except Exception:
-                        is_long_form = event.get("kind") == 30311
-
-                    pruned_addresses = None
-                    addresses_changed = False
-                    if is_long_form:
-                        addresses = dict(getattr(settings, 'tracked_event_addresses', {}) or {})
-                        apply_event_address(addresses, event)
-                        pruned_addresses = {
-                            nid: addr for nid, addr in addresses.items() if nid in updated_tracked
-                        }
-                        addresses_changed = pruned_addresses != (
-                            getattr(settings, 'tracked_event_addresses', {}) or {}
-                        )
-
-                    if updated_tracked != current_tracked or addresses_changed:
+                    current_tracked = list(getattr(settings, 'tracked_event_ids', []) or [])
+                    events = await tracking_targets.project(user_id, settings)
+                    updated_tracked = sorted(candidate["id"] for candidate in events)
+                    timestamps = {candidate["id"]: int(candidate["created_at"]) for candidate in events}
+                    stream = next((candidate for candidate in events if candidate["kind"] == 30311), None)
+                    from .note_metadata import extract_30311_address
+                    stream_address = extract_30311_address(stream) if stream else None
+                    addresses = {nid: address for nid, address in (getattr(settings, "tracked_event_addresses", {}) or {}).items()
+                                 if stream_address and address == stream_address}
+                    if event.get("kind") == 30311 and extract_30311_address(event) == stream_address:
+                        addresses[event["id"]] = stream_address
+                    if stream:
+                        addresses[stream["id"]] = stream_address
+                    metadata_changed = (addresses != getattr(settings, "tracked_event_addresses", {}) or timestamps != getattr(settings, "tracked_event_timestamps", {}))
+                    if updated_tracked != current_tracked or metadata_changed:
                         settings.tracked_event_ids = updated_tracked
-
-                        # Store this event's timestamp for optimized recovery
-                        # scanning, then drop timestamps for any pruned notes.
-                        timestamps = dict(getattr(settings, 'tracked_event_timestamps', {}) or {})
-                        try:
-                            created_at = int(event.get("created_at") or 0)
-                            if created_at > 0:
-                                timestamps[eid] = created_at
-                        except Exception:
-                            pass
-                        timestamps = {
-                            k: v for k, v in timestamps.items() if k in updated_tracked
-                        }
                         settings.tracked_event_timestamps = timestamps
-
-                        if is_long_form and pruned_addresses is not None:
-                            settings.tracked_event_addresses = pruned_addresses
-
+                        settings.tracked_event_addresses = addresses
                         await crud.upsert_settings(settings, user_id)
                         _dbg(f"Auto-added/updated event {eid} metadata for user {user_id}")
                         
@@ -575,15 +564,14 @@ async def _append_today(user_id: str | None, eff_pub: str | None, tags: list[str
                                 cache = _get_cache(app)
                                 for key in cache_keys:
                                     note_ids = _get_cache_note_ids(cache, key, create=True)
-                                    if eid not in note_ids:
-                                        note_ids.append(eid)
+                                    note_ids[:] = updated_tracked
                                 logger.debug(f"✅ Added event {eid[:16]}... to in-memory cache for user {user_id}")
                             except Exception as e:
                                 logger.warning(f"Failed to update in-memory cache: {e}")
                         else:
                             logger.debug(f"⚠️ App instance missing in _append_today - skipping in-memory cache update for {eid[:16]}...")
 
-                        if eid not in current_tracked:
+                        if updated_tracked != current_tracked:
                             # Trigger immediate refresh of subscriptions to include the new note
                             # This ensures we start tracking zaps/reposts for this note immediately
                             try:
@@ -689,7 +677,9 @@ async def force_requery_for_user(app, user_id: str) -> list[str]:
             try:
                 notes = []
                 seen_note_ids = set()
-                for filters in (tag_filter, author_filter):
+                provider_filter = {"kinds": [30311], "#p": [effective_pubkey],
+                                   "since": since_ts - 3600, "limit": 100}
+                for filters in (tag_filter, author_filter, provider_filter):
                     try:
                         fetched = await nostr_helpers.query_events(
                             filters, limit=500, timeout=10.0
@@ -732,24 +722,19 @@ async def force_requery_for_user(app, user_id: str) -> list[str]:
         # Query engagement events (reposts and reactions) for tracked notes
         # Combine existing tracked IDs with newly detected ones to ensure we query for
         # everything, even if the DB update from process_note_for_tracked_tags isn't visible yet.
-        existing_tracked = getattr(settings, 'tracked_event_ids', []) or []
-        all_tracked_ids = list(set(existing_tracked) | newly_detected_ids)
+        canonical_settings = await crud.get_settings(user_id)
+        all_tracked_ids = list(getattr(canonical_settings, "tracked_event_ids", []) or [])
         
         if not all_tracked_ids:
             logger.info(f"No tracked events for user {user_id}, skipping engagement recovery")
         else:
             logger.debug(f"Querying engagement for {len(all_tracked_ids)} tracked notes")
             
-            # Build filters for reposts and reactions
-            filters = {
-                "kinds": [6, 7],  # reposts and reactions
-                "#e": all_tracked_ids,
-                "since": since_ts,
-                "limit": 1000
-            }
-            
             try:
-                engagement_events = await nostr_helpers.query_events(filters, limit=1000, timeout=10.0)
+                from .streams import query_engagements
+                current = await crud.get_settings(user_id) or settings
+                current.tracked_event_ids = all_tracked_ids
+                engagement_events = await query_engagements(current, [6, 7], since_ts, 1000, 10.0)
                 _record_helper_query(True)
                 
                 logger.info(f"Found {len(engagement_events)} engagement events for user {user_id} recovery")
@@ -758,7 +743,7 @@ async def force_requery_for_user(app, user_id: str) -> list[str]:
                 for event in engagement_events:
                     try:
                         kind = event.get("kind")
-                        if kind == 6:
+                        if kind in (6, 16):
                             await process_repost_for_tracked_notes(
                                 user_id=user_id,
                                 event=event,
@@ -1047,7 +1032,7 @@ async def _observe_qualifying_engagement(user_id, event, note_id, settings):
                 return False
             if not await crud.observe_engagement(
                 event["pubkey"],
-                int(event["kind"]),
+                6 if int(event["kind"]) == 16 else int(event["kind"]),
                 event["id"],
                 note_id,
                 event["created_at"],
@@ -1106,7 +1091,7 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
 
         # kind 1: notes, kind 30311: long-form content
         # For notes, we WANT events from the effective pubkey (user's own notes)
-        if kind in (1, 30311):
+        if kind in (1, 30311, 9041):
             logger.info(
                 f"📝 Processing kind {kind} note event {eid[:16]}... from pubkey {pubkey[:16]}... "
                 f"(user's effective_pubkey: {eff_pub[:16] if eff_pub else 'None'}...) "
@@ -1123,7 +1108,7 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
             return bool(result)
 
         # kind 6: reposts
-        elif kind == 6 and getattr(settings, "repost_tracking_enabled", False):
+        elif kind in (6, 16) and getattr(settings, "repost_tracking_enabled", False):
             # Reject reposts from the effective pubkey (operator's own actions)
             # This prevents self-reposts from counting
             if eff_pub and pubkey == eff_pub:
@@ -1168,6 +1153,11 @@ async def process_event_for_user(user_id: str, event: dict, settings, app, recov
                 is_tracked = await _is_tracked_event(user_id, resolved_id, settings, app, cache)
                 logger.info(f"🎯 Is {resolved_id[:16]}... tracked? {is_tracked}")
                 
+                if is_tracked and kind == 16:
+                    current = await crud.get_settings(user_id)
+                    from .tracking_targets import current_goal
+                    is_tracked = (resolved_id in (getattr(current, "tracked_event_addresses", {}) or {})
+                                  or await current_goal(user_id, current, resolved_id))
                 if is_tracked:
                     tracked_targets.append(resolved_id)
                     logger.info(f"✅ Found tracked event: {resolved_id[:16]}... for repost!")
@@ -1418,9 +1408,23 @@ async def _resolve_tracked_event(settings, identifier: str, cache: dict | None, 
 
     Returns (event_id, event_metadata_dict or None).
     """
+    from .streams import StreamVerificationUnavailableError
     event_id = _normalize_tracked_event_id(identifier)
     if event_id:
+        address = (getattr(settings, "tracked_event_addresses", {}) or {}).get(event_id)
+        if address:
+            resolved, metadata = await _resolve_tracked_event(settings, address, cache, app)
+            if resolved:
+                return resolved, metadata
         return event_id, None
+
+    if identifier and identifier.startswith("30311:") and getattr(settings, "user_id", None):
+        from . import streams
+        known = await streams.lookup(settings.user_id, identifier)
+        if known and await streams.authenticate(known, get_effective_pubkey(settings)):
+            if _would_event_be_tracked(known, get_effective_pubkey(settings), settings.tracked_tags):
+                await _append_today(settings.user_id, get_effective_pubkey(settings), settings.tracked_tags, known, app)
+                return known["id"], known
 
     # Stored address mappings locate candidates but do not authenticate the
     # coordinate. Resolve it against signed event metadata below.
@@ -1444,6 +1448,10 @@ async def _resolve_tracked_event(settings, identifier: str, cache: dict | None, 
                     events = await nostr_helpers.query_events(filters, limit=1, timeout=5.0)
                     if events:
                         ev = events[0]
+                        if ev.get("kind") == 30311:
+                            from . import streams
+                            if not await streams.authenticate(ev, get_effective_pubkey(settings)):
+                                return None, None
                         ev_id = _normalize_tracked_event_id(ev.get('id'))
                         if (
                             ev_id
@@ -1459,7 +1467,11 @@ async def _resolve_tracked_event(settings, identifier: str, cache: dict | None, 
                                 getattr(settings, "tracked_tags", []) or [],
                             )
                         ):
+                            if kind == 30311 and getattr(settings, "user_id", None):
+                                await _append_today(settings.user_id, get_effective_pubkey(settings), settings.tracked_tags, ev, app)
                             return ev_id, ev
+    except StreamVerificationUnavailableError:
+        raise
     except Exception:
         pass
 
@@ -1472,6 +1484,19 @@ async def _is_tracked_event(user_id: str, note_event_id: str, settings, app, cac
     UTC-FIRST: Cache keys use UTC date for consistency across timezones.
     """
     try:
+        from .tracking_targets import current_goal
+        if await current_goal(user_id, settings, note_event_id):
+            return True
+        address = (getattr(settings, "tracked_event_addresses", {}) or {}).get(note_event_id)
+        if address:
+            from . import streams
+            current_stream = await streams.lookup(user_id, address)
+            if current_stream:
+                if not await streams.authenticate(current_stream, get_effective_pubkey(settings)):
+                    return False
+                if not _would_event_be_tracked(current_stream, get_effective_pubkey(settings), settings.tracked_tags):
+                    return False
+                return True
         logger.debug(f"🔍 _is_tracked_event: Checking if {note_event_id[:16]}... is tracked for user {user_id}")
         
         # First check if the event is in today's cache
@@ -1498,7 +1523,7 @@ async def _is_tracked_event(user_id: str, note_event_id: str, settings, app, cac
         # Check cache
         for key in cache_keys:
             event_ids = _get_cache_note_ids(cache, key)
-            if note_event_id in event_ids:
+            if note_event_id in event_ids and note_event_id in settings.tracked_event_ids:
                 logger.debug(f"✅ Event {note_event_id[:16]}... found in cache!")
                 return True
         
@@ -1522,6 +1547,11 @@ async def _is_tracked_event(user_id: str, note_event_id: str, settings, app, cac
             
             if events:
                 event = events[0]
+                if event.get("kind") == 30311:
+                    from . import streams
+                    if not await streams.authenticate(event, eff_pub):
+                        return False
+                    await _append_today(user_id, eff_pub, tags, event, app)
                 logger.debug("  Found event via nostr_helpers, checking if it would be tracked...")
                 # Check if this event would be tracked
                 if (
@@ -1530,10 +1560,14 @@ async def _is_tracked_event(user_id: str, note_event_id: str, settings, app, cac
                 ):
                     logger.debug(f"✅ Event {note_event_id[:16]}... WOULD be tracked, adding to cache")
                     # Add to cache so future checks are faster
+                    if event.get("kind") == 1:
+                        await _append_today(user_id, eff_pub, tags, event, app)
+                    current = await crud.get_settings(user_id)
+                    if note_event_id not in (getattr(current, "tracked_event_ids", []) or []):
+                        return False
                     for key in cache_keys:
                         note_ids = _get_cache_note_ids(cache, key, create=True)
-                        if note_event_id not in note_ids:
-                            note_ids.append(note_event_id)
+                        note_ids[:] = current.tracked_event_ids
                     return True
                 else:
                     logger.debug(f"❌ Event {note_event_id[:16]}... would NOT be tracked (doesn't match criteria)")

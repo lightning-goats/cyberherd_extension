@@ -14,6 +14,7 @@ from uuid import uuid4
 from loguru import logger
 
 from .. import crud
+from .shares import compute_member_share_percentages, member_point_units
 
 # Only the Database-owned schema and fixed SQL clauses are interpolated.
 # All identifiers from events, wallets and users are bound values.
@@ -100,19 +101,107 @@ def valid_pubkey(value):
     )
 
 
+FAILED_ADMISSIONS = {
+    "headbutt_failure",
+    "kind_6_headbutt_failure",
+    "kind_7_headbutt_failure",
+    "join_below_minimum",
+}
+
+
+def score_snapshot(member, settings, percent):
+    return {
+        "zap_sats": max(0, int(member.get("amount") or 0)),
+        "minimum_sats": max(1, int(settings.minimum_sats)),
+        "repost_points": 3 * int(6 in member.get("engagement_kinds", [])),
+        "like_points": int(7 in member.get("engagement_kinds", [])),
+        "total_point_units": member_point_units(member, settings.minimum_sats),
+        "share_percent": percent,
+    }
+
+
+async def current_scores(owner):
+    """Read current score inputs without changing membership or payout targets."""
+    from ..utils.common import is_valid_lightning_address
+
+    settings = await crud.get_settings(owner)
+    members = await crud.get_active_cyberherd_members(owner)
+    members = [m for m in members if not m.get("banned")]
+    if not settings:
+        return None, members, {}
+    eligible = [m for m in members if is_valid_lightning_address(m.get("lud16"))]
+    pool = settings.member_allocation_percent if settings.zap_wallet else 100
+    shares = compute_member_share_percentages(eligible, pool, settings.minimum_sats)
+    return settings, members, shares
+
+
+async def member_summary(owner, pubkey, event_type, values):
+    if event_type in FAILED_ADMISSIONS:
+        return {"status": "not_admitted"}
+    settings, members, shares = await current_scores(owner)
+    member = next((m for m in members if m["pubkey"] == pubkey), None)
+    if not settings or not member:
+        return None
+    snapshot = score_snapshot(member, settings, shares.get(pubkey, 0))
+    if event_type in {"existing_member_repost", "existing_member_reaction"}:
+        kind = 6 if event_type == "existing_member_repost" else 7
+        source = values.get("source_event_id") or values.get("event_id")
+        observation = await crud._db().fetchone(
+            f"SELECT event_id FROM {crud.db.references_schema}engagement_observations "
+            "WHERE user_id=:uid AND pubkey=:pubkey AND kind=:kind AND cycle_id=:cycle",
+            {"uid": owner, "pubkey": pubkey, "kind": kind, "cycle": await cycle(owner)},
+        )
+        snapshot["earned_points"] = (
+            (3 if kind == 6 else 1)
+            if (observation and observation["event_id"] == source)
+            else 0
+        )
+    elif event_type == "member_increase":
+        snapshot["earned_points"] = (
+            10
+            * max(0, int(values.get("increase_amount") or 0))
+            / snapshot["minimum_sats"]
+        )
+    return snapshot
+
+
 async def queue_member(event_type, owner, values, wallet_id, roots, topic):
     """Queue a lifecycle message, reserving its joining-message branch atomically."""
-    pubkey = values.get("member_pubkey") or values.get("pubkey")
+    pubkey = (
+        values.get("member_pubkey")
+        or values.get("pubkey")
+        or values.get("attacker_pubkey")
+    )
     if not owner or not valid_pubkey(pubkey):
         return False
     async with _lock, crud.admission_transaction():
         token = await cycle(owner)
+        values = dict(values)
+        settings = await crud.get_settings(owner)
+        root = next(iter(roots or []), None)
+        from .streams import conversation
+
+        stream_address = values.get("stream_address") or conversation(settings, root)
+        summary = await member_summary(owner, pubkey, event_type, values)
+        if summary:
+            values["current_score"] = summary
+        if settings and event_type not in FAILED_ADMISSIONS:
+            members = await crud.get_active_cyberherd_members(owner)
+            active = len([m for m in members if not m.get("banned")])
+            values["herd_capacity"] = {
+                "active_members": active,
+                "max_members": settings.max_members,
+                "spots_remaining": max(0, settings.max_members - active),
+            }
         thread_id = key("thread", owner, pubkey, token)
         thread = await record(thread_id)
+        if thread and thread["data"].get("stream_address") != stream_address:
+            thread_id = key("thread", owner, pubkey, token, stream_address or "notes")
+            thread = await record(thread_id)
         source = values.get("source_event_id") or values.get("event_id")
         # Admission supplies an event identity. Fallback is a stable snapshot.
         message_id = key("member", owner, token, pubkey, event_type, source or values)
-        if not thread:
+        if not thread and event_type not in FAILED_ADMISSIONS:
             await put(
                 thread_id,
                 owner,
@@ -120,7 +209,8 @@ async def queue_member(event_type, owner, values, wallet_id, roots, topic):
                 "waiting",
                 {
                     "join_message": message_id,
-                    "root": next(iter(roots or []), None),
+                    "root": root,
+                    "stream_address": stream_address,
                     "wallet": wallet_id,
                     "pubkey": pubkey,
                     "cycle": token,
@@ -136,7 +226,12 @@ async def queue_member(event_type, owner, values, wallet_id, roots, topic):
             {
                 "event_type": event_type,
                 "values": values,
-                "thread": thread_id,
+                "thread": thread_id if event_type not in FAILED_ADMISSIONS else None,
+                "roots": list(roots or []),
+                "stream_address": stream_address,
+                "p_tags": [
+                    p for p in (pubkey, values.get("victim_pubkey")) if valid_pubkey(p)
+                ],
                 "wallet": wallet_id,
                 "pubkey": pubkey,
                 "topic": topic,
@@ -173,7 +268,9 @@ async def prepare_distribution(payment, targets):
             matches = [
                 m
                 for m in members
-                if m.get("lud16") and m["lud16"].lower() == target.wallet.lower()
+                if m.get("lud16")
+                and m["lud16"].lower() == target.wallet.lower()
+                and target.wallet.lower() != (settings.zap_wallet or "").lower()
             ]
             # Shared addresses cannot uniquely identify a member: never guess.
             if len(matches) != 1:
@@ -212,6 +309,9 @@ async def prepare_distribution(payment, targets):
                     {
                         "join_message": anchor_id,
                         "root": member.get("note"),
+                        "stream_address": (settings.tracked_event_addresses or {}).get(
+                            member.get("note")
+                        ),
                         "wallet": settings.herd_wallet,
                         "pubkey": member["pubkey"],
                         "cycle": token,
@@ -226,7 +326,12 @@ async def prepare_distribution(payment, targets):
                     "queued",
                     {
                         "event_type": "member_thread",
-                        "values": {"name": member.get("display_name") or "Member"},
+                        "values": {
+                            "name": member.get("display_name") or "Member",
+                            "current_score": await member_summary(
+                                owner, member["pubkey"], "member_thread", {}
+                            ),
+                        },
                         "thread": thread_id,
                         "wallet": settings.herd_wallet,
                         "pubkey": member["pubkey"],
@@ -244,6 +349,7 @@ async def prepare_distribution(payment, targets):
                     "wallet": payment.wallet_id,
                     "target": target.wallet,
                     "percent": target.percent,
+                    "score_breakdown": score_snapshot(member, settings, target.percent),
                     "gross_msat": int(payment.amount * target.percent / 100),
                     "pubkey": member["pubkey"],
                     "name": member.get("display_name") or "Member",
@@ -291,6 +397,8 @@ async def _queue_treat(row):
     data = row["data"]
     skipped = row["state"] == "too_small"
     values = {"name": data["name"], "new_amount": data.get("amount_msat", 0) / 1000}
+    if "score_breakdown" in data:
+        values["score_breakdown"] = data["score_breakdown"]
     nudge = False
     if skipped and not data["reposted"]:
         # At most one suggestion per membership cycle, and only on half of rounds.
@@ -320,6 +428,36 @@ async def _queue_treat(row):
     await put(row["id"], row["user_id"], "treat", "announced", data)
 
 
+async def _parent_reference(data):
+    if not data.get("reply_message"):
+        return True, None
+    parent = await record(data["reply_message"])
+    if not parent or parent["state"] != "submitted":
+        return False, None
+    event_id = parent["data"].get("event_id") or parent["data"].get("signed", {}).get(
+        "id"
+    )
+    return bool(event_id), event_id
+
+
+async def _render_queued_message(row, data):
+    from lnbits.extensions.cyberherd_messaging import services as messaging
+
+    if data["event_type"] == "feeder_triggered":
+        return await messaging.render_feeder_message(data["values"], row["user_id"])
+    if data.get("stream_notice"):
+        return await messaging.render_stream_notice(
+            data["event_type"], data["values"], row["user_id"]
+        )
+    return await messaging.render_member_message(
+        data["event_type"],
+        data["values"],
+        data["pubkey"],
+        row["user_id"],
+        data.get("nudge", False),
+    )
+
+
 async def _publish(row):
     from lnbits.extensions.cyberherd_messaging import services as messaging
 
@@ -331,19 +469,11 @@ async def _publish(row):
     is_join = thread.get("join_message") == row["id"]
     if thread and not is_join and not thread.get("event_id"):
         return
+    ready, reply_event = await _parent_reference(data)
+    if not ready:
+        return
     if "content" not in data:
-        if data["event_type"] == "feeder_triggered":
-            data["content"] = await messaging.render_feeder_message(
-                data["values"], row["user_id"]
-            )
-        else:
-            data["content"] = await messaging.render_member_message(
-                data["event_type"],
-                data["values"],
-                data["pubkey"],
-                row["user_id"],
-                data.get("nudge", False),
-            )
+        data["content"] = await _render_queued_message(row, data)
     data["retry_at"] = int(time.time()) + 30
     await put(row["id"], row["user_id"], "message", "queued", data)
     receipt = {}
@@ -358,7 +488,7 @@ async def _publish(row):
         )
         submitted_id = data["signed"]["id"] if ok else None
     else:
-        roots = [thread["root"]] if thread.get("root") else []
+        roots = [thread["root"]] if thread.get("root") else data.get("roots", [])
         if thread and not is_join:
             roots.append(thread["event_id"])
         source = data["values"].get("source_event_id")
@@ -367,11 +497,19 @@ async def _publish(row):
             if valid_pubkey(source) and source not in roots
             else []
         )
+        stream_address = thread.get("stream_address") or data.get("stream_address")
         await messaging.publish_note(
             data["content"],
+            reply_to_30311_a_tag=stream_address,
+            reply_to_30311_event=(
+                (reply_event or thread.get("event_id"))
+                if stream_address and not is_join
+                else None
+            ),
             e_tags=roots,
             tags=context_tags,
-            p_tags=[data["pubkey"]] if data.get("pubkey") else [],
+            p_tags=data.get("p_tags")
+            or ([data["pubkey"]] if data.get("pubkey") else []),
             wallet_id=data["wallet"],
             user_id=row["user_id"],
             receipt=receipt,
@@ -384,6 +522,7 @@ async def _publish(row):
         if is_join:
             thread["event_id"] = submitted_id
             await put(data["thread"], row["user_id"], "thread", "submitted", thread)
+        data["event_id"] = submitted_id
         await put(row["id"], row["user_id"], "message", "submitted", data)
     await messaging.send_to_websocket_clients(
         data["topic"],
@@ -478,6 +617,24 @@ async def claim_recipient(identifier):
 
 async def queue_feeder(owner, wallet, payment_id, values, topic):
     """One durable feeder announcement per received payment, regardless of cycles."""
+    values = dict(values)
+    from .note_metadata import extract_30311_address
+    from .streams import active
+
+    stream = await active(owner)
+    stream_address = extract_30311_address(stream) if stream else None
+    async with crud.admission_transaction():
+        settings, members, _ = await current_scores(owner)
+        if settings:
+            basis = max(1, int(settings.minimum_sats))
+            values["herd_score"] = {
+                "active_members": len(members),
+                "total_points": sum(member_point_units(m, basis) for m in members)
+                / basis,
+                "member_allocation": (
+                    settings.member_allocation_percent if settings.zap_wallet else 100
+                ),
+            }
     await put(
         key("feeder-notice", owner, payment_id),
         owner,
@@ -486,6 +643,8 @@ async def queue_feeder(owner, wallet, payment_id, values, topic):
         {
             "event_type": "feeder_triggered",
             "values": values,
+            "stream_address": stream_address,
+            "roots": [stream["id"]] if stream else [],
             "wallet": wallet,
             "topic": topic,
         },

@@ -1289,13 +1289,15 @@ async def publish_event_message(
     """
     values = values or {}
     item = values.get("cyber_herd_item") or {}
-    member_pubkey = values.get("member_pubkey") or item.get("pubkey")
-    if owner_user_id and event_type in _MEMBERSHIP_EVENTS and member_pubkey:
+    member_pubkey = values.get("member_pubkey") or item.get("pubkey") or values.get("attacker_pubkey")
+    from .treats import FAILED_ADMISSIONS
+    if owner_user_id and event_type in (_MEMBERSHIP_EVENTS | FAILED_ADMISSIONS) and member_pubkey:
         from .treats import queue_member, valid_pubkey
         if valid_pubkey(member_pubkey):
             queued = await queue_member(
                 event_type, owner_user_id,
-                {**values, "member_pubkey": member_pubkey}, wallet_id,
+                {**values, "member_pubkey": member_pubkey,
+                 "stream_address": reply_to_30311_a_tag}, wallet_id,
                 e_tags, websocket_topic,
             )
             if queued and _msg is not None:

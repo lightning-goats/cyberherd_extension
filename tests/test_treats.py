@@ -736,3 +736,80 @@ async def test_internal_sub_satoshi_target_does_not_create_zero_invoice(
     monkeypatch.setattr(split_tasks, "create_invoice", invoice)
     await split_tasks.on_invoice_paid(payment)
     invoice.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_score_snapshot_survives_later_engagements(
+    audit_db, enabled, monkeypatch
+):
+    payment, targets = await setup_distribution()
+    await treats.prepare_distribution(payment, targets)
+    recipient = (await rows("treat"))[0]
+    snapshot = recipient["data"]["score_breakdown"]
+    assert snapshot == {
+        "zap_sats": 0,
+        "minimum_sats": 10,
+        "repost_points": 0,
+        "like_points": 1,
+        "total_point_units": 10,
+        "share_percent": 0.16,
+    }
+    # Later settings and contribution changes must not alter a pending payment notice.
+    await save_settings(herd_wallet="herd", source_wallet="source", minimum_sats=21)
+    await add_member(pubkey=PUBKEY, amount=210, kinds=[6, 7])
+    await treats.prepare_distribution(payment, targets)
+    recipient = (await rows("treat"))[0]
+    assert recipient["data"]["score_breakdown"] == snapshot
+    recipient["state"] = "paid"
+    recipient["data"]["amount_msat"] = 1000
+    await treats._queue_treat(recipient)
+    notice = next(
+        r
+        for r in await rows("message")
+        if r["data"]["event_type"] == "cyber_herd_treats"
+    )
+    assert notice["data"]["values"]["score_breakdown"] == snapshot
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "event_type", ["cyber_herd_treats", "cyber_herd_treats_skipped"]
+)
+async def test_score_footer_uses_stored_template_and_actual_share(
+    monkeypatch, event_type
+):
+    from lnbits.extensions.cyberherd_messaging.defaults import SEED_DEFAULTS
+
+    async def stored(owner, category):
+        entry = SEED_DEFAULTS[category].get(
+            "treat_0", next(iter(SEED_DEFAULTS[category].values()))
+        )
+        return [SimpleNamespace(content=entry)]
+
+    monkeypatch.setattr(
+        "lnbits.extensions.cyberherd_messaging.crud.ensure_default_templates",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "lnbits.extensions.cyberherd_messaging.crud.get_message_templates", stored
+    )
+    values = {
+        "name": "Alice",
+        "new_amount": 13,
+        "score_breakdown": {
+            "zap_sats": 21,
+            "minimum_sats": 21,
+            "repost_points": 3,
+            "like_points": 1,
+            "total_point_units": 294,
+            "share_percent": 0.000001,
+        },
+    }
+    content = await messages.render_member_message(event_type, values, PUBKEY, "owner")
+    assert "Zaps: 21 sats → 10 points" in content
+    assert "Repost: 3 points" in content and "Like: 1 points" in content
+    assert "Total: 14 points" in content
+    assert "Treat share: 0.000001%" in content
+    assert content.index("Total:") < content.index(
+        "https://lightning-goats.com/leaderboard"
+    )

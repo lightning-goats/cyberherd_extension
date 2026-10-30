@@ -316,3 +316,31 @@ Pull requests are welcome! Please ensure that:
 - README and docs remain updated when behaviour changes.
 
 Licensed under the MIT License.
+
+## Stream conversations, treat zaps and broadcast targets
+
+CyberHerd supports authenticated kind-30311 live streams and their kind-1311
+chat. The tracked list selects one current-day tagged announcement, the latest
+live stream version, and its linked signed kind-9041 goal. Old stream versions
+remain reference aliases. Qualifying goal zaps, reposts and likes use the same
+admission and cumulative scoring rules as the other broadcast targets.
+
+Member messages retain their joining conversation. Joining, engagement and
+headbutt notices include context-appropriate current score summaries; settled
+treat notices include the frozen payout score breakdown. Compatible recipients
+receive NIP-57 zap requests referencing their member conversation; unsupported
+LNURL endpoints retain ordinary Lightning payments. The member pool remains
+capped by the configured allocation. Update the required SplitPayments companion
+patch when upgrading these three extensions.
+
+Invitations and feeder outcome summaries also use stream chat; daily resets do
+not. Pause and re-enabling notices go to kind-1 notes and the associated chat,
+with durable per-transition deduplication across restarts and stream refreshes.
+Evening pauses use read-only local OpenHAB Astro phase, sunset and direct
+radiation context to select foraging and overnight stream sign-off wording.
+Changing sunlight never repeats a notice for an already-paused feeder.
+
+All wording lives in CyberHerd Messaging templates. Upgrade messaging through
+migration 12 for the expanded invitation, score, feeder and evening categories.
+See [the explanation](cyberherd_explanation.md) for the complete rules and solar
+selection details.

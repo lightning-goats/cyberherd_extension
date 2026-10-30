@@ -376,3 +376,150 @@ once, including when admission is through a zap. Previously processed failed
 headbutts can be reconciled silently for active members; the failed attempt
 itself never grants a seat. Cycle boundaries prevent retained actions from a
 previous daily or manual reset being promoted into a new cycle.
+
+Treat and no-treat notices include the interaction breakdown saved before that
+distribution: cumulative zap sats and their points, the first repost (3 points),
+the first like (1 point), total points, and the actual percentage assigned to
+the recipient after the member pool is applied. Later engagements do not change
+a queued notice. Older distributions without this snapshot retain their original
+wording. The breakdown is an editable CyberHerd Messaging database template.
+
+Non-payout messages save a separate current-score snapshot when queued. Joining,
+successful headbutts, engagement updates, and member-thread anchors show cumulative
+contributions, total points, and the current percentage of the distribution after
+the member allocation is applied. They say that shares can change before
+distribution, and do not claim that a payment has occurred. Engagement updates
+also show the points added by that interaction; repeated likes/reposts add zero
+and retain the existing duplicate-message suppression. Rejected admissions explain
+that the attempt earned no membership points or share; qualifying social evidence
+can contribute after a later qualifying join. Rejections do not reserve a joining
+message thread. Feeder announcements show active member count, total herd points,
+member allocation and the existing feeding/payout cycle counts, once per payment.
+These summaries use editable CyberHerd Messaging database templates (migration 7).
+Older queued messages without a snapshot keep their saved wording.
+
+Member treats use NIP-57 zaps when the recipient's Lightning address advertises
+`allowsNostr` and a valid receipt-signing public key. CyberHerd Messaging signs a
+kind-9734 request with the existing herd identity and editable database wording.
+The request goes only to the recipient's LNURL callback, never directly to relays.
+The submitted joining-message ID is referenced when available; otherwise the
+payment is a profile zap. Active Nostr Client relays are supplied for receipts.
+
+The signed request is saved before requesting the invoice. The returned invoice
+must have exactly the planned whole-sat amount, commit to the exact saved request
+in its description hash, and remain unexpired. Signing or callback failures do
+not silently downgrade supported recipients. Unsupported recipients retain normal
+Lightning payments, with the fallback recorded. Operator transfers remain ordinary
+splits. These changes do not increase the configured member allocation or bypass
+fee reserves. A settled LNbits payment proves delivery; receipt publication by the
+recipient's provider is separate and is not assumed from payment success.
+
+Deployment requires CyberHerd Messaging migration 8, the matching SplitPayments
+companion patch, and a kind-9734 grant for `cyberherd_messaging` on the existing herd
+signing key. The migration installs message wording, never signer permissions.
+
+Live-stream CyberHerd interactions use the same membership and contribution
+score as regular notes. Generic reposts (Nostr kind 16) of an authenticated
+kind-30311 stream count as the existing repost award (3 points), not a separate
+award. The first repost and first positive reaction remain once per membership
+cycle across both notes and streams; separate settled zaps always count once per
+payment identity. Chat text itself does not award membership points.
+
+Streams are identified by their stable `30311:<author>:<d-tag>` address. Discovery
+covers project-authored events and provider-authored events naming the configured
+project identity as host. A provider event requires a valid signature plus either
+a NIP-53 host proof or verification of its publishing key against the fixed
+HTTPS metadata endpoint of the supported zap.stream service. An unverified host
+tag or service URL alone is not sufficient. Provider verification outages leave
+settled payments retryable without claiming their hashes. Live streams can remain
+eligible across local midnight while fresh; ended or stale streams are excluded
+from new interaction qualification and feeder chat selection. Older versions cannot
+restore a stream to live after a newer ended update.
+
+Recovery and realtime monitoring query both event-ID (`e`) and stable-address
+(`a`) references using separate OR filters. Address-only settled zap requests
+resolve to the authenticated stream while retaining the project host as payee.
+Nostr receipts alone do not grant credit; the incoming payment must settle in the
+configured Herd wallet. Payments retained by an external streaming provider do
+not count as settled Herd-wallet payments.
+
+Joining, engagement, headbutt and treat messages preserve their conversation
+address in the durable queue. Stream messages are kind-1311 chat messages with
+the stream `a` root and a direct `e` reply to the member's joining chat message.
+A member can have separate note/stream conversation branches while sharing one
+membership score. Treat notices retain the first joining conversation of that
+membership cycle. Feeder announcements select one authenticated active stream
+chat when queued and remain one message per received payment. Signed retries and
+queued contexts retain their original channel even if the stream changes later.
+Zap payouts referencing a joining chat message identify its kind as 1311.
+
+The configured 10% member allocation and feeder/payout cycle limits are unchanged.
+Live-event state uses the existing durable delivery-record tables; no additional
+schema migration or stream-signing permission is required for this integration.
+
+Additional public notices do not include daily resets. Invitations appear only
+in an authenticated active stream chat, at most once every two hours per stream,
+and only when the operator pause switch is confirmed OFF. Removing the
+`cyber_herd_invitation` template category opts out of invitations. Membership and
+invitation messages include the saved count of filled/open places; a full herd
+explains that likes cannot headbutt while qualifying zaps and eligible reposts can.
+
+The chat status observer only reads OpenHAB. A confirmed feeder pause or
+resumption is queued once as a kind-1 note and, when an active stream exists, once as a
+kind-1311 chat message. Each destination has an independent durable identity and
+retry record. Consecutive transitions retain their order in each destination.
+Repeated observations and restarts do not duplicate notices. An initial OFF
+reading establishes a quiet baseline; an initial ON reading announces the pause.
+Unknown, NULL, UNDEF and unavailable readings do not announce re-enabling or
+advance the last confirmed state. Notes still work without a live stream.
+
+The single feeder-triggered message reports OpenHAB command acceptance rather
+than claiming physical food delivery. A completed batch can post a separate chat
+reply with the recorded number of accepted feeder commands and completed
+CyberHerd funding transfers. An ambiguous command reports uncertainty and operator
+reconciliation, not success or physical failure. Its automatic replay remains
+blocked by the existing feeding safety rules. These replies retain the trigger
+message's chat and wait for that message to be submitted before replying.
+Recipient treat announcements continue to follow independently settled payments.
+There is no physical delivery sensor in this integration, so no message claims
+that food was physically dispensed.
+
+CyberHerd Messaging migration 9 installs editable wording for these notices,
+command acknowledgments and herd-capacity footers without replacing custom rows
+or restoring intentionally deleted templates. Feeder limits, cooldowns, payout
+amounts and the 10% member pool are unchanged. No new signing permission is needed:
+`cyberherd_messaging` uses existing kinds 1 and 1311, and 9734 for zap requests.
+
+
+### Evening feeder pause
+
+The messaging observer reads the local OpenHAB Astro Items `Sun_SunPhaseName`,
+`Sun_Set_Start`, and `Sun_DirectRadiation`. In the afternoon/evening, dusk or night
+selects the evening pause category. Today’s sunset also selects it once passed;
+within the hour before sunset, direct radiation at or below 0.5 W/m² can select it.
+Low light earlier in the day does not mean the stream is closing. If solar context
+is unavailable, the conservative fallback starts at 18:00 in the server’s local
+zone; confirmed daylight or positive direct radiation overrides that fallback.
+
+Evening messages explain that the goats are heading out to forage and the stream
+is signing off until the morning sun. This is messaging context, not a command to
+stop the stream or operate the feeder. Evening wording is selected only when the pause is first observed. A later change
+in sunlight does not send another sign-off for an already-paused feeder. Repeated
+readings, worker restarts and stream refreshes never repeat a pause or resumption. The notice goes to a
+kind-1 note and the active stream chat, or an authenticated stream that ended in
+the previous 15 minutes. Unknown pause state never announces a transition.
+
+The editable `feeder_requests_paused_night` category contains eight variations in
+the cyberherd_messaging database. Ordinary pause/resume categories contain six
+each, and invitations contain eight. The template upgrades preserve custom text
+and subsequent deletions.
+
+### Canonical broadcast targets
+
+The tracked target list selects one current-day tagged CyberHerd announcement,
+one latest live kind-30311 stream version, and the signed kind-9041 goal linked
+from that broadcast. When available, the announcement sharing the stream’s goal
+is preferred. Older versions of that same stream remain reference aliases rather
+than additional displayed targets. Unrelated notes and unsigned or unlinked goals
+are not added. Qualifying goal zaps, reposts and likes use the same membership and
+once-per-cycle social scoring rules as the other broadcast targets.

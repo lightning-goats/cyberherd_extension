@@ -120,6 +120,8 @@ def _start_daily_ready_background_tasks():
     logger.info("🚀 Cyberherd: Starting background tasks...")
     from .services.treats import run as monitor_treats
     scheduled_tasks.append(create_permanent_unique_task("ext_cyberherd_treats", monitor_treats))
+    from .services.chat_updates import run as monitor_chat_updates
+    scheduled_tasks.append(create_permanent_unique_task("ext_cyberherd_chat_updates", monitor_chat_updates))
     
     # Create permanent task for subscription handler (like nwcprovider does)
     task = create_permanent_unique_task("ext_cyberherd_subscriptions", cyberherd_subscription_handler)

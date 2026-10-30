@@ -112,6 +112,10 @@ def test_inactive_banned_and_unawarded_kinds_do_not_score():
 
 @pytest.mark.anyio
 async def test_first_repost_and_like_add_once_across_notes(scenario, monkeypatch):
+    # Target selection is tested separately; this contract covers shared social awards.
+    async def eligible(*args, **kwargs):
+        return True
+    monkeypatch.setattr("lnbits.extensions.cyberherd.services.subscriptions._is_tracked_event", eligible)
     other_note = "d" * 64
     scenario.settings.tracked_event_ids.append(other_note)
 

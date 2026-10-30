@@ -79,6 +79,8 @@ async def social_db(request, monkeypatch, tmp_path):
 
 @pytest.fixture
 async def scenario(social_db, monkeypatch):
+    monkeypatch.setattr(subscriptions, "_user_update_locks", {})
+    monkeypatch.setattr(subscriptions, "_user_locks_mutex", None)
     user_settings = SimpleNamespace(
         tracked_event_ids=[NOTE],
         tracked_tags=[],

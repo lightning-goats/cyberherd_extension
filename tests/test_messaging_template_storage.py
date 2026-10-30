@@ -240,3 +240,27 @@ async def test_partial_seed_failure_is_retryable_and_preserves_custom_rows(
     assert (
         next(row.content for row in paid if row.key == "0") == "Our custom paid message"
     )
+
+
+@pytest.mark.anyio
+async def test_breakdown_upgrade_preserves_edits_and_deletions(messaging_db):
+    await insert_template(messaging_db, "cyber_herd_treats", "custom", "Custom treats")
+    await messaging_db.execute(
+        f"INSERT INTO {messaging_db.references_schema}user_settings "
+        "(user_id,key,value) "
+        "VALUES ('owner','member_message_templates_v1','1')"
+    )
+    await migrations.m006_seed_treat_breakdown_template(messaging_db)
+    templates = await crud.get_message_templates("owner", "cyber_herd_treat_breakdown")
+    assert len(templates) == 1 and "{total_points}" in templates[0].content
+    await crud.update_message_template(
+        "owner", "cyber_herd_treat_breakdown", "0", "Custom {total_points}"
+    )
+    await migrations.m006_seed_treat_breakdown_template(messaging_db)
+    assert (await crud.get_message_templates("owner", "cyber_herd_treat_breakdown"))[
+        0
+    ].content == "Custom {total_points}"
+    await crud.delete_message_template("owner", "cyber_herd_treat_breakdown", "0")
+    await crud.ensure_default_templates("owner")
+    assert not await crud.get_message_templates("owner", "cyber_herd_treat_breakdown")
+    assert len(await crud.get_message_templates("owner", "cyber_herd_treats")) == 1

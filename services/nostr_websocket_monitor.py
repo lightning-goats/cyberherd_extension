@@ -431,11 +431,13 @@ class NostrWebSocketMonitor:
             "limit": 200,
         }
 
-        events = await nostr_helpers.query_events(
-            filters,
-            limit=200,
-            timeout=6.0,
+        events = await nostr_helpers.query_events(filters, limit=200, timeout=6.0)
+        provider_events = await nostr_helpers.query_events(
+            {"kinds": [30311], "#p": [effective_pubkey], "since": since_ts - 3600, "limit": 100},
+            limit=100, timeout=6.0,
         )
+        by_id = {e["id"]: e for e in (events or []) + (provider_events or []) if isinstance(e, dict) and e.get("id")}
+        events = list(by_id.values())
         processed = 0
         for event in events or []:
             if not isinstance(event, dict):
@@ -482,22 +484,11 @@ class NostrWebSocketMonitor:
             return 0
 
         from .time_utils import get_day_boundaries_utc
-        from . import nostr_helpers
 
         boundaries = get_day_boundaries_utc(days_ago=0)
         since_ts = int(boundaries.local_since_ts)
-        filters = {
-            "kinds": engagement_kinds,
-            "#e": tracked_note_ids,
-            "since": since_ts,
-            "limit": 200,
-        }
-
-        events = await nostr_helpers.query_events(
-            filters,
-            limit=200,
-            timeout=6.0,
-        )
+        from .streams import query_engagements
+        events = await query_engagements(user_settings, engagement_kinds, since_ts, 200, 6.0)
         processed = 0
         for event in events or []:
             if not isinstance(event, dict):
@@ -613,8 +604,10 @@ class NostrWebSocketMonitor:
                         "since": engagement_since,
                     }
                     
-                    # Send REQ message
-                    await self._send(["REQ", sub_id, filter_dict])
+                    from .streams import engagement_filters
+                    filters = engagement_filters(user_settings, engagement_kinds, engagement_since, 1000)
+                    # Relay filters are ORed; combining #e and #a in one filter would require both.
+                    await self._send(["REQ", sub_id, *filters])
                     
                     # Track subscription
                     self.subscriptions[sub_id] = {
@@ -690,6 +683,14 @@ class NostrWebSocketMonitor:
                     "handshake_completed": False,
                     "last_event_at": None,
                     "closed": False,
+                }
+
+                stream_sub_id = self._get_new_subid()
+                stream_filter = {"kinds": [30311], "#p": [effective_pubkey], "since": note_since - 3600}
+                await self._send(["REQ", stream_sub_id, stream_filter])
+                self.subscriptions[stream_sub_id] = {
+                    "type": "streams", "filter": stream_filter, "created_at": time.time(),
+                    "handshake_completed": False, "last_event_at": None, "closed": False,
                 }
 
                 logger.debug(
@@ -798,7 +799,7 @@ class NostrWebSocketMonitor:
                 # Process the note: check tags, add to tracked_event_ids, trigger subscription refresh
                 acted = bool(await process_note_for_tracked_tags(self.user_id, event, self.app))
 
-            elif kind == 6:
+            elif kind in (6, 16):
                 # Repost
                 logger.debug(f"User {self.user_id}: Processing repost {event_id[:8]}...")
                 acted = bool(await process_repost_for_tracked_notes(self.user_id, event, self.app))

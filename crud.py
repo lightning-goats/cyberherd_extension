@@ -516,7 +516,7 @@ def _row_to_settings(row) -> CyberherdSettings:
 
     tracked_events_set = {eid for eid in tracked_events_list if eid}
     tracked_events_set.update(eid for eid in manual_events_list if eid)
-    tracked_events_set.update(tracked_addresses_dict.keys())
+    # Stream aliases resolve old versions but are not separate tracked targets.
     combined_tracked_events = sorted(tracked_events_set)
 
     return CyberherdSettings(

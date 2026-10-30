@@ -188,13 +188,13 @@ async def test_realtime_note_poll_queries_and_processes_today_author_notes(
         "tags": [["t", "cyberherd"]],
         "content": "hello #CyberHerd",
     }
-    captured = {"processed": []}
+    captured = {"processed": [], "filters": []}
 
     async def fake_get_settings(user_id):
         return settings
 
     async def fake_query_events(filters, limit=100, timeout=6.0):
-        captured["filters"] = filters
+        captured["filters"].append(filters)
         captured["limit"] = limit
         return [event]
 
@@ -215,10 +215,14 @@ async def test_realtime_note_poll_queries_and_processes_today_author_notes(
 
     assert processed == 1
     assert captured["processed"] == [event]
-    assert captured["filters"]["kinds"] == [1, 30311]
-    assert captured["filters"]["authors"] == ["b" * 64]
-    assert "#t" not in captured["filters"]
-    assert captured["filters"]["since"] == int(
+    assert len(captured["filters"]) == 2
+    assert captured["filters"][1]["kinds"] == [30311]
+    assert captured["filters"][1]["#p"] == ["b" * 64]
+    assert "authors" not in captured["filters"][1]
+    assert captured["filters"][0]["kinds"] == [1, 30311]
+    assert captured["filters"][0]["authors"] == ["b" * 64]
+    assert "#t" not in captured["filters"][0]
+    assert captured["filters"][0]["since"] == int(
         subscriptions._get_today_boundaries_utc().local_since_ts
     )
 
@@ -245,7 +249,7 @@ async def test_engagement_subscription_uses_local_day_since(monkeypatch):
 
     engagement_reqs = [
         msg for msg in sent_messages
-        if msg[0] == "REQ" and msg[2].get("kinds") == [6, 7]
+        if msg[0] == "REQ" and msg[2].get("kinds") == [6, 7, 16]
     ]
     assert len(engagement_reqs) == 1
     engagement_filter = engagement_reqs[0][2]
@@ -295,7 +299,7 @@ async def test_realtime_interaction_poll_queries_and_processes_tracked_events(
 
     assert processed == 1
     assert captured["processed"] == [event]
-    assert captured["filters"]["kinds"] == [6, 7]
+    assert captured["filters"]["kinds"] == [6, 7, 16]
     assert captured["filters"]["#e"] == [note_id]
     assert captured["filters"]["since"] == int(
         subscriptions._get_today_boundaries_utc().local_since_ts
@@ -782,6 +786,14 @@ async def test_fetch_tagged_note_returns_event_matching_tracked_tag(monkeypatch)
     )
 
     monkeypatch.setattr(subscriptions.nostr_helpers, "verify_event_signature", lambda event: True)
+    # This unit isolates signed tag matching; catalog persistence has database tests.
+    async def select_target(*args, **kwargs):
+        settings.tracked_event_ids = [note_id]
+        return True
+    async def current_settings(*args):
+        return settings
+    monkeypatch.setattr(subscriptions, "_append_today", select_target)
+    monkeypatch.setattr(payment_coordinator.crud, "get_settings", current_settings)
     monitor = payment_coordinator.PaymentCoordinatorService(user_id="user-id")
 
     fetched = await monitor._fetch_tagged_note(

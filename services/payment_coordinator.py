@@ -196,8 +196,16 @@ class PaymentCoordinatorService:
                 return ts
         return None
 
-    async def _resolve_note_from_addresses(self, *args, **kwargs) -> tuple[str | None, str | None]:
-        """Deprecated: address-based note resolution no longer performed here."""
+    async def _resolve_note_from_addresses(self, settings, addresses) -> tuple[str | None, str | None]:
+        from .subscriptions import _resolve_tracked_event, get_effective_pubkey
+
+        for address in addresses:
+            if not isinstance(address, str) or not address.startswith("30311:"):
+                continue
+            event_id, _ = await _resolve_tracked_event(settings, address, None, self.app)
+            if event_id:
+                # Zap p identifies the payee/host, not a provider's event-signing key.
+                return event_id, get_effective_pubkey(settings)
         return None, None
 
     async def start_monitoring(self):
@@ -573,11 +581,22 @@ class PaymentCoordinatorService:
                 if not events:
                     self.last_error = "retryable_processing"
                     return False
-                if not any(
-                    isinstance(event, dict) and event.get("id") == target_note_id
-                    and event.get("pubkey", "").lower() == effective.lower()
-                    and verify_event_signature(event) for event in (events or [])
-                ):
+                valid_target = False
+                for event in events or []:
+                    if not isinstance(event, dict) or event.get("id") != target_note_id or not verify_event_signature(event):
+                        continue
+                    if event.get("kind") == 30311:
+                        from . import streams
+                        from .subscriptions import _append_today, _would_event_be_tracked
+                        if await streams.authenticate(event, effective) and _would_event_be_tracked(event, effective, settings.tracked_tags):
+                            await _append_today(self.user_id, effective, settings.tracked_tags, event, self.app)
+                            valid_target = True
+                    elif event.get("kind") == 9041:
+                        from .tracking_targets import accept_goal
+                        valid_target = await accept_goal(self.user_id, settings, event)
+                    elif event.get("kind") == 1 and event.get("pubkey", "").lower() == effective.lower():
+                        valid_target = True
+                if not valid_target:
                     self.last_error = "note_author_mismatch"
                     return False
             else:
@@ -871,6 +890,12 @@ class PaymentCoordinatorService:
                 )
                 return False
 
+            current = await crud.get_settings(self.user_id)
+            if current and note_id in current.tracked_event_ids:
+                settings.tracked_event_ids = list(current.tracked_event_ids)
+                settings.tracked_event_timestamps = dict(getattr(current, "tracked_event_timestamps", {}) or {})
+                settings.tracked_event_addresses = dict(getattr(current, "tracked_event_addresses", {}) or {})
+                return True
             tracked = list(getattr(settings, "tracked_event_ids", []) or [])
             if note_id in tracked:
                 return True
@@ -936,6 +961,20 @@ class PaymentCoordinatorService:
             from .time_utils import get_day_boundaries_utc
 
             boundaries = get_day_boundaries_utc(days_ago=0)
+            from .tracking_targets import current_goal
+            if await current_goal(self.user_id, settings, note_id):
+                return True
+            stream_address = (getattr(settings, "tracked_event_addresses", {}) or {}).get(note_id)
+            if stream_address:
+                if author_hint and author_hint != resolve_effective_pubkey(settings):
+                    return False
+                from . import streams
+                from .subscriptions import _would_event_be_tracked
+                current = await streams.lookup(self.user_id, stream_address)
+                if current:
+                    if not await streams.authenticate(current, resolve_effective_pubkey(settings)):
+                        return False
+                    return _would_event_be_tracked(current, resolve_effective_pubkey(settings), settings.tracked_tags)
             timestamps = dict(getattr(settings, "tracked_event_timestamps", {}) or {})
             raw_ts = timestamps.get(note_id)
             if raw_ts is None:
@@ -966,6 +1005,7 @@ class PaymentCoordinatorService:
             )
             return bool(tagged_event)
         except Exception as exc:
+            self.last_error = "retryable_processing"
             logger.debug(
                 "Failed to validate tracked note %s against today's local window: %s",
                 note_id[:8] if isinstance(note_id, str) else "unknown",
@@ -1010,16 +1050,36 @@ class PaymentCoordinatorService:
                     kind = int(event.get("kind") or 0)
                 except Exception:
                     kind = 0
-                if kind not in (1, 30311):
+                if kind not in (1, 30311, 9041):
                     continue
 
                 event_pubkey = str(event.get("pubkey") or "").strip().lower()
-                if author_hint and event_pubkey != author_hint:
+                if kind == 9041:
+                    from .tracking_targets import accept_goal
+                    if author_hint and author_hint != resolve_effective_pubkey(settings):
+                        continue
+                    if await accept_goal(self.user_id, settings, event):
+                        from .subscriptions import _append_today
+                        await _append_today(self.user_id, resolve_effective_pubkey(settings), settings.tracked_tags, event, self.app)
+                        return event
+                    continue
+                if kind == 30311:
+                    from . import streams
+                    if author_hint and author_hint != resolve_effective_pubkey(settings):
+                        continue
+                    if not await streams.authenticate(event, resolve_effective_pubkey(settings)):
+                        continue
+                elif author_hint and event_pubkey != author_hint:
                     continue
 
                 eff_pub = resolve_effective_pubkey(settings)
                 tracked_tags = getattr(settings, "tracked_tags", []) or []
                 if _would_event_be_tracked(event, eff_pub, tracked_tags):
+                    from .subscriptions import _append_today
+                    await _append_today(self.user_id, eff_pub, tracked_tags, event, self.app)
+                    current = await crud.get_settings(self.user_id)
+                    if note_id not in current.tracked_event_ids:
+                        return None
                     return event
                 logger.info(
                     f"Zap monitor: target note {note_id[:8]}... was found but "
