@@ -97,6 +97,16 @@ def cyberherd_start():
         from .tasks import ensure_membership_day
 
         await ensure_membership_day(app=_APP_REF)
+        from .services.splits import update_split_targets_proportional
+        from .utils.common import is_extension_enabled_for_user
+
+        # Activate the new share policy for existing members before intake.
+        for settings in await crud.get_all_settings():
+            uid = settings.user_id
+            if uid and await is_extension_enabled_for_user(uid):
+                await crud.recompute_member_payouts(uid)
+                if settings.source_wallet:
+                    await update_split_targets_proportional(settings.source_wallet, uid, strict=True)
         _start_daily_ready_background_tasks()
 
     task = create_permanent_unique_task(
@@ -108,6 +118,8 @@ def cyberherd_start():
 def _start_daily_ready_background_tasks():
     """Register monitors only after durable day recovery succeeds."""
     logger.info("🚀 Cyberherd: Starting background tasks...")
+    from .services.treats import run as monitor_treats
+    scheduled_tasks.append(create_permanent_unique_task("ext_cyberherd_treats", monitor_treats))
     
     # Create permanent task for subscription handler (like nwcprovider does)
     task = create_permanent_unique_task("ext_cyberherd_subscriptions", cyberherd_subscription_handler)
@@ -296,7 +308,7 @@ def init_extension(app):
                 from .crud import db as _cdb, get_settings
                 from .utils.common import is_extension_enabled_for_user
                 try:
-                    rows = await _cdb.fetchall("SELECT user_id FROM cyberherd.settings WHERE zap_tracking_enabled = 1")
+                    rows = await _cdb.fetchall(f"SELECT user_id FROM {_cdb.references_schema}settings WHERE zap_tracking_enabled = 1")
                 except Exception as db_err:
                     # Tables might not exist yet if migrations haven't run
                     logger.info(f"Cyberherd: skipping zap monitor startup (init_extension), database not ready: {db_err}")
@@ -457,7 +469,7 @@ async def _start_zap_monitoring_if_enabled(app):
                 from lnbits.db import Database
                 db = Database("ext_cyberherd")
                 row = await db.fetchone(
-                    "SELECT user_id FROM cyberherd.settings WHERE zap_tracking_enabled = 1 LIMIT 1"
+                    f"SELECT user_id FROM {db.references_schema}settings WHERE zap_tracking_enabled = 1 LIMIT 1"
                 )
                 if row and row.get('user_id'):
                     user_id = row['user_id']
@@ -500,7 +512,7 @@ async def _warm_start_today_cache_and_recovery(app):
 
         logger.info("Cyberherd warm start: begin recovery")
         try:
-            rows = await crud.db.fetchall("SELECT user_id FROM cyberherd.settings")
+            rows = await crud.db.fetchall(f"SELECT user_id FROM {crud.db.references_schema}settings")
             logger.info(f"Cyberherd warm start: database query succeeded, got {len(rows or [])} rows")
         except Exception as db_err:
             logger.warning(f"Cyberherd warm start: database query failed: {db_err}")

@@ -9,7 +9,7 @@ import pytest
 
 import lnbits.db as db_module
 from lnbits.db import POSTGRES, SQLITE, Database
-from lnbits.extensions.cyberherd import crud
+from lnbits.extensions.cyberherd import crud, migrations
 from lnbits.extensions.cyberherd.services import headbutt, messaging, subscriptions
 from lnbits.settings import settings
 
@@ -60,6 +60,7 @@ async def social_db(request, monkeypatch, tmp_path):
             pubkey TEXT, processed_at INTEGER NOT NULL, event_type TEXT,
             UNIQUE (user_id, event_hash, note_id)
         )""")
+        await migrations._create_engagement_awards(database)
         for pubkey in (ALICE, BOB):
             await database.execute(
                 f"INSERT INTO {schema}cyber_herd "
@@ -111,15 +112,18 @@ async def scenario(social_db, monkeypatch):
     async def websocket_topic(self):
         return "test-topic"
 
-    async def query_note_events(*args, **kwargs):
-        from lnbits.extensions.cyberherd.services.time_utils import get_day_boundaries_utc
-        return [{"id": NOTE, "pubkey": "f" * 64, "kind": 1,
-                 "created_at": get_day_boundaries_utc().local_since_ts + 1,
-                 "tags": [], "content": ""}]
+    async def query_events(filters, **kwargs):
+        if 1 in filters.get("kinds", []) or filters.get("ids") == [NOTE]:
+            from lnbits.extensions.cyberherd.services.time_utils import get_day_boundaries_utc
 
-    monkeypatch.setattr(subscriptions.nostr_helpers, "check_availability", lambda: True)
-    monkeypatch.setattr(subscriptions.nostr_helpers, "query_events", query_note_events)
+            return [{"id": NOTE, "pubkey": "f" * 64, "kind": 1,
+                     "created_at": int(get_day_boundaries_utc().local_since_ts) + 1,
+                     "tags": [], "content": ""}]
+        return []
+
     monkeypatch.setattr(crud, "get_settings", get_settings)
+    monkeypatch.setattr(subscriptions.nostr_helpers, "query_events", query_events)
+    monkeypatch.setattr(subscriptions.nostr_helpers, "check_availability", lambda: True)
     monkeypatch.setattr(subscriptions, "get_effective_pubkey", lambda s: "f" * 64)
     monkeypatch.setattr(
         subscriptions.nostr_helpers, "verify_event_signature", lambda event: True
@@ -256,3 +260,83 @@ async def test_other_user_or_note_marker_does_not_block_new_engagement(scenario)
     await deliver(scenario, event)
     assert await active_members() == {ALICE}
     assert await crud.is_event_processed(OWNER, event["id"], note_id=NOTE)
+
+
+@pytest.mark.anyio
+async def test_legacy_payment_ledger_repair_commits_membership_once(scenario, monkeypatch):
+    from lnbits.extensions.cyberherd import migrations
+    from lnbits.extensions.cyberherd.services import zap_totals
+
+    database = scenario.db
+    if database.type != POSTGRES:
+        pytest.skip("legacy PostgreSQL constraints")
+    schema = database.references_schema
+    await database.execute(f"""CREATE TABLE {schema}processed_zaps (
+        id SERIAL PRIMARY KEY, user_id TEXT NOT NULL,
+        zap_receipt_id TEXT NOT NULL, payment_hash TEXT NOT NULL,
+        note_id TEXT NOT NULL, zapper_pubkey TEXT NOT NULL,
+        amount_sats INTEGER NOT NULL, processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        event_id TEXT, amount INTEGER, UNIQUE(user_id, zap_receipt_id))""")
+    await database.execute(f"""INSERT INTO {schema}processed_zaps
+        (user_id,zap_receipt_id,payment_hash,note_id,zapper_pubkey,amount_sats)
+        VALUES ('old-owner','receipt','old-hash','old-note','old-zapper',42)""")
+    old_row = dict(await database.fetchone(f"SELECT * FROM {schema}processed_zaps"))
+    await database.execute(f"""CREATE TABLE {schema}zap_totals (
+        user_id TEXT NOT NULL, zapper_pubkey TEXT NOT NULL,
+        total_sats INTEGER NOT NULL DEFAULT 0, event_count INTEGER NOT NULL DEFAULT 0,
+        first_event_at INTEGER, last_event_at INTEGER, last_event_ids TEXT,
+        last_updated_at REAL NOT NULL, target_pubkey TEXT,
+        PRIMARY KEY (user_id, zapper_pubkey))""")
+
+    async def metadata(self, attacker):
+        return {}, None
+
+    monkeypatch.setattr(headbutt.EnhancedHeadbuttService, "_resolve_attacker_metadata", metadata)
+    payment_hash = "3" * 64
+
+    async def claim():
+        if await crud.is_payment_processed(OWNER, payment_hash, strict=True):
+            return False
+        return await crud.register_processed_event(
+            OWNER, payment_hash, note_id=NOTE, pubkey=ALICE, event_type="payment_zap"
+        )
+
+    async def account():
+        await zap_totals.record_incremental_zap_total(
+            user_id=OWNER, zapper_pubkey=ALICE, target_pubkey="f" * 64,
+            amount_sats=21, event_id=payment_hash, skip_member_check=True,
+        )
+
+    def service():
+        return headbutt.EnhancedHeadbuttService(db=crud, messaging_module=messaging, user_id=OWNER)
+
+    def attacker():
+        return headbutt._Attacker(ALICE, 21, kinds=[9735], note_id=NOTE, event_id=payment_hash)
+
+    await migrations.m039_repair_processed_zap_timestamp(database)
+    await database.engine.dispose()
+    with pytest.raises(Exception, match="zap_receipt_id"):
+        await service().attempt_headbutt(attacker(), payment_effect=claim, payment_success=account)
+    assert await active_members() == set()
+    assert not await crud.is_payment_processed(OWNER, payment_hash, strict=True)
+    assert not scenario.announcements
+
+    for _ in range(2):
+        await migrations.m040_repair_processed_zap_nullability(database)
+    new_row = dict(await database.fetchone(f"SELECT * FROM {schema}processed_zaps"))
+    from datetime import datetime
+    # PostgreSQL's timestamp-to-text cast omits insignificant fractional zeros.
+    assert datetime.fromisoformat(new_row["processed_at"]) == datetime.fromisoformat(str(old_row["processed_at"]))
+    assert {k: v for k, v in new_row.items() if k != "processed_at"} == {
+        k: v for k, v in old_row.items() if k != "processed_at"
+    }
+    result = await service().attempt_headbutt(attacker(), payment_effect=claim, payment_success=account)
+    assert result["status"] == "reactivated"
+    assert await active_members() == {ALICE}
+    assert await crud.is_payment_processed(OWNER, payment_hash, strict=True)
+    duplicate = await service().attempt_headbutt(attacker(), payment_effect=claim, payment_success=account)
+    assert duplicate == {"status": "duplicate"}
+    member = await crud.get_cyberherd_member_by_pubkey(ALICE, OWNER)
+    assert member["amount"] == 21
+    totals = await crud.get_zap_totals_row(OWNER, ALICE)
+    assert (totals["total_sats"], totals["event_count"]) == (21, 1)

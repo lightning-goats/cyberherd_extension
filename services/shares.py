@@ -32,7 +32,9 @@ def _parse_kinds(value: Any) -> Set[int]:
         return kinds
 
     if isinstance(value, str):
-        tokens = [token.strip() for token in value.split(",") if token and token.strip()]
+        tokens = [
+            token.strip() for token in value.split(",") if token and token.strip()
+        ]
         for token in tokens:
             try:
                 kinds.add(int(token))
@@ -98,131 +100,62 @@ def _proportional_percentages(weights: List[int], total: int = 100) -> List[int]
     return floors
 
 
+def member_point_units(member: Dict[str, Any], minimum_sats: int = 10) -> int:
+    """Exact score multiplied by the joining minimum; no floating-point weights."""
+    basis = max(1, int(minimum_sats))
+    try:
+        amount = max(0, int(member.get("amount") or 0))
+    except (TypeError, ValueError):
+        amount = 0
+    kinds = _parse_kinds(member.get("engagement_kinds", member.get("kinds")))
+    return 10 * amount + basis * (3 * int(6 in kinds) + int(7 in kinds))
+
+
 def compute_member_share_percentages(
-    members: Iterable[Dict[str, Any]], member_total: int
+    members: Iterable[Dict[str, Any]], member_total: int, minimum_sats: int = 10
 ) -> Dict[str, float]:
-    """Compute per-member share percentages for the member allocation block.
+    """Divide the member pool by cumulative zap, first-repost and first-like points.
 
-    Share allocation per the CyberHerd spec:
-    - Engagement-only members (kind 6/7, no zaps) receive exactly 1% each
-    - Zappers receive a proportional share of the remaining pool based on
-      zap amount (no guaranteed minimum)
-    - Members with BOTH engagement AND zaps receive 1% for engagement PLUS
-      their proportional zap share from the remaining pool
-
-    For example, with member_total=10, 1 engagement-only and 2 zappers:
-    - Reserved for engagement: 1% (1 engagement-only member)
-    - Zap pool = 9% (distributed proportionally by zap amount)
-    - Engagement-only member gets: 1%
-    - Each zapper gets: their proportional share of 9%
-
-    Args:
-        members: Iterable of member row dictionaries. Only active members
-            contribute to the distribution.
-        member_total: Total percentage available for members (e.g. 10 or 100).
-
-    Returns:
-        Mapping of normalized pubkey -> percentage of the full payment.
-        Proportional amounts retain six decimal places of percentage precision.
-        Members that are inactive, missing a pubkey, or otherwise ineligible
-        will appear in the mapping with a value of 0.
+    A minimum qualifying zap earns 10 points, repost earns 3, like earns 1.
+    Each additional sat adds 10/minimum points. Durable engagement_kinds take
+    precedence over the current membership's kinds (which eviction can clear).
+    Round the pool to micro-percentage units with stable largest remainders.
     """
-    safe_total = max(0, int(member_total))
+    total = max(0, int(member_total))
     shares: Dict[str, float] = {}
-    active_records: List[Dict[str, Any]] = []
-
-    for raw in members:
-        if not isinstance(raw, dict):
+    eligible = []
+    for member in members:
+        if not isinstance(member, dict):
             continue
-
-        pubkey = _normalize_pubkey(raw.get("pubkey"))
+        pubkey = _normalize_pubkey(member.get("pubkey"))
         if not pubkey:
             continue
-
-        # Default every seen pubkey to zero so callers can update inactive rows.
-        shares.setdefault(pubkey, 0)
-
-        is_active_flag = raw.get("is_active", 0)
-        try:
-            is_active = bool(is_active_flag) if isinstance(is_active_flag, bool) else int(is_active_flag) == 1
-        except Exception:
-            is_active = False
-
-        if not is_active:
+        shares[pubkey] = 0.0
+        if int(member.get("is_active") or 0) != 1 or member.get("banned"):
             continue
-
-        try:
-            amount = int(raw.get("amount") or 0)
-        except Exception:
-            amount = 0
-        amount = max(0, amount)
-
-        kinds_set = _parse_kinds(raw.get("kinds"))
-        has_kind_6 = 6 in kinds_set
-        has_kind_7 = 7 in kinds_set
-
-        active_records.append(
-            {
-                "pubkey": pubkey,
-                "amount": amount,
-                "has_engagement": has_kind_6 or has_kind_7,
-            }
-        )
-
-    if safe_total <= 0 or not active_records:
+        weight = member_point_units(member, minimum_sats)
+        if weight > 0:
+            eligible.append((pubkey, weight))
+    eligible.sort()  # deterministic ties, independent of database row order
+    weight_sum = sum(weight for _, weight in eligible)
+    if not weight_sum or not total:
         return shares
-
-    # Identify qualifying members (have engagement OR have zaps)
-    qualifying_members = [r for r in active_records if r["has_engagement"] or r["amount"] > 0]
-
-    if not qualifying_members:
-        return shares
-
-    # --- Step 1: Reserve 1% for each member with engagement (kind 6/7) ---
-    engagement_members = [r for r in qualifying_members if r["has_engagement"]]
-    num_engagement = len(engagement_members)
-
-    # Edge case: more engagement members than total available percentage
-    if num_engagement > safe_total:
-        even_percents = _proportional_percentages([1] * num_engagement, total=safe_total)
-        for record, pct in zip(engagement_members, even_percents):
-            shares[record["pubkey"]] = pct
-        return shares
-
-    # Grant each engagement member their 1% allocation
-    for record in engagement_members:
-        shares[record["pubkey"]] = 1
-
-    # --- Step 2: Distribute remaining pool proportionally by zap amount ---
-    remaining_pool = safe_total - num_engagement
-    if remaining_pool <= 0:
-        return shares
-
-    zappers = [r for r in qualifying_members if r["amount"] > 0]
-    total_zap_amount = sum(r["amount"] for r in zappers)
-
-    if zappers and total_zap_amount > 0:
-        weights = [record["amount"] for record in zappers]
-        # Allocate micro-percentage units using exact integer division. This
-        # preserves proportional shares instead of rounding to whole percent.
-        units = remaining_pool * 1_000_000
-        allocated = [units * weight // total_zap_amount for weight in weights]
-        remainder = units - sum(allocated)
-        order = sorted(range(len(weights)),
-                       key=lambda i: (units * weights[i]) % total_zap_amount,
-                       reverse=True)
-        for index in order[:remainder]:
-            allocated[index] += 1
-        zap_percents = [value / 1_000_000 for value in allocated]
-        for record, pct in zip(zappers, zap_percents):
-            shares[record["pubkey"]] = shares.get(record["pubkey"], 0) + pct
-    # If there are no zappers, the remaining pool is intentionally left
-    # unallocated so engagement members stay at exactly 1% each.
-
+    units = total * 1_000_000
+    allocated = [units * weight // weight_sum for _, weight in eligible]
+    remainder = units - sum(allocated)
+    order = sorted(
+        range(len(eligible)),
+        key=lambda i: (-(units * eligible[i][1] % weight_sum), eligible[i][0]),
+    )
+    for index in order[:remainder]:
+        allocated[index] += 1
+    for (pubkey, _), amount in zip(eligible, allocated):
+        shares[pubkey] = amount / 1_000_000
     return shares
 
 
 __all__ = [
     "_proportional_percentages",
     "compute_member_share_percentages",
+    "member_point_units",
 ]

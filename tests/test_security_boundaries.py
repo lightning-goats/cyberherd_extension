@@ -1,6 +1,5 @@
 import json
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock
 import os
 import time
 from datetime import datetime
@@ -18,18 +17,18 @@ from lnbits.extensions.cyberherd.services import nostr_websocket_monitor
 from lnbits.extensions.cyberherd.services import subscriptions
 
 
-@pytest.fixture(autouse=True)
-def isolate_new_admission_boundaries(monkeypatch):
-    # These unit tests replace CRUD with small fakes; lifecycle/transaction
-    # integration is covered by disposable database tests.
-    from lnbits.extensions.cyberherd import tasks
-
+@pytest.fixture
+def fake_admission_transaction(monkeypatch):
+    """Guard-only unit tests use fake storage; DB atomicity is tested separately."""
     @asynccontextmanager
     async def transaction(**kwargs):
         yield
 
-    monkeypatch.setattr(tasks, "ensure_membership_day", AsyncMock(return_value=[]))
+    async def ensure_day(*args, **kwargs):
+        return []
+
     monkeypatch.setattr(headbutt.crud, "admission_transaction", transaction)
+    monkeypatch.setattr("lnbits.extensions.cyberherd.tasks.ensure_membership_day", ensure_day)
 
 
 def _settings(**overrides):
@@ -368,7 +367,7 @@ def test_local_day_boundaries_handle_dst_spring_forward(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_open_slot_zap_enforces_configured_membership_minimum(monkeypatch):
+async def test_open_slot_zap_enforces_configured_membership_minimum(monkeypatch, fake_admission_transaction):
     # With minimum_sats configured to 50, a 10-sat zap must be rejected even when
     # a slot is open (cyberherd_explanation.md: the minimum is configurable).
     note_id = "c" * 64
@@ -519,7 +518,7 @@ async def test_payment_recovery_uses_supplied_tracked_settings(monkeypatch):
     )
     captured = {}
 
-    async def fake_get_payments(wallet_id, incoming, since, filters, complete):
+    async def fake_get_payments(wallet_id, incoming, since, complete, filters):
         return [SimpleNamespace(wallet_id="herd-wallet-id", extra={"nostr": "{}"})]
 
     async def fake_process_payment_for_zap(self, payment, settings_override=None):
@@ -552,7 +551,7 @@ async def test_payment_recovery_scans_when_tracked_ids_empty(monkeypatch):
     )
     captured = {"processed": 0}
 
-    async def fake_get_payments(wallet_id, incoming, since, filters, complete):
+    async def fake_get_payments(wallet_id, incoming, since, complete, filters):
         return [SimpleNamespace(wallet_id="herd-wallet-id", extra={"nostr": "{}"})]
 
     async def fake_process_payment_for_zap(self, payment, settings_override=None):
@@ -815,9 +814,9 @@ async def test_payment_zap_uses_relay_hints_for_opportunistic_tracking(monkeypat
         ],
     }
     payment = SimpleNamespace(
-        success=True,
         wallet_id="herd-wallet-id",
         amount=33_000,
+        success=True,
         extra={"nostr": zap_request},
         payment_hash="e" * 64,
         checking_id="e" * 64,
@@ -870,12 +869,18 @@ async def test_payment_zap_uses_relay_hints_for_opportunistic_tracking(monkeypat
     # here since this mock zap request is unsigned.
     monkeypatch.setattr(subscriptions.nostr_helpers, "verify_event_signature", lambda event: True)
 
-    async def fake_trigger(*args, **kwargs):
-        return {"status": "duplicate"}
-    monkeypatch.setattr(payment_coordinator, "trigger_headbutt_from_zap", fake_trigger)
-    async def fake_is_payment_processed(*args, **kwargs):
+    async def not_processed(*args, **kwargs):
         return False
-    monkeypatch.setattr(payment_coordinator.crud, "is_payment_processed", fake_is_payment_processed)
+
+    monkeypatch.setattr(payment_coordinator.crud, "is_payment_processed", not_processed)
+    async def admitted(**kwargs):
+        return {"status": "new"}
+
+    monkeypatch.setattr(payment_coordinator, "trigger_headbutt_from_zap", admitted)
+    async def no_broadcast(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("lnbits.extensions.cyberherd.services.leaderboard.broadcast_leaderboard_update", no_broadcast)
     monitor = payment_coordinator.PaymentCoordinatorService(user_id="user-id")
 
     ok = await monitor._process_payment_for_zap(payment, settings_override=settings)
@@ -900,9 +905,9 @@ async def test_payment_recovery_rejects_previous_day_tracked_note_for_new_member
         nostr_pubkey_override=target_pubkey,
     )
     payment = SimpleNamespace(
-        success=True,
         wallet_id="herd-wallet-id",
         amount=33_000,
+        success=True,
         extra={
             "nostr": {
                 "kind": 9734,
@@ -915,7 +920,7 @@ async def test_payment_recovery_rejects_previous_day_tracked_note_for_new_member
     )
     captured = {"headbutts": 0, "registered": 0}
 
-    async def fake_get_payments(wallet_id, incoming, since, filters, complete):
+    async def fake_get_payments(wallet_id, incoming, since, complete, filters):
         assert since == boundaries.local_since_ts - 60
         return [payment]
 
@@ -958,9 +963,10 @@ async def test_payment_recovery_rejects_previous_day_tracked_note_for_new_member
     # check so the unsigned mock zap request reaches it.
     monkeypatch.setattr(subscriptions.nostr_helpers, "verify_event_signature", lambda event: True)
 
-    async def fake_is_payment_processed(*args, **kwargs):
+    async def not_processed(*args, **kwargs):
         return False
-    monkeypatch.setattr(payment_coordinator.crud, "is_payment_processed", fake_is_payment_processed)
+
+    monkeypatch.setattr(payment_coordinator.crud, "is_payment_processed", not_processed)
     monitor = payment_coordinator.PaymentCoordinatorService(user_id="user-id")
 
     result = await monitor._recover_missed_payment_zaps(settings)
@@ -1091,7 +1097,7 @@ async def test_headbutt_evicts_victim_only_after_successful_admission(monkeypatc
 
 
 @pytest.mark.anyio
-async def test_reaction_cannot_headbutt_when_herd_full(monkeypatch):
+async def test_reaction_cannot_headbutt_when_herd_full(monkeypatch, fake_admission_transaction):
     """cyberherd_explanation.md scenario 9: a reaction (kind 7) can NEVER
     headbutt. When the herd is full it is rejected and displaces no member,
     and the reactor is notified of the failure."""
@@ -1105,6 +1111,9 @@ async def test_reaction_cannot_headbutt_when_herd_full(monkeypatch):
     notified = {}
 
     class FakeDb:
+        async def get_engagement_kinds(self, pubkey, user_id):
+            return []
+
         async def is_event_processed(
             self, user_id, event_hash, note_id=None, *, strict=False
         ):
@@ -1162,7 +1171,7 @@ async def test_reaction_cannot_headbutt_when_herd_full(monkeypatch):
     [(7, "existing_member_reaction"), (6, "existing_member_repost")],
 )
 async def test_existing_member_reengagement_uses_existing_member_category(
-    monkeypatch, kind, expected_event_type
+    monkeypatch, kind, expected_event_type, fake_admission_transaction
 ):
     """Regression: an EXISTING herd member who reposts/reacts again must NOT be
     welcomed as a new join.
@@ -1184,6 +1193,9 @@ async def test_existing_member_reengagement_uses_existing_member_category(
     published = {}
 
     class FakeDb:
+        async def get_engagement_kinds(self, pubkey, user_id):
+            return []
+
         async def is_event_processed(
             self, user_id, event_hash, note_id=None, *, strict=False
         ):
@@ -1340,3 +1352,57 @@ async def test_force_reconnect_closes_socket_and_resets_marker():
 
     assert closed["n"] == 1
     assert monitor.last_ws_event_at > 0.0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("valid_signature", [True, False])
+async def test_background_note_validation_needs_no_app(monkeypatch, valid_signature):
+    owner = "b" * 64
+    note = "a" * 64
+    boundaries = time_utils.get_day_boundaries_utc()
+    settings = _settings(nostr_pubkey_override=owner)
+
+    async def get_settings(user_id):
+        return settings
+
+    async def query_events(filters, **kwargs):
+        assert filters["authors"] == [owner]
+        return [{"id": note, "pubkey": owner, "kind": 1,
+                 "created_at": int(boundaries.local_since_ts) + 1,
+                 "tags": [["t", "CyberHerd"]]}]
+
+    monkeypatch.setattr(headbutt.nostr_helpers, "query_events", query_events)
+    monkeypatch.setattr(headbutt.nostr_helpers, "verify_event_signature", lambda event: valid_signature)
+    service = headbutt.EnhancedHeadbuttService(
+        db=SimpleNamespace(get_settings=get_settings), messaging_module=SimpleNamespace(),
+        user_id="user-id", app=None,
+    )
+    assert await service._get_today_cyberherd_notes() == ([note] if valid_signature else [])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("successful", [0, 1])
+async def test_recovery_reports_successes_separately_from_attempts(monkeypatch, successful):
+    settings = _settings()
+
+    async def get_settings(user_id):
+        return settings
+
+    async def requery(app, user_id):
+        return []
+
+    async def recover(settings):
+        return {"scanned": 1, "processed": 1, "successful": successful}
+
+    async def payload():
+        return {}
+
+    monkeypatch.setattr(views_api.crud, "get_settings", get_settings)
+    monkeypatch.setattr(subscriptions, "force_requery_for_user", requery)
+    monkeypatch.setattr(views_api, "get_zap_monitor", lambda **kwargs: SimpleNamespace(_recover_missed_payment_zaps=recover))
+    request = SimpleNamespace(json=payload, query_params={}, app=SimpleNamespace())
+    wallet_info = SimpleNamespace(wallet=SimpleNamespace(user="user-id"))
+    result = await views_api.api_recover_events(request, wallet_info)
+    result = json.loads(result.body)["diagnostics"]
+    assert result["zaps"]["processed"] == successful
+    assert result["zaps"]["processing_attempts"] == 1

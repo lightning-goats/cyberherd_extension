@@ -8,10 +8,46 @@ For existing installations, the old migrations (m001-m020) remain to ensure
 proper upgrade paths. New installations can use just m001_consolidated.
 """
 
-from lnbits.db import POSTGRES, Database
+from lnbits.db import COCKROACH, POSTGRES, SQLITE, Database
 import logging
+from contextlib import asynccontextmanager
+
+from sqlalchemy.sql import text
 
 logger = logging.getLogger(__name__)
+
+
+class _MigrationConnection:
+    """Execute DDL within one transaction instead of committing each statement."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    async def execute(self, query, values=None):
+        conn = self.connection
+        return await conn.conn.execute(
+            text(conn.rewrite_query(query)), conn.rewrite_values(values or {})
+        )
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+
+@asynccontextmanager
+async def _migration_transaction(database):
+    if isinstance(database, Database):
+        async with database.connect() as connection:
+            async with _migration_transaction(connection) as transaction:
+                yield transaction
+        return
+    connection = database.conn
+    already_started = connection.in_transaction()
+    transaction = connection.begin_nested() if already_started else connection.begin()
+    async with transaction:
+        if database.type == SQLITE and not already_started:
+            # sqlite's legacy transaction mode does not BEGIN for DDL alone.
+            await connection.exec_driver_sql("BEGIN")
+        yield _MigrationConnection(database)
 
 
 async def _column_exists(db: Database, schema_table: str, column: str) -> bool:
@@ -22,15 +58,14 @@ async def _column_exists(db: Database, schema_table: str, column: str) -> bool:
     statement aborts the whole transaction, which would silently break every
     subsequent migration; catching the error is not enough because the
     transaction is already poisoned. Works on Postgres (information_schema) and
-    SQLite (PRAGMA), returning False on any error.
+    SQLite (PRAGMA), propagating storage errors.
     """
     if "." in schema_table:
         schema, table = schema_table.split(".", 1)
     else:
         schema, table = None, schema_table
 
-    # Postgres / Cockroach: information_schema.
-    try:
+    if db.type in (POSTGRES, COCKROACH):
         params = {"table": table, "col": column}
         if schema:
             query = (
@@ -45,14 +80,10 @@ async def _column_exists(db: Database, schema_table: str, column: str) -> bool:
                 "WHERE table_name = :table AND column_name = :col LIMIT 1"
             )
         row = await db.fetchone(query, params)
-        if row:
-            return True
-    except Exception:
-        # Not Postgres, or information_schema unavailable — fall through.
-        pass
+        return row is not None
 
     # SQLite: PRAGMA table_info.
-    try:
+    if db.type == SQLITE:
         rows = await db.fetchall(f"PRAGMA table_info({table})")
         for r in rows:
             try:
@@ -61,8 +92,6 @@ async def _column_exists(db: Database, schema_table: str, column: str) -> bool:
                 name = None
             if name == column:
                 return True
-    except Exception:
-        pass
 
     return False
 
@@ -85,12 +114,9 @@ async def _add_column_if_missing(
         )
         logger.info(f"CyberHerd migration: added column {schema_table}.{column}")
     except Exception as e:
-        # Tolerate a concurrent add / benign duplicate race; anything else is
-        # logged for visibility but not fatal.
-        msg = str(e).lower()
-        if any(t in msg for t in ("duplicate", "already exists")):
-            return
+        # Propagate failures so the runner cannot record a false success.
         logger.warning(f"CyberHerd migration: could not add {schema_table}.{column}: {e}")
+        raise
 
 # Expose ordered list of migration function names
 __all__ = [
@@ -116,6 +142,11 @@ __all__ = [
     'm036_repair_postgres_member_key',
     'm037_add_membership_reset_days',
     'm038_preserve_payout_precision',
+    'm039_repair_processed_zap_timestamp',
+    'm040_repair_processed_zap_nullability',
+    'm041_repair_database_contract',
+    'm042_add_engagement_awards',
+    'm043_add_treat_delivery_records',
 ]
 
 logger.info(f"CYBERHERD MIGRATIONS: Registered {len(__all__)} migrations: {__all__}")
@@ -133,19 +164,17 @@ async def m001_consolidated_schema(db: Database):
     logger.info("=" * 60)
     
     # Create schema for Postgres/Cockroach (ignored on SQLite)
-    try:
+    if db.type in (POSTGRES, COCKROACH):
         logger.info("CYBERHERD m001: Creating schema...")
-        await db.execute("CREATE SCHEMA IF NOT EXISTS cyberherd;")
+        await db.execute(f"CREATE SCHEMA IF NOT EXISTS {db.schema};")
         logger.info("CYBERHERD m001: Schema created successfully")
-    except Exception as e:
-        logger.warning(f"CYBERHERD m001: Schema creation error (may be SQLite): {e}")
     
     # -------------------------------------------------------------------------
     # Settings Table - User Configuration
     # -------------------------------------------------------------------------
     await db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cyberherd.settings (
+        f"""
+        CREATE TABLE IF NOT EXISTS {db.references_schema}settings (
             -- Core settings
             source_wallet TEXT,
             max_members INTEGER DEFAULT 3,
@@ -163,8 +192,8 @@ async def m001_consolidated_schema(db: Database):
             
             -- Tracking configuration
             tracked_event_ids TEXT,
-            tracked_event_timestamps TEXT DEFAULT '{}',
-            tracked_event_addresses TEXT DEFAULT '{}',
+            tracked_event_timestamps TEXT DEFAULT '{{}}',
+            tracked_event_addresses TEXT DEFAULT '{{}}',
             zap_tracking_enabled INTEGER DEFAULT 1,
             zap_monitor_mode TEXT DEFAULT 'websocket',
             repost_tracking_enabled INTEGER DEFAULT 0,
@@ -185,17 +214,17 @@ async def m001_consolidated_schema(db: Database):
     # Index for multi-user queries
     try:
         await db.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_settings_user ON cyberherd.settings(user_id) WHERE user_id IS NOT NULL;"
+            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_settings_user ON {db.references_schema}settings(user_id) WHERE user_id IS NOT NULL;"
         )
     except Exception:
-        pass
+        raise
     
     # -------------------------------------------------------------------------
     # Cyber Herd Table - Active Members (Legacy, kept for compatibility)
     # -------------------------------------------------------------------------
     await db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cyberherd.cyber_herd (
+        f"""
+        CREATE TABLE IF NOT EXISTS {db.references_schema}cyber_herd (
             pubkey TEXT NOT NULL,
             display_name TEXT,
             event_id TEXT,
@@ -221,23 +250,23 @@ async def m001_consolidated_schema(db: Database):
     # Indices for performance
     try:
         await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_id ON cyberherd.cyber_herd(user_id);"
+            f"CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_id ON {db.references_schema}cyber_herd(user_id);"
         )
         await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_active ON cyberherd.cyber_herd(user_id, is_active);"
+            f"CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_active ON {db.references_schema}cyber_herd(user_id, is_active);"
         )
         await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_banned ON cyberherd.cyber_herd(user_id, banned);"
+            f"CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_banned ON {db.references_schema}cyber_herd(user_id, banned);"
         )
     except Exception:
-        pass
+        raise
     
     # -------------------------------------------------------------------------
     # Members Table - New member tracking system
     # -------------------------------------------------------------------------
     await db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cyberherd.members (
+        f"""
+        CREATE TABLE IF NOT EXISTS {db.references_schema}members (
             pubkey TEXT PRIMARY KEY,
             amount INTEGER NOT NULL DEFAULT 0,
             allocation_percentage REAL NOT NULL DEFAULT 10.0,
@@ -259,7 +288,7 @@ async def m001_consolidated_schema(db: Database):
     # -------------------------------------------------------------------------
     await db.execute(
         f"""
-        CREATE TABLE IF NOT EXISTS cyberherd.processed_zaps (
+        CREATE TABLE IF NOT EXISTS {db.references_schema}processed_zaps (
             id {db.serial_primary_key},
             user_id TEXT NOT NULL,
             event_id TEXT,
@@ -279,29 +308,29 @@ async def m001_consolidated_schema(db: Database):
     # Indices for processed_zaps
     try:
         await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_event ON cyberherd.processed_zaps(user_id, event_id);"
+            f"CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_event ON {db.references_schema}processed_zaps(user_id, event_id);"
         )
         await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_note ON cyberherd.processed_zaps(user_id, note_id);"
+            f"CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_note ON {db.references_schema}processed_zaps(user_id, note_id);"
         )
         await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_zapper ON cyberherd.processed_zaps(user_id, zapper_pubkey);"
+            f"CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_zapper ON {db.references_schema}processed_zaps(user_id, zapper_pubkey);"
         )
         try:
             await db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_receipt ON cyberherd.processed_zaps(user_id, zap_receipt_id) WHERE zap_receipt_id IS NOT NULL;"
+                f"CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_receipt ON {db.references_schema}processed_zaps(user_id, zap_receipt_id) WHERE zap_receipt_id IS NOT NULL;"
             )
         except Exception:
-            pass
+            raise
     except Exception:
-        pass
+        raise
 
     # -------------------------------------------------------------------------
     # Zap Totals Table - Persist aggregated zap receipt summaries
     # -------------------------------------------------------------------------
     await db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cyberherd.zap_totals (
+        f"""
+        CREATE TABLE IF NOT EXISTS {db.references_schema}zap_totals (
             user_id TEXT NOT NULL,
             zapper_pubkey TEXT NOT NULL,
             total_sats INTEGER NOT NULL DEFAULT 0,
@@ -343,6 +372,7 @@ async def m001_consolidated_schema(db: Database):
         )
     except Exception as e:
         logger.info(f"CyberHerd m001: processed_events unique index: {e}")
+        raise
 
     logger.info("CyberHerd: consolidated schema migration completed")
 
@@ -403,6 +433,7 @@ async def m022_add_user_id_to_cyber_herd(db: Database):
         logger.info("CyberHerd m022: added indices for user_id column")
     except Exception as e:
         logger.info(f"CyberHerd m022 indices: {e}")
+        raise
 
 
 async def m023_add_tracked_event_addresses(db: Database):
@@ -436,80 +467,29 @@ async def m025_migrate_legacy_userids(db: Database):
     We avoid automatically assigning `cyber_herd` member rows because there is no reliable automatic
     cross-reference; use the diagnostics tool for manual/more aggressive migration of member rows.
     """
-    logger.info("CYBERHERD MIGRATION m025: migrating legacy settings rows to explicit user_id where possible")
-    settings_table = f"{db.references_schema}settings"
-    try:
-        # Find legacy settings rows with a source_wallet and no user_id
-        rows = await db.fetchall(
-            f"SELECT rowid AS rid, source_wallet FROM {settings_table} WHERE (user_id IS NULL OR TRIM(user_id) = '') AND source_wallet IS NOT NULL AND TRIM(source_wallet) != ''"
-        )
-    except Exception:
-        # Fallback for SQLite or other connections without schema prefix
-        try:
-            rows = await db.fetchall(
-                "SELECT rowid AS rid, source_wallet FROM settings WHERE (user_id IS NULL OR TRIM(user_id) = '') AND source_wallet IS NOT NULL AND TRIM(source_wallet) != ''"
-            )
-        except Exception as e:
-            logger.info(f"CyberHerd m025: could not enumerate legacy settings rows: {e}")
-            return
+    from lnbits.core.crud.wallets import get_wallet
 
-    if not rows:
-        logger.info("CyberHerd m025: no legacy settings rows to migrate")
-        return
-
-    migrated = 0
+    table = f"{db.references_schema}settings"
+    rows = await db.fetchall(
+        f"SELECT source_wallet FROM {table} "
+        "WHERE (user_id IS NULL OR TRIM(user_id) = '') "
+        "AND source_wallet IS NOT NULL AND TRIM(source_wallet) != '' "
+        "GROUP BY source_wallet HAVING COUNT(*) = 1"
+    )
     for row in rows:
-        source_wallet = row.get("source_wallet") if isinstance(row, dict) else row[1]
-        rid = row.get("rid") if isinstance(row, dict) else row[0]
-        if not source_wallet:
+        wallet = await get_wallet(row["source_wallet"])
+        if not wallet:
             continue
-        # Resolve owning user via core wallets table
-        try:
-            user_rows = await db.fetchall(
-                'SELECT "user" FROM wallets WHERE id = :wallet_id',
-                {"wallet_id": source_wallet},
-            )
-        except Exception:
-            try:
-                user_rows = await db.fetchall(
-                    'SELECT "user" FROM public.wallets WHERE id = :wallet_id',
-                    {"wallet_id": source_wallet},
-                )
-            except Exception:
-                continue
-        if not user_rows:
-            continue
-        user_id = user_rows[0].get("user") if isinstance(user_rows[0], dict) else user_rows[0][0]
-        if not user_id:
-            continue
-        # Check if user already has a settings row
-        try:
-            existing = await db.fetchall(
-                f"SELECT 1 FROM {settings_table} WHERE user_id = :uid LIMIT 1",
-                {"uid": user_id},
-            )
-        except Exception:
-            existing = []
-        if existing:
-            continue
-        # Update the legacy row
-        try:
+        existing = await db.fetchone(
+            f"SELECT 1 FROM {table} WHERE user_id = :uid",
+            {"uid": wallet.user},
+        )
+        if not existing:
             await db.execute(
-                f"UPDATE {settings_table} SET user_id = :uid WHERE rowid = :rid",
-                {"uid": user_id, "rid": rid},
+                f"UPDATE {table} SET user_id = :uid WHERE source_wallet = :wallet "
+                "AND (user_id IS NULL OR TRIM(user_id) = '')",
+                {"uid": wallet.user, "wallet": row["source_wallet"]},
             )
-            migrated += 1
-        except Exception as e:
-            logger.warning(f"CyberHerd m025: failed to migrate row {rid}: {e}")
-
-    logger.info(f"CyberHerd m025: migrated {migrated} legacy settings rows")
-
-
-async def m027_add_feeder_trigger_sats(db: Database):
-    """Add feeder_trigger_sats column to settings for external feeder logic."""
-    table_name = f"{db.references_schema}settings"
-    logger.info("CYBERHERD m027: Adding feeder_trigger_sats column to settings")
-    await _add_column_if_missing(db, table_name, "feeder_trigger_sats", "INTEGER DEFAULT 0")
 
 
 async def m026_add_zap_totals_table(db: Database):
@@ -536,12 +516,20 @@ async def m026_add_zap_totals_table(db: Database):
         logger.info("CyberHerd m026: zap_totals table ready")
     except Exception as e:
         logger.warning(f"CyberHerd m026: failed ensuring zap_totals table: {e}")
+        raise
+
+
+async def m027_add_feeder_trigger_sats(db: Database):
+    """Add feeder_trigger_sats column to settings for external feeder logic."""
+    table_name = f"{db.references_schema}settings"
+    logger.info("CYBERHERD m027: Adding feeder_trigger_sats column to settings")
+    await _add_column_if_missing(db, table_name, "feeder_trigger_sats", "INTEGER DEFAULT 0")
 
 
 async def m028_sync_processed_zaps_schema(db: Database):
     """Ensure processed_zaps table has the unified legacy/new columns."""
     logger.info("CYBERHERD m028: syncing processed_zaps table schema")
-    table_name = "cyberherd.processed_zaps"
+    table_name = f"{db.references_schema}processed_zaps"
     try:
         await db.execute(
             f"""
@@ -563,6 +551,7 @@ async def m028_sync_processed_zaps_schema(db: Database):
         )
     except Exception as e:
         logger.debug(f"CYBERHERD m028: base table ensure failed (may already exist): {e}")
+        raise
     columns_to_add = [
         ("event_id", "TEXT"),
         ("note_id", "TEXT"),
@@ -577,33 +566,31 @@ async def m028_sync_processed_zaps_schema(db: Database):
         await _add_column_if_missing(db, table_name, column, column_def)
 
     index_statements = [
-        "CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_event ON cyberherd.processed_zaps(user_id, event_id);",
-        "CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_note ON cyberherd.processed_zaps(user_id, note_id);",
-        "CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_zapper ON cyberherd.processed_zaps(user_id, zapper_pubkey);",
+        f"CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_event ON {db.references_schema}processed_zaps(user_id, event_id);",
+        f"CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_note ON {db.references_schema}processed_zaps(user_id, note_id);",
+        f"CREATE INDEX IF NOT EXISTS idx_processed_zaps_user_zapper ON {db.references_schema}processed_zaps(user_id, zapper_pubkey);",
     ]
     for stmt in index_statements:
         try:
             await db.execute(stmt)
         except Exception:
-            pass
+            raise
     try:
         await db.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_processed_zaps_user_event ON cyberherd.processed_zaps(user_id, event_id) WHERE event_id IS NOT NULL;"
+            f"CREATE UNIQUE INDEX IF NOT EXISTS uq_processed_zaps_user_event ON {db.references_schema}processed_zaps(user_id, event_id) WHERE event_id IS NOT NULL;"
         )
     except Exception:
-        pass
+        raise
     try:
         await db.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_processed_zaps_user_receipt ON cyberherd.processed_zaps(user_id, zap_receipt_id) WHERE zap_receipt_id IS NOT NULL;"
+            f"CREATE UNIQUE INDEX IF NOT EXISTS uq_processed_zaps_user_receipt ON {db.references_schema}processed_zaps(user_id, zap_receipt_id) WHERE zap_receipt_id IS NOT NULL;"
         )
     except Exception:
-        pass
-    try:
+        raise
+    if db.type != SQLITE:
         await db.execute(
-            "ALTER TABLE cyberherd.processed_zaps ALTER COLUMN processed_at TYPE TEXT USING processed_at::text;"
+            f"ALTER TABLE {db.references_schema}processed_zaps ALTER COLUMN processed_at TYPE TEXT USING processed_at::text;"
         )
-    except Exception:
-        pass
     logger.info("CYBERHERD m028: processed_zaps schema sync complete")
 
 
@@ -629,6 +616,7 @@ async def m030_add_banned_column(db: Database):
         logger.info("CYBERHERD m030: added index for banned column")
     except Exception as e:
         logger.info(f"CYBERHERD m030 index: {e}")
+        raise
 
 
 async def m031_add_send_splits_enabled(db: Database):
@@ -650,8 +638,8 @@ async def m032_enable_interaction_tracking(db: Database):
     try:
         # Enable repost tracking for all users where it's currently disabled (or NULL)
         await db.execute(
-            """
-            UPDATE cyberherd.settings 
+            f"""
+            UPDATE {db.references_schema}settings
             SET repost_tracking_enabled = 1 
             WHERE repost_tracking_enabled = 0 OR repost_tracking_enabled IS NULL;
             """
@@ -660,8 +648,8 @@ async def m032_enable_interaction_tracking(db: Database):
         
         # Enable likes tracking for all users where it's currently disabled (or NULL)
         await db.execute(
-            """
-            UPDATE cyberherd.settings 
+            f"""
+            UPDATE {db.references_schema}settings
             SET likes_tracking_enabled = 1 
             WHERE likes_tracking_enabled = 0 OR likes_tracking_enabled IS NULL;
             """
@@ -671,6 +659,7 @@ async def m032_enable_interaction_tracking(db: Database):
         logger.info("CYBERHERD m032: interaction tracking enabled successfully")
     except Exception as e:
         logger.warning(f"CYBERHERD m032: failed to enable interaction tracking: {e}")
+        raise
 
 
 async def m033_add_member_allocation_percent(db: Database):
@@ -691,99 +680,47 @@ async def m034_fix_processed_events_unique_constraint(db: Database):
     The new constraint is UNIQUE(user_id, event_hash, note_id) with note_id defaulting
     to empty string for NULL values to maintain uniqueness semantics.
     
-    This migration:
-    1. Creates a new table with the correct constraint
-    2. Migrates existing data (handling NULL note_ids)
-    3. Drops the old table and renames the new one
+    PostgreSQL is repaired in place. SQLite swaps tables only when the old
+    two-column uniqueness exists. Every statement in a swap is transactional;
+    duplicate identities fail the migration rather than discarding history.
     """
-    logger.info("CYBERHERD m034: fixing processed_events unique constraint to include note_id")
-    table_name = f"{db.references_schema}processed_events"
-    temp_table = f"{db.references_schema}processed_events_new"
-    
-    try:
-        # Step 1: Create new table with correct unique constraint
-        # Using COALESCE pattern in the unique index to handle NULL note_ids
-        await db.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {temp_table} (
-                user_id TEXT NOT NULL,
-                event_hash TEXT NOT NULL,
-                note_id TEXT DEFAULT '',
-                pubkey TEXT,
-                processed_at INTEGER NOT NULL,
-                event_type TEXT
-            );
-            """
+    async with _migration_transaction(db) as transaction:
+        table = f"{db.references_schema}processed_events"
+        if db.type != SQLITE:
+            constraints = await transaction.fetchall(
+                "SELECT c.conname, array_agg(a.attname ORDER BY k.ordinality) AS columns "
+                "FROM pg_constraint c "
+                "CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS k(attnum, ordinality) "
+                "JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=k.attnum "
+                "WHERE c.contype='u' AND c.conrelid=CAST(:table AS regclass) GROUP BY c.conname",
+                {"table": table},
+            )
+            for constraint in constraints:
+                if set(constraint["columns"]) == {"user_id", "event_hash"}:
+                    name = constraint["conname"].replace('"', '""')
+                    await transaction.execute(f'ALTER TABLE {table} DROP CONSTRAINT "{name}"')
+        else:
+            indexes = await transaction.fetchall("PRAGMA index_list(processed_events)")
+            pair_key = False
+            for index in indexes:
+                name = index["name"].replace('"', '""')
+                columns = await transaction.fetchall(f'PRAGMA index_info("{name}")')
+                if index["unique"] and {row["name"] for row in columns} == {"user_id", "event_hash"}:
+                    pair_key = True
+            if pair_key:
+                await transaction.execute("""CREATE TABLE processed_events_new (
+                    user_id TEXT NOT NULL, event_hash TEXT NOT NULL, note_id TEXT DEFAULT '',
+                    pubkey TEXT, processed_at INTEGER NOT NULL, event_type TEXT)""")
+                await transaction.execute("""INSERT INTO processed_events_new
+                    SELECT user_id,event_hash,COALESCE(note_id,''),pubkey,processed_at,event_type
+                    FROM processed_events""")
+                await transaction.execute("DROP TABLE processed_events")
+                await transaction.execute("ALTER TABLE processed_events_new RENAME TO processed_events")
+        await transaction.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_events_unique_triple "
+            f"ON {table}(user_id,event_hash,COALESCE(note_id,''))"
         )
-        
-        # Step 2: Create the unique index that handles the (user_id, event_hash, note_id) triple
-        # Using COALESCE to ensure NULL note_ids are treated as empty strings
-        try:
-            await db.execute(
-                f"""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_events_unique_triple 
-                ON {temp_table}(user_id, event_hash, COALESCE(note_id, ''));
-                """
-            )
-        except Exception as idx_e:
-            # Some databases may not support COALESCE in index - fall back to simpler approach
-            logger.debug(f"CYBERHERD m034: COALESCE index failed, trying simple index: {idx_e}")
-            try:
-                await db.execute(
-                    f"""
-                    CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_events_unique_triple 
-                    ON {temp_table}(user_id, event_hash, note_id);
-                    """
-                )
-            except Exception:
-                pass
-        
-        # Step 3: Migrate existing data, converting NULL note_ids to empty string
-        # and handling duplicates by keeping the earliest processed_at
-        try:
-            await db.execute(
-                f"""
-                INSERT INTO {temp_table} (user_id, event_hash, note_id, pubkey, processed_at, event_type)
-                SELECT 
-                    user_id, 
-                    event_hash, 
-                    COALESCE(note_id, '') as note_id,
-                    pubkey, 
-                    processed_at, 
-                    event_type
-                FROM {table_name}
-                WHERE user_id IS NOT NULL AND event_hash IS NOT NULL
-                ON CONFLICT DO NOTHING;
-                """
-            )
-            logger.info("CYBERHERD m034: migrated existing data to new table")
-        except Exception as migrate_e:
-            # If migration fails, the old table structure is still valid
-            # Just log and continue - the code will work with the old structure
-            logger.warning(f"CYBERHERD m034: data migration failed, keeping old table: {migrate_e}")
-            try:
-                await db.execute(f"DROP TABLE IF EXISTS {temp_table};")
-            except Exception:
-                pass
-            return
-        
-        # Step 4: Drop old table and rename new one
-        try:
-            await db.execute(f"DROP TABLE IF EXISTS {table_name};")
-            await db.execute(f"ALTER TABLE {temp_table} RENAME TO processed_events;")
-            logger.info("CYBERHERD m034: replaced old table with new schema")
-        except Exception as rename_e:
-            logger.warning(f"CYBERHERD m034: table swap failed: {rename_e}")
-            # Try to recover by keeping old table
-            try:
-                await db.execute(f"DROP TABLE IF EXISTS {temp_table};")
-            except Exception:
-                pass
-            return
-        
-        logger.info("CYBERHERD m034: processed_events unique constraint fixed successfully")
-    except Exception as e:
-        logger.warning(f"CYBERHERD m034: migration failed: {e}")
+
 
 
 async def m035_fix_cyber_herd_user_pubkey_key(db: Database):
@@ -793,14 +730,20 @@ async def m035_fix_cyber_herd_user_pubkey_key(db: Database):
     row overwrite another user's row when the same Nostr pubkey participates in
     more than one CyberHerd instance.
     """
+    if db.type == POSTGRES:
+        await m036_repair_postgres_member_key(db)
+        return
+    columns = await db.fetchall("PRAGMA table_info(cyber_herd)")
+    if {row["name"] for row in columns if row["pk"]} == {"user_id", "pubkey"}:
+        return
     logger.info("CYBERHERD m035: rebuilding cyber_herd with user-scoped primary key")
     table_name = f"{db.references_schema}cyber_herd"
     temp_table = f"{db.references_schema}cyber_herd_new"
 
-    try:
-        await db.execute(
+    async with _migration_transaction(db) as transaction:
+        await transaction.execute(
             f"""
-            CREATE TABLE IF NOT EXISTS {temp_table} (
+            CREATE TABLE {temp_table} (
                 pubkey TEXT NOT NULL,
                 display_name TEXT,
                 event_id TEXT,
@@ -828,9 +771,9 @@ async def m035_fix_cyber_herd_user_pubkey_key(db: Database):
             ("banned", "INTEGER DEFAULT 0"),
             ("user_id", "TEXT"),
         ):
-            await _add_column_if_missing(db, table_name, column, column_def)
+            await _add_column_if_missing(transaction, table_name, column, column_def)
 
-        await db.execute(
+        await transaction.execute(
             f"""
             INSERT INTO {temp_table} (
                 pubkey, display_name, event_id, note, kinds, nprofile, lud16,
@@ -856,31 +799,24 @@ async def m035_fix_cyber_herd_user_pubkey_key(db: Database):
                 COALESCE(NULLIF(TRIM(user_id), ''), ''),
                 COALESCE(banned, 0)
             FROM {table_name}
-            WHERE pubkey IS NOT NULL AND TRIM(pubkey) != ''
-            ON CONFLICT DO NOTHING;
+            ;
             """
         )
 
-        await db.execute(f"DROP TABLE IF EXISTS {table_name};")
-        await db.execute(f"ALTER TABLE {temp_table} RENAME TO cyber_herd;")
+        await transaction.execute(f"DROP TABLE IF EXISTS {table_name};")
+        await transaction.execute(f"ALTER TABLE {temp_table} RENAME TO cyber_herd;")
 
         rebuilt_table = table_name
-        await db.execute(
+        await transaction.execute(
             f"CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_id ON {rebuilt_table}(user_id);"
         )
-        await db.execute(
+        await transaction.execute(
             f"CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_active ON {rebuilt_table}(user_id, is_active);"
         )
-        await db.execute(
+        await transaction.execute(
             f"CREATE INDEX IF NOT EXISTS idx_cyber_herd_user_banned ON {rebuilt_table}(user_id, banned);"
         )
         logger.info("CYBERHERD m035: cyber_herd user-scoped primary key ready")
-    except Exception as e:
-        logger.warning(f"CYBERHERD m035: migration failed: {e}")
-        try:
-            await db.execute(f"DROP TABLE IF EXISTS {temp_table};")
-        except Exception:
-            pass
 
 
 async def m036_repair_postgres_member_key(db: Database):
@@ -950,3 +886,131 @@ async def m038_preserve_payout_precision(db: Database):
             f"ALTER TABLE {db.references_schema}cyber_herd "
             "ALTER COLUMN payouts TYPE DOUBLE PRECISION"
         )
+
+
+async def m039_repair_processed_zap_timestamp(db: Database):
+    """Repair legacy timestamp columns that reject the accounting ledger's text."""
+    if db.type != POSTGRES:
+        return
+    table = f"{db.references_schema}processed_zaps"
+    # Do not suppress errors: a recorded version must guarantee this repair.
+    # Preserve historical values and the legacy insertion-time default.
+    await db.execute(
+        f"ALTER TABLE {table} ALTER COLUMN processed_at TYPE TEXT "
+        "USING processed_at::text"
+    )
+
+
+async def m040_repair_processed_zap_nullability(db: Database):
+    """Allow payment-ledger rows without legacy Nostr receipt fields."""
+    if db.type != POSTGRES:
+        return
+    table = f"{db.references_schema}processed_zaps"
+    # Match the consolidated schema: settled invoices need no relay receipt,
+    # and profile zaps may have no note. Keep user_id and deduplication intact.
+    for column in (
+        "zap_receipt_id", "payment_hash", "note_id", "zapper_pubkey", "amount_sats"
+    ):
+        await db.execute(f"ALTER TABLE {table} ALTER COLUMN {column} DROP NOT NULL")
+    await db.execute(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS uq_processed_zaps_user_event "
+        f"ON {table}(user_id, event_id) WHERE event_id IS NOT NULL"
+    )
+
+
+async def m041_repair_database_contract(db: Database):
+    """Repair recorded historical migrations without replacing member data."""
+    await m034_fix_processed_events_unique_constraint(db)
+    await _add_column_if_missing(db, f"{db.references_schema}members", "alias", "TEXT")
+    await _add_column_if_missing(db, f"{db.references_schema}members", "added_at", "INTEGER")
+    await _add_column_if_missing(
+        db, f"{db.references_schema}cyber_herd", "allocation_percentage", "REAL"
+    )
+    if db.type == POSTGRES:
+        # Satoshi totals and Unix seconds are not limited to signed 32 bits.
+        for table, columns in (
+            ("cyber_herd", ("amount", "notified", "metadata_last_checked_at")),
+            ("members", ("amount",)),
+            ("processed_zaps", ("amount", "amount_sats")),
+            ("processed_events", ("processed_at",)),
+            ("zap_totals", ("total_sats", "first_event_at", "last_event_at")),
+        ):
+            for column in columns:
+                await db.execute(
+                    f"ALTER TABLE {db.references_schema}{table} ALTER COLUMN {column} TYPE BIGINT"
+                )
+        # float4 rounds epoch seconds by tens of seconds, breaking cache TTLs.
+        await db.execute(
+            f"ALTER TABLE {db.references_schema}zap_totals "
+            "ALTER COLUMN last_updated_at TYPE DOUBLE PRECISION"
+        )
+
+
+async def _create_engagement_awards(db):
+    await db.execute(f"""CREATE TABLE IF NOT EXISTS {db.references_schema}engagement_awards (
+        user_id TEXT NOT NULL, pubkey TEXT NOT NULL,
+        kind INTEGER NOT NULL CHECK (kind IN (6, 7)),
+        awarded_at BIGINT,
+        PRIMARY KEY (user_id, pubkey, kind)
+    )""")
+
+
+async def m042_add_engagement_awards(db: Database):
+    """Preserve evidenced social awards for the current cycle, including evictions."""
+    from datetime import date
+    from .services.time_utils import get_day_boundaries_utc
+
+    async with _migration_transaction(db) as transaction:
+        await _create_engagement_awards(transaction)
+        schema = db.references_schema
+        for kind in (6, 7):
+            # Current membership kinds prove the award, but not its original time.
+            await transaction.execute(
+                f"""INSERT INTO {schema}engagement_awards (user_id,pubkey,kind)
+                SELECT user_id,LOWER(TRIM(pubkey)),:kind FROM {schema}cyber_herd
+                WHERE user_id IS NOT NULL AND TRIM(user_id) != ''
+                AND pubkey IS NOT NULL AND TRIM(pubkey) != ''
+                AND (',' || COALESCE(kinds,'') || ',') LIKE :pattern
+                ON CONFLICT DO NOTHING""",
+                {"kind": kind, "pattern": f"%,{kind},%"},
+            )
+        today = get_day_boundaries_utc()
+        owners = await transaction.fetchall(
+            f"""SELECT s.user_id,s.midnight_reset_enabled,r.local_day
+            FROM {schema}settings s LEFT JOIN {schema}membership_reset_days r
+            ON s.user_id=r.user_id WHERE s.user_id IS NOT NULL AND s.user_id != ''"""
+        )
+        for owner in owners:
+            if owner["midnight_reset_enabled"]:
+                since = today.local_since_ts
+            elif owner["local_day"]:
+                days = (date.fromisoformat(today.local_day_str) - date.fromisoformat(owner["local_day"])).days
+                since = get_day_boundaries_utc(days_ago=days).local_since_ts
+            else:
+                since = 0  # no known reset; retain documented successful awards
+            await transaction.execute(
+                f"""INSERT INTO {schema}engagement_awards (user_id,pubkey,kind,awarded_at)
+                SELECT user_id,LOWER(TRIM(pubkey)),
+                    CASE WHEN event_type='repost' THEN 6 ELSE 7 END,MIN(processed_at)
+                FROM {schema}processed_events WHERE user_id=:user_id
+                AND event_type IN ('repost','reaction') AND processed_at >= :since
+                AND pubkey IS NOT NULL AND TRIM(pubkey) != ''
+                GROUP BY user_id,LOWER(TRIM(pubkey)),event_type
+                ON CONFLICT DO NOTHING""",
+                {"user_id": owner["user_id"], "since": int(since)},
+            )
+
+
+async def m043_add_treat_delivery_records(db: Database):
+    """Durable member branches, distribution snapshots and signed-message outbox."""
+    async with _migration_transaction(db) as transaction:
+        await transaction.execute(f"""CREATE TABLE IF NOT EXISTS {db.references_schema}delivery_records (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, kind TEXT NOT NULL,
+            state TEXT NOT NULL, payload TEXT NOT NULL, updated_at BIGINT NOT NULL
+        )""")
+        await transaction.execute(f"""CREATE INDEX IF NOT EXISTS delivery_records_work
+            ON {db.references_schema}delivery_records (kind,state,updated_at)""")
+        # An independent cycle token also distinguishes multiple manual resets today.
+        await transaction.execute(f"""CREATE TABLE IF NOT EXISTS {db.references_schema}member_cycles (
+            user_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL
+        )""")

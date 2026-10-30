@@ -6,7 +6,7 @@ The #CyberHerd is a community of Nostr users who collectively support the ⚡Lig
 
 **Important: With midnight reset enabled, the CyberHerd resets every night at midnight in the server's local timezone.** All memberships and accumulated zap amounts are cleared, giving everyone a fresh start each day. This means:
 - All members are removed from the herd
-- All accumulated zap amounts reset to zero
+- All accumulated zap amounts and first-repost/first-like awards reset to zero
 - A current-day #CyberHerd note from the project is required; posting that note is handled by the project's separate publishing process
 
 ## How to Join the CyberHerd
@@ -33,8 +33,8 @@ Members can join the CyberHerd without zapping by reposting or reacting to TODAY
 ### Repost (Kind 6) and Reaction (Kind 7) Rules:
 - **Free entry when slots available**: If the herd has open slots, reposts and reactions can join without paying
 - **TODAY'S note requirement**: Must repost or react to the current day's #CyberHerd note (older notes invalid)
-- **Exactly 1% for engagement**: Members with kind 6 (repost) OR kind 7 (reaction) receive exactly 1% of the full feeder payment. Having both kind 6 AND kind 7 still gives only 1% (not 2%)
-- **Zapper bonus**: Members who have zaps AND kind 6/7 events receive their 1% engagement share PLUS their proportional zap share from the remaining pool
+- **Separate cumulative rewards**: The first repost earns 3 points and the first like earns 1 point. Doing both earns 4 points; there is no fixed percentage bonus.
+- **Zaps are the strongest incentive**: A zap meeting the configured joining minimum earns 10 points. Every additional settled zap adds points in proportion to its satoshi amount. Social points add to zap points.
 - **Valid requirements**: NIP-05 identifier (configurable, can be disabled) and Lightning address required
 - **Vulnerable to displacement**: A new or rejoining zap that meets the configured minimum will displace repost/reaction-only members first
 - **Repost headbutting (kind 6)**: Reposts CAN headbutt other repost-only or reaction-only members (amount=0) when the herd is full
@@ -54,7 +54,7 @@ When the herd is full:
 - **Support visibility**: Reposts amplify Lightning Goats content even if you receive no payout
 
 ### Example Progression:
-- **Day 1**: Repost TODAY'S #CyberHerd note → Join with 0 sats → Receive 1% of the full feeder payment
+- **Day 1**: Repost TODAY'S #CyberHerd note → Join with 0 sats → Earn 3 points and a proportional share of the member pool
 - **Day 2**: Zap 50 sats to TODAY'S #CyberHerd note → Join with 50 sats → Start receiving proportional payouts
 - **Later on Day 2**: Already a member, zap 100 sats to any Lightning Goats post → Total becomes 150 sats → Harder to displace
 
@@ -85,9 +85,9 @@ Once you're a CyberHerd member, you have **flexible zapping options** to increas
 
 After the feeder integration successfully requests a feed at its configured threshold, the available herd balance is distributed:
 
-- **Engagement = exactly 1%** - Members with kind 6 (repost) or kind 7 (reaction) receive exactly 1% of the full feeder payment
-- **Zaps distributed proportionally** - The remaining pool (after engagement allocation) is distributed proportionally by zap amount
-- **Zapper + engagement bonus** - Members with BOTH zaps AND engagement receive their 1% engagement share PLUS their proportional zap share
+- **Contribution points** - A minimum qualifying zap earns 10 points, the first repost earns 3, and the first like earns 1. These rewards add together.
+- **One shared pool** - Eligible active members divide the configured member allocation proportionally to their total points.
+- **Every paid invoice counts once** - Re-delivery does not add points; a distinct settled invoice does.
 - **Only Lightning Goats content** - Zaps to other people's notes don't count
 - **Feeder-triggered payments** - Reaching a balance threshold alone does not distribute funds. A blocked, failed, or unknown feeder request does not authorize a payout
 - **Bigger contributions = bigger share** - The more you've zapped, the larger your piece of the available allocation
@@ -102,7 +102,7 @@ After the feeder integration successfully requests a feed at its configured thre
 After a successful feeder request, the herd balance is split using the current members and configured allocation:
 
 - **Goat allocation** - The remainder after payable member shares goes to goat food and operations (90% in these examples)
-- **Member allocation** - A configurable percentage (10% in these examples) is divided by engagement and zap amounts
+- **Member allocation** - A configurable percentage (10% in these examples) is divided by cumulative contribution points
 
 ### Your Share
 The more you've zapped Lightning Goats content, the bigger your share of that 10%! Your payment gets sent directly to your Lightning address when the feeder triggers.
@@ -111,7 +111,7 @@ The more you've zapped Lightning Goats content, the bigger your share of that 10
 - Feeder triggers with 1,000 sats
 - 900 sats feeds the goats
 - 100 sats gets split among CyberHerd members
-- If you've zapped the most, you get the biggest piece!
+- The member with the most contribution points gets the biggest piece!
 
 ## Payout Examples
 
@@ -132,41 +132,43 @@ Here's how your share gets calculated:
 - Feeder triggers with 5,000 sats
 - Your share: ~150 sats sent directly to your Lightning address (based on your contribution ratio)
 
-**Example 4 - Repost member receives exactly 1%:**
-- Herd members: [Repost only (0 sats), Zap (300 sats), Zap (700 sats)]
-- Feeder triggers with 10,000 sats → 1,000 sats to CyberHerd (10%)
-- Engagement allocation: 1% = 100 sats (repost member gets exactly 1%)
-- Zap pool: 9% = 900 sats (distributed proportionally by zap amount)
-- Repost member: 100 sats (exactly 1% for engagement)
-- Zap member 1: 270 sats (300/1000 * 900)
-- Zap member 2: 630 sats (700/1000 * 900)
+**Point formula**
 
-**Example 5 - Zapper with engagement bonus:**
-- Herd members: [Zap+Repost (500 sats, has kind 6), Zap only (300 sats), Zap only (200 sats)]
-- Feeder triggers with 10,000 sats → 1,000 sats to CyberHerd (10%)
-- Engagement allocation: 1% = 100 sats (member 1 gets exactly 1%)
-- Zap pool: 9% = 900 sats (distributed proportionally by zap amount)
-- Member 1 (500 sats + kind 6): 100 + 450 = 550 sats (1% engagement + 500/1000 * 900)
-- Member 2 (300 sats): 270 sats (300/1000 * 900)
-- Member 3 (200 sats): 180 sats (200/1000 * 900)
+`points = 10 × qualifying zap sats ÷ max(1, configured joining minimum) + 3 × first repost + 1 × first like`
 
-**Example 6 - Multiple members with engagement:**
-- Herd members: [Zap+Repost (400 sats, has kind 6), Zap+React (400 sats, has kind 7), Zap only (200 sats)]
-- Feeder triggers with 10,000 sats → 1,000 sats to CyberHerd (10%)
-- Engagement allocation: 2% = 200 sats (1% each to members 1 and 2)
-- Zap pool: 8% = 800 sats (distributed proportionally by zap amount)
-- Member 1 (400 sats + kind 6): 100 + 320 = 420 sats (1% engagement + 400/1000 * 800)
-- Member 2 (400 sats + kind 7): 100 + 320 = 420 sats (1% engagement + 400/1000 * 800)
-- Member 3 (200 sats): 160 sats (200/1000 * 800)
+At a 10-sat joining minimum, every sat earns one point. If the minimum changes,
+zap points scale with it so a minimum qualifying zap always earns 10 points.
+A zero configured minimum uses a one-sat basis for scoring. Only positive,
+settled zaps count. Every distinct qualifying paid invoice adds its points.
 
-**Example 7 - Member with BOTH kind 6 AND kind 7 (still only 1%):**
-- Herd members: [Zap+Repost+React (600 sats, has kind 6+7), Zap only (200 sats), Zap only (200 sats)]
-- Feeder triggers with 10,000 sats → 1,000 sats to CyberHerd (10%)
-- Engagement allocation: 1% = 100 sats (member 1 gets exactly 1%, not 2%)
-- Zap pool: 9% = 900 sats (distributed proportionally by zap amount)
-- Member 1 (600 sats + kind 6+7): 100 + 540 = 640 sats (1% engagement + 600/1000 * 900)
-- Member 2 (200 sats): 180 sats (200/1000 * 900)
-- Member 3 (200 sats): 180 sats (200/1000 * 900)
+`member percentage = member allocation × member points ÷ total eligible active member points`
+
+The configured goat allocation remains outside the member pool. An eligible
+member gets no fixed percentage; their share changes as others earn points.
+Only active members with a valid Lightning address participate in the pool.
+If nobody is eligible, the configured goat wallet receives the full payment.
+
+**Example 4 - Zaps, reposts and likes ranked separately:**
+- Joining minimum: 10 sats; member pool: 10% of the full payment
+- Zap-only member: 10 sats → 10 points
+- Repost-only member: 3 points; like-only member: 1 point
+- Total: 14 points; full-payment shares: approximately 7.142857%, 2.142857%, and 0.714286%
+- The goat wallet receives 90%
+
+**Example 5 - Cumulative engagement:**
+- Member A zaps 20 sats, reposts and likes: 20 + 3 + 1 = 24 points
+- Member B zaps 20 sats without social engagement: 20 points
+- Their shares of a 10% member pool are approximately 5.454545% and 4.545455%
+- Reposting or liking again adds no points. A further distinct 5-sat zap raises A to 29 points
+
+**Once-per-cycle social awards:**
+- The first successfully admitted repost and first successfully admitted like each count once per project owner and Nostr pubkey across all qualifying notes
+- Repeating the interaction, using a new event ID, restarting the service, or unliking/reposting again does not renew an award
+- Eviction or deleting a member does not erase their earned social awards or allow the same type to grant free re-entry. A previously unused social type can still qualify under the normal admission rules
+- Returning with a qualifying zap restores the previously earned social points; the eviction-reset zap score starts from the new contribution
+- Enabled midnight reset clears social awards with daily membership scores. With midnight reset disabled, awards persist until a manual reset
+- Manual reset starts a fresh cycle and clears the awards atomically with the membership state
+- Failed admissions earn no social points. Replaying an old event after a daily reset does not grant a fresh award
 
 ## The ⚡Headbutting⚡ Mechanism
 
@@ -236,7 +238,7 @@ When the CyberHerd reaches maximum capacity, new members can still join by "head
 - **Build your total**: Multiple zaps accumulate, making you harder to headbutt
 - **Monitor the herd**: Check current members' contributions before zapping
 - **Stay active**: Regular zapping increases your "headbutt resistance"
-- **Risk awareness**: Getting headbutted resets your accumulated payout score; prior donations are not refunded or carried over when you rejoin
+- **Risk awareness**: Getting headbutted resets your membership zap score; prior donations are not refunded or carried over when you rejoin. Earned social awards remain recorded until the cycle resets
 
 ### Headbutting Rules:
 - **New members only**: Only new members can attempt headbutting by zapping TODAY'S #CyberHerd note or reposting it
@@ -292,12 +294,17 @@ The CyberHerd works automatically behind the scenes:
 - **Zap priority**: Zaps always displace repost/reaction-only members first before competing with other zaps
 - **Repost headbutting**: Reposts (kind 6) can displace repost-only or reaction-only members (amount=0)
 - **Reaction limitation**: Reactions (kind 7) cannot headbutt - can only join when open slots available
-- **Engagement = exactly 1%**: Members with kind 6 (repost) or kind 7 (reaction) receive exactly 1% of the full feeder payment. Having both kind 6 AND kind 7 still gives only 1%
-- **Zaps distributed proportionally**: The remaining pool after engagement allocation is distributed proportionally by zap amount
-- **Zapper + engagement**: Members with zaps AND kind 6/7 events receive their 1% engagement PLUS proportional zap share
-- **Headbutt consequences**: Getting headbutted resets your accumulated payout score to zero
-- **Feeder-triggered payouts**: Payments follow a successful feeder request at the configured threshold, with current member targets applied before distribution
-- **Configurable split**: The configured member allocation limits the CyberHerd pool; unused member allocation goes to the goat wallet. Engagement-enabled configurations reserve at least one percentage point per possible member
+- **Cumulative points**: A minimum qualifying zap earns 10 points; the first repost earns 3 and the first like earns 1. Every distinct qualifying settled zap adds points
+- **Proportional shares**: The member allocation is divided according to total eligible active member points
+- **Social awards count once**: Each social type counts once per owner/pubkey/cycle and survives eviction or deletion
+- **Headbutt consequences**: Getting headbutted resets the membership zap score to zero. Social awards remain recorded and contribute again only after valid re-entry
+- **Threshold payout cycles**: Each full threshold cycle transfers exactly the configured trigger amount from the herd wallet to the CyberHerd distribution wallet. The remainder stays in the herd wallet. With a 1,000-sat trigger, 1,234 sats produces one feeding and one 1,000-sat transfer, leaving 234 sats. A 2,345-sat balance produces two feedings and two separate 1,000-sat transfers, leaving 345 sats. Each received payment produces one feeder-triggered announcement for its entire batch. At most three feeder activations are rewarded per received payment. Additional full thresholds still produce separate CyberHerd payouts: 4,345 sats means three feeder activations and four 1,000-sat transfers, leaving 345 sats. Within one payment, feeder requests are spaced six seconds apart; separate payments retain the configured cooldown. Both respect the override switch.
+- **CyberHerd treats**: Confirmed member payouts receive a named Nostr mention in that member's thread, replying to their joining message for the membership cycle. Later membership updates reuse that branch. New membership cycles start new branches; late settlements stay attached to their original cycle.
+- **Small shares**: A share that cannot cover the routing reserve and a whole-satoshi payment, or the recipient's minimum, is skipped. “The big goats ate all the food this round” explains the missed treat. The `cyber_herd_no_treats` category provides varied goat-themed explanations; confirmed payments use the existing `cyber_herd_treats` category. All wording, including optional repost hints and feeding summaries, comes from editable `cyberherd_messaging` database templates. An occasional repost suggestion appears only if the member has not already earned the repost award, at most once per membership cycle. Skipped amounts are not credited as a member balance or carried forward.
+- **Reliable announcements**: `cyberherd_messaging` renders, signs and submits all member-thread messages. Pending or failed payments are never announced as received. Messages survive a restart and reuse the same signed event on retry. Goat operations payouts and ambiguous shared recipient addresses do not produce member treat notices.
+- **Existing members after upgrade**: Older joining messages have no stored publication receipt. Their first update creates a clearly labeled member-thread anchor rather than pretending to know the old joining event ID. New joins retain the actual signed event ID.
+- **Feeding recovery**: Confirmed feeding requests resume their recorded transfer after interruption. An uncertain feeder request is held for operator reconciliation rather than automatically repeated.
+- **Configurable split**: The configured member allocation limits the CyberHerd pool; unused member allocation goes to the goat wallet. There is no one-percentage-point reservation or minimum allocation per slot
 
 Payout examples show amounts before routing fees and whole-satoshi rounding by the payment service. Proportional split targets retain six decimal places of percentage precision. A successful OpenHAB rule request authorizes distribution; physical delivery requires separate feeder telemetry.
 
@@ -309,3 +316,53 @@ Payout examples show amounts before routing fees and whole-satoshi rounding by t
 - Each paid invoice counts once. Separate settled invoices count separately even if they reuse the same signed zap request. Re-delivering the same repost or reaction does not create another headbutt.
 - A settled qualifying zap can appear in lifetime history even when it is insufficient to join or displace someone. It does not grant a membership score for a rejected admission. History refresh uses verified settled payments held by this installation; relay receipts alone do not prove payment.
 - Payout targets include only members with a valid Lightning address. A missing or malformed address does not receive a target; remaining allocation follows the configured goat-wallet rules. Address syntax validation cannot guarantee that a remote payment provider is available.
+
+Legacy PostgreSQL zap accounting repair (migration 39): some installations still
+have a timestamp `processed_zaps.processed_at` column despite the earlier schema
+sync. Zap accounting writes text timestamps, so that mismatch aborts the atomic
+membership update. Migration 39 converts the column to text in place, preserving
+history and the insertion default, and propagates failures so an unsuccessful
+repair cannot be recorded as complete. Failed admissions remain eligible for the
+existing settled-payment recovery path; accounting still deduplicates by payment.
+
+Migration 40 completes legacy PostgreSQL zap-table compatibility by removing
+receipt-specific NOT NULL constraints that the consolidated schema no longer
+requires. Payment accounting is identified by the settled payment hash in
+`event_id`; the user-scoped unique index continues to prevent double counting.
+Recovery diagnostics now distinguish processing attempts from successful zaps.
+Background note validation queries the configured author and checks signatures,
+tags, and today's time boundaries even when there is no FastAPI app reference.
+
+Database audit changes (migration 41): user-specific reads cannot inherit a
+legacy operator's settings. Settings creation preserves the supplied split
+switch and zero allocations. Member mutations and their payout recalculations
+commit together; payout calculation uses the final engagement kinds. A caught
+SQL error still forces the entire admission to roll back, and split updates run
+only after commit. Banned members must be unbanned before reactivation.
+
+Manual reset now clears membership scores, event/payment ledgers, cached lifetime
+totals, and tracked notes in one transaction. It records pending split work for
+retry if the downstream reset fails. The daily rollover retains lifetime history
+and replay protection, as described above. Manual amount edits assign the desired
+total atomically; failed edits remain retryable and duplicate IDs are user-scoped.
+Payment accounting retains the target note for filtered history queries. History
+pagination compares parsed timestamps, including legacy ISO values, and reports
+whether additional matching rows exist.
+
+Migration 41 repairs event identity indexes and legacy helper columns without
+rebuilding PostgreSQL member rows. PostgreSQL monetary totals and epoch seconds
+use 64-bit integers; cache update timestamps use double precision. Historical
+migration failures propagate instead of being recorded as successes, SQLite
+table swaps are transactional, and migrations run in numerical definition order.
+
+Contribution points upgrade (migration 42): existing membership kinds and recorded
+successful interactions from the current cycle seed the social-award ledger.
+Failed interactions do not seed awards, and unknown award times are left unknown.
+No old zap history is converted into a new daily membership score. At startup,
+stored payouts and configured split targets are refreshed before event intake.
+
+Displayed percentages use the shared six-decimal calculation. If the payout
+backend's storage rounding would push the target total above 100%, target values
+are rounded downward only as needed to fit its numeric precision. The tiny
+residual stays in the source wallet; member priority and contribution points do
+not change. Routing fees and whole-satoshi rounding still apply to payments.

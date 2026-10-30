@@ -12,7 +12,7 @@ def member(pubkey,amount,kinds='9735',address=None):
 
 def test_remaining_pool_preserves_fractional_proportions():
  rows=[member('a',0,'6,7'),member('b',300),member('c',700)]
- assert shares.compute_member_share_percentages(rows,10)=={'a':1,'b':2.7,'c':6.3}
+ assert shares.compute_member_share_percentages(rows,10)=={'a':0.039841,'b':2.988048,'c':6.972111}
 
 @pytest.mark.anyio
 async def test_config_change_updates_targets_and_alias(monkeypatch):
@@ -43,8 +43,8 @@ async def test_invalid_addresses_are_excluded_and_fractional_targets_preserved(m
  monkeypatch.setattr(splits,'split_set_targets',set_targets)
  monkeypatch.setattr(splits,'_split_signature_cache',{})
  result=await splits.update_split_targets_proportional('source',user_id='owner')
- assert {t['wallet']:t['percent'] for t in result['targets']}=={
-  'goat-wallet':90,'a@example.test':1,'b@example.test':2.7,'c@example.test':6.3}
+ assert {t['wallet']:t['percent'] for t in result['targets']}==pytest.approx({
+  'goat-wallet':90,'a@example.test':0.02991,'b@example.test':2.991027,'c@example.test':6.979063}, abs=1e-6)
 
 @pytest.mark.anyio
 async def test_balance_threshold_alone_never_authorizes_payout(monkeypatch):
@@ -64,7 +64,7 @@ async def test_balance_threshold_alone_never_authorizes_payout(monkeypatch):
 async def test_successful_feeder_context_can_distribute(monkeypatch,threshold,balance):
  config=SimpleNamespace(user_id='owner',send_splits_enabled=True,feeder_trigger_sats=threshold,herd_wallet='herd',source_wallet='source')
  async def resolve(wallet):return wallet,SimpleNamespace(balance_msat=balance)
- async def transfer(settings):return {'ok':True,'sats':1000}
+ async def transfer(settings, **kwargs):return {'ok':True,'sats':1000}
  monkeypatch.setattr(send_splits,'_resolve_wallet',resolve)
  monkeypatch.setattr(send_splits,'transfer_herd_balance_to_source',transfer)
  monkeypatch.setattr(send_splits,'_LAST_ATTEMPT',{})

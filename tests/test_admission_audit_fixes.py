@@ -107,17 +107,19 @@ async def test_shares_fallback_uses_configured_budget_and_engagement(scenario):
     await crud.update_and_activate_member(BOB,0,OWNER,kinds=[7])
     result=await views_api.api_get_shares(SimpleNamespace(), {"type":"admin","value":SimpleNamespace(id=OWNER)})
     assert result["allocation_model"]=="zap+members"
-    assert {s.get("pubkey") or "goats":s["percent"] for s in result["shares"]}=={ALICE:19.0, BOB:1.0,"goats":80.0}
+    assert {s.get("pubkey") or "goats":s["percent"] for s in result["shares"]}=={ALICE:19.80198, BOB:0.19802,"goats":80.0}
 
 
 @pytest.mark.anyio
-async def test_settings_reject_budget_below_enabled_engagement_capacity(scenario, monkeypatch):
+async def test_settings_allows_small_pool_with_weighted_engagement(scenario, monkeypatch):
     scenario.settings.max_members=3
     scenario.settings.member_allocation_percent=10
-    monkeypatch.setattr(crud,"upsert_settings",AsyncMock())
-    with pytest.raises(HTTPException) as exc:
-        await views_api.api_put_settings(SimpleNamespace(), {"member_allocation_percent":1}, SimpleNamespace(wallet=SimpleNamespace(user=OWNER)))
-    assert exc.value.status_code==400
+    store=AsyncMock()
+    monkeypatch.setattr(crud,"upsert_settings",store)
+    await views_api.api_put_settings(SimpleNamespace(), {"member_allocation_percent":1}, SimpleNamespace(wallet=SimpleNamespace(user=OWNER)))
+    store.assert_awaited_once()
+    assert scenario.settings.member_allocation_percent==1
+    assert scenario.settings.max_members==3
 
 
 @pytest.mark.anyio
@@ -140,12 +142,15 @@ async def test_daily_note_query_independently_checks_relay_metadata(scenario, mo
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("payload", [{"max_members":11},{"repost_tracking_enabled":True,"member_allocation_percent":1}])
-async def test_settings_validate_merged_capacity_not_only_allocation_field(scenario, payload):
+async def test_settings_capacity_is_independent_of_pool(scenario, monkeypatch, payload):
     scenario.settings.max_members=3
     scenario.settings.member_allocation_percent=10
-    with pytest.raises(HTTPException) as exc:
-        await views_api.api_put_settings(SimpleNamespace(),payload,SimpleNamespace(wallet=SimpleNamespace(user=OWNER)))
-    assert exc.value.status_code==400
+    store=AsyncMock()
+    monkeypatch.setattr(crud,"upsert_settings",store)
+    await views_api.api_put_settings(SimpleNamespace(),payload,SimpleNamespace(wallet=SimpleNamespace(user=OWNER)))
+    store.assert_awaited_once()
+    for field,value in payload.items():
+        assert getattr(scenario.settings,field)==value
 
 
 @pytest.mark.anyio

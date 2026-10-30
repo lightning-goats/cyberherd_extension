@@ -23,6 +23,49 @@ It watches Lightning Network zaps and Nostr activity, keeps the herd roster up t
 
 The full user-facing walkthrough—including daily reset behaviour, headbutt rules, and payout examples—is available in [cyberherd_explanation.md](./cyberherd_explanation.md).
 
+## Membership points and treat distributions
+
+Contribution scores combine every distinct qualifying settled zap with the first
+repost (3 points) and first like (1 point) per membership cycle. A minimum-sized
+qualifying zap earns 10 points. Repeating a repost or like does not add another
+award. Eviction does not erase a social award; daily or manual reset starts a new
+cycle. Member percentages retain six decimal places and share one calculation
+across the API, stored payouts and SplitPayments targets.
+
+Member updates and confirmed payout notices use a durable per-member thread for
+each membership cycle. Pending and failed payments never produce a received-treat
+notice. Shares too small to send use the separate `cyber_herd_no_treats` category,
+with an occasional, once-per-cycle repost hint only when the repost award is
+unearned. All message wording is stored in `cyberherd_messaging` templates. Signed
+Nostr events are saved before submission and retries reuse the event ID. A relay
+submission does not prove remote relay acceptance. Older joins without a stored
+event receipt receive an explicitly labeled member-thread anchor.
+
+### Coordinated upgrade requirement
+
+Update this extension, `cyberherd_messaging`, and `lightning_goats` together.
+CyberHerd migrations 39–43 repair payment-ledger compatibility and add durable
+engagement, membership-cycle and delivery records; messaging migration 5 seeds
+editable templates without overwriting existing custom rows.
+
+The payout integration also requires the companion
+[SplitPayments patch](patches/splitpayments-treat-accounting.patch). It prevents
+zero/negative invoices, snapshots recipients before sending, records outgoing
+payment hashes, and deduplicates distribution recipients. Keep the original
+SplitPayments file backed up, inspect the patch against your installed version,
+and apply it before restarting LNbits. For the upstream `tasks.py` layout:
+
+```sh
+patch --dry-run -p1 -d /path/to/lnbits/extensions/splitpayments < patches/splitpayments-treat-accounting.patch
+patch -p1 -d /path/to/lnbits/extensions/splitpayments < patches/splitpayments-treat-accounting.patch
+```
+
+The patch is required for treat settlement monitoring and skipped-share messages;
+upgrading only the three extensions does not install these SplitPayments hooks.
+The wallet monitor announces only recorded, attributable distributions. Unrelated
+manual payments and ambiguous shared recipient addresses are not attributed to a
+member.
+
 ## API Endpoints
 
 All endpoints are mounted under `/cyberherd/api/v1`. Authentication uses LNbits API keys (admin, invoice, or wallet keys depending on endpoint). Full interactive documentation is available at `/docs#/cyberherd` when the extension is enabled.

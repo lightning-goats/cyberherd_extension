@@ -57,6 +57,10 @@ _MEMBERSHIP_EVENTS = {
     "kind_7_reaction",
     "existing_member_repost",
     "existing_member_reaction",
+    "headbutt_success",
+    "zapper_displaces_kind_6",
+    "zapper_displaces_kind_7",
+    "repost_displaces",
 }
 
 
@@ -496,6 +500,7 @@ async def send_cyberherd_update(
     note_id: Optional[str] = None,
     p_tags: list[str] | None = None,
     websocket_topic: str = "cyberherd",
+    user_id: str | None = None,
 ):
     """Build a lightweight cyberherd update payload and broadcast it.
 
@@ -513,13 +518,9 @@ async def send_cyberherd_update(
     # Attempt to build a payload from the DB if provided
     payload = {"type": "cyberherd_update", "newest": newest_pubkey}
     try:
-        if db is not None:
-            rows = await db.fetch_all(
-                (
-                    "SELECT pubkey, display_name, amount, is_active, picture, nprofile "
-                    "FROM cyberherd.cyber_herd ORDER BY amount DESC LIMIT 10"
-                ),
-            )
+        if db is not None and user_id:
+            rows = await db.get_active_cyberherd_members(user_id)
+            rows = sorted(rows, key=lambda row: int(row.get("amount") or 0), reverse=True)[:10]
             members: list[dict[str, Any]] = []
             for row in rows:
                 member_dict = dict(row)
@@ -1287,6 +1288,28 @@ async def publish_event_message(
         wallet_id: Wallet ID for nsec_oracle signing (mandatory)
     """
     values = values or {}
+    item = values.get("cyber_herd_item") or {}
+    member_pubkey = values.get("member_pubkey") or item.get("pubkey")
+    if owner_user_id and event_type in _MEMBERSHIP_EVENTS and member_pubkey:
+        from .treats import queue_member, valid_pubkey
+        if valid_pubkey(member_pubkey):
+            queued = await queue_member(
+                event_type, owner_user_id,
+                {**values, "member_pubkey": member_pubkey}, wallet_id,
+                e_tags, websocket_topic,
+            )
+            if queued and _msg is not None:
+                try:
+                    payload = {"type": event_type,
+                               "message": values.get("member_display_name") or values.get("name") or "Member update",
+                               "values": _build_websocket_values(event_type, values)}
+                    members = _build_websocket_members(event_type, values)
+                    if members:
+                        payload["members"] = members
+                    await _msg.send_to_websocket_clients(websocket_topic, payload)
+                except Exception:
+                    logger.warning("CyberHerd member websocket update deferred")
+            return queued
 
     mapping = {
         "headbutt_success": "headbutt_success",

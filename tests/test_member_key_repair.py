@@ -50,9 +50,6 @@ async def member_db(request, monkeypatch, tmp_path):
 
 
 async def create_members(database, primary_key):
-    await database.execute(
-        f"CREATE TABLE {database.references_schema}settings (user_id TEXT PRIMARY KEY)"
-    )
     await database.execute(f"""CREATE TABLE {database.references_schema}cyber_herd (
             pubkey TEXT NOT NULL, user_id TEXT, display_name TEXT,
             event_id TEXT, note TEXT, kinds TEXT, nprofile TEXT, lud16 TEXT,
@@ -64,6 +61,8 @@ async def create_members(database, primary_key):
     await database.execute(f"""INSERT INTO {database.references_schema}cyber_herd
             (pubkey, user_id, display_name, kinds, amount, payouts, notified, banned)
             VALUES ('existing', 'owner', 'Existing member', '9735', 42, 1.5, 1, 1)""")
+    await migrations.m001_consolidated_schema(database)
+    await migrations._create_engagement_awards(database)
 
 
 async def migrate_from_35(database, monkeypatch):
@@ -76,11 +75,11 @@ async def migrate_from_35(database, monkeypatch):
     monkeypatch.setattr(helpers, "update_migration_version", record_version)
     async with database.connect() as connection:
         await helpers.run_migration(
-            connection, migrations, "cyberherd", type("Version", (), {"version": 35})()
+            connection,
+            SimpleNamespace(m036_repair_postgres_member_key=migrations.m036_repair_postgres_member_key),
+            "cyberherd",
+            type("Version", (), {"version": 35})(),
         )
-    # Column type upgrades invalidate asyncpg prepared SELECT metadata. A real
-    # extension upgrade starts with fresh connections; mirror that boundary.
-    await database.engine.dispose()
     return versions
 
 
@@ -119,7 +118,7 @@ async def test_members_join_after_version_35_key_repair(member_db, monkeypatch, 
         {"user_id": "other-owner", "kinds": str(kind), "is_active": 1},
         {"user_id": "owner", "kinds": str(kind), "is_active": 1},
     ]
-    assert versions == [36, 37, 38]
+    assert versions == [36]
 
 
 @pytest.mark.anyio
@@ -131,7 +130,7 @@ async def test_key_repair_is_idempotent(member_db, monkeypatch):
         )
     )
     for _ in range(2):
-        assert await migrate_from_35(member_db, monkeypatch) == [36, 37, 38]
+        assert await migrate_from_35(member_db, monkeypatch) == [36]
         assert (
             dict(
                 await member_db.fetchone(
@@ -178,3 +177,48 @@ async def test_key_repair_failure_keeps_old_key_and_does_not_advance_version(
             f"SELECT user_id FROM {member_db.references_schema}cyber_herd"
         )
     )["user_id"] is None
+
+
+@pytest.mark.anyio
+async def test_zap_timestamp_repair_preserves_history_and_allows_accounting(member_db):
+    if member_db.type != POSTGRES:
+        pytest.skip("legacy timestamp repair is PostgreSQL only")
+    table = f"{member_db.references_schema}processed_zaps"
+    await member_db.execute(f"""CREATE TABLE {table} (
+        user_id TEXT, event_id TEXT, note_id TEXT, zapper_pubkey TEXT,
+        amount INTEGER, processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, event_id))""")
+    await member_db.execute(
+        f"INSERT INTO {table} (user_id, event_id, processed_at) "
+        "VALUES ('owner', 'old', '2026-10-29 12:34:56')"
+    )
+    # Reproduce the production error; failed admissions must remain retryable.
+    with pytest.raises(Exception, match="datetime"):
+        async with crud.admission_transaction():
+            await crud.account_zap_payment(
+                user_id="owner", payment_hash="new", zapper_pubkey="alice",
+                amount_sats=21, processed_at=1793370465,
+            )
+    await migrations.m039_repair_processed_zap_timestamp(member_db)
+    await migrations.m039_repair_processed_zap_timestamp(member_db)
+    # A service restart also clears prepared statements using the old type.
+    await member_db.engine.dispose()
+    for expected in (True, False):
+        async with crud.admission_transaction():
+            assert await crud.account_zap_payment(
+                user_id="owner", payment_hash="new", zapper_pubkey="alice",
+                amount_sats=21, processed_at=1793370465,
+            ) is expected
+    rows = await member_db.fetchall(
+        f"SELECT event_id, processed_at FROM {table} ORDER BY event_id"
+    )
+    assert [dict(row) for row in rows] == [
+        {"event_id": "new", "processed_at": "1793370465"},
+        {"event_id": "old", "processed_at": "2026-10-29 12:34:56"},
+    ]
+    await member_db.execute(
+        f"INSERT INTO {table} (user_id, event_id) VALUES ('owner', 'default')"
+    )
+    assert (await member_db.fetchone(
+        f"SELECT processed_at FROM {table} WHERE event_id = 'default'"
+    ))["processed_at"]

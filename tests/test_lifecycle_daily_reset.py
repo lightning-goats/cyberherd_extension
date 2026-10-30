@@ -90,6 +90,8 @@ async def lifecycle_db(request, monkeypatch, tmp_path):
     await database.execute(
         "INSERT INTO processed_zaps VALUES ('social','durable-payment')"
     )
+    await migrations._create_engagement_awards(database)
+    await migrations.m043_add_treat_delivery_records(database)
     try:
         yield database
     finally:
@@ -254,6 +256,7 @@ async def test_startup_catchup_finishes_before_registering_intake(monkeypatch):
         return SimpleNamespace(cancel=lambda: None)
 
     monkeypatch.setattr(tasks, "ensure_membership_day", catchup)
+    monkeypatch.setattr(crud, "get_all_settings", AsyncMock(return_value=[]))
     monkeypatch.setattr(cyberherd, "create_permanent_unique_task", create)
     monkeypatch.setattr(tasks, "create_permanent_unique_task", create)
     monkeypatch.setattr(

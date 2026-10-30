@@ -670,9 +670,6 @@ class EnhancedHeadbuttService:
         that match tracked tags.
         """
         logger.info(f"🔍 _get_today_cyberherd_notes called for user {self.user_id}, app={self.app is not None}")
-        if not self.app:
-            logger.warning(f"⚠️  _get_today_cyberherd_notes: self.app is None for user {self.user_id}")
-            return []
         try:
             # This logic is duplicated from views_api.py for service-layer use
             from ..views_api import _get_effective_pubkey
@@ -925,6 +922,14 @@ class EnhancedHeadbuttService:
                 logger.info(
                     f"Skipping processed social event {event_id[:16]}... "
                     f"for note {note_id[:16]}... (user {self.user_id})"
+                )
+                return None
+            earned = await self.db.get_engagement_kinds(attacker.pubkey, self.user_id)
+            social_kind = 6 if identity[2] == "repost" else 7
+            if social_kind in earned:
+                await self.db.register_processed_event(
+                    self.user_id, event_id, note_id=note_id, pubkey=attacker.pubkey,
+                    event_type="social_duplicate",
                 )
                 return None
         if self._in_cooldown():
@@ -1786,11 +1791,12 @@ class EnhancedHeadbuttService:
             p_tags = [pubkey] if pubkey else []
             await self.messaging.send_cyberherd_update(
                 pubkey,
-                getattr(self.db, "database", None),
+                self.db,
                 event_id=event_id,
                 note_id=note_id,
                 p_tags=p_tags,
                 websocket_topic=websocket_topic,
+                user_id=self.user_id,
             )
         except Exception as e:
             logger.warning(e)
@@ -2367,7 +2373,7 @@ class EnhancedHeadbuttService:
             logger.error(f"Error sending headbutt success notification: {e}")
 
     async def _handle_repost_admission(self, attacker: Any) -> dict[str, Any] | None:
-        """Handle admission for repost events (kind 6) with 1% allocation."""
+        """Handle admission for repost events (kind 6) with the first-repost point award."""
         try:
             # Check if already a member
             existing = await self.db.get_cyberherd_member_by_pubkey(attacker.pubkey, user_id=self.user_id)
@@ -2376,7 +2382,7 @@ class EnhancedHeadbuttService:
                 logger.info(f"Reposter {attacker.pubkey[:8]}... already a member, skipping repost admission")
                 return None
 
-            # Add as new member with 1% allocation
+            # Add as new member with the first-repost point award
             data = {
                 'pubkey': attacker.pubkey,
                 'display_name': f'Reposter_{attacker.pubkey[:8]}',
@@ -2396,9 +2402,6 @@ class EnhancedHeadbuttService:
 
             await self.db.add_new_active_member(data, user_id=self.user_id)
 
-            # Set allocation to 1% for reposts
-            await self.db.update_cyberherd_member_allocation(attacker.pubkey, 1.0, user_id=self.user_id)
-
             # Update splits
             try:
                 from .splits import update_split_targets_proportional
@@ -2416,12 +2419,12 @@ class EnhancedHeadbuttService:
             except Exception as e:
                 logger.warning(f"Error publishing repost admission message: {e}")
 
-            logger.info(f"Admitted reposter {attacker.pubkey[:8]}... with 1% allocation")
+            logger.info(f"Admitted reposter {attacker.pubkey[:8]}... with the first-repost point award")
             return {
                 "newly_activated": attacker.pubkey,
                 "reason": "repost",
                 "status": "new",
-                "allocation_percentage": 1.0
+                "engagement_points": 3
             }
 
         except Exception as e:
@@ -2429,33 +2432,12 @@ class EnhancedHeadbuttService:
             return None
 
     async def _maybe_update_splits(self):
-        """Update splits for active members based on their amounts."""
-        try:
-            active_members = await self.db.get_active_cyberherd_members(user_id=self.user_id)
-            total_amount = sum(m.get("amount", 0) for m in active_members)
-            if total_amount <= 0:
-                return
+        """Use the shared contribution-point policy for every target update."""
+        from .splits import update_split_targets_proportional
 
-            # Update each member's allocation percentage based on their amount
-            for member in active_members:
-                try:
-                    pubkey = member.get("pubkey")
-                    amount = member.get("amount", 0)
-                    # Calculate new allocation percentage
-                    allocation_percentage = (amount / total_amount) * 100.0
-                    allocation_percentage = round(allocation_percentage, 4)  # Limit to 4 decimal places
-
-                    # Update member record
-                    await self.db.update_cyberherd_member_allocation(
-                        pubkey, allocation_percentage, user_id=self.user_id
-                    )
-                except Exception as e:
-                    logger.warning(f"Error updating split for member {member.get('pubkey')}: {e}")
-        except Exception as e:
-            logger.error(f"Error in _maybe_update_splits: {e}")
-
-
-# ---- Public Trigger Functions for External Services ----
+        settings = await self.db.get_settings(self.user_id)
+        if settings.source_wallet:
+            await update_split_targets_proportional(settings.source_wallet, user_id=self.user_id)
 
 
 class _Attacker:

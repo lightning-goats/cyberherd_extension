@@ -700,6 +700,7 @@ class PaymentCoordinatorService:
                     amount_sats=amount_sats,
                     event_timestamp=self._extract_payment_timestamp(payment),
                     event_id=event_id,
+                    note_id=target_note_id,
                     skip_member_check=True,
                     lock_already_held=True,
                 )

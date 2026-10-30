@@ -21,6 +21,7 @@ from .shares import (
 )
 import asyncio
 import hashlib
+import struct
 from typing import Any, Dict
 
 # Simple in-process cache & scheduling (per source_wallet) to avoid excessive writes.
@@ -35,7 +36,29 @@ _pending_recompute: Dict[str, asyncio.Task] = {}
 _RECOMPUTE_DELAY_SEC = 0.75  # debounce window
 
 
-def _compute_signature(members: list[dict], zap_wallet: str | None, member_total: int = 10, zap_wallet_alias: str = "Zap Wallet") -> str:
+def _storage_safe_targets(targets: list[Target]) -> list[Target]:
+    """Avoid SplitPayments rejecting totals rounded above 100 by PostgreSQL REAL.
+
+    Keep exact planned percentages unless either float64 or float32 summation
+    exceeds the cap. In that case round each target down to a representable
+    float32 value; the tiny residual remains in the source wallet.
+    """
+    def float32(value):
+        return struct.unpack("!f", struct.pack("!f", value))[0]
+
+    if sum(t.percent for t in targets) <= 100 and sum(float32(t.percent) for t in targets) <= 100:
+        return targets
+    adjusted = []
+    for target in targets:
+        value = float32(target.percent)
+        if value > target.percent:
+            bits = struct.unpack("!I", struct.pack("!f", value))[0]
+            value = struct.unpack("!f", struct.pack("!I", bits - 1))[0]
+        adjusted.append(target.copy(update={"percent": value}))
+    return adjusted
+
+
+def _compute_signature(members: list[dict], zap_wallet: str | None, member_total: int = 10, zap_wallet_alias: str = "Zap Wallet", minimum_sats: int = 10) -> str:
     """Build a compact signature representing the current split-relevant state.
 
     We include pubkey, amount, lud16, *and* kinds/is_active so that changes in
@@ -50,8 +73,10 @@ def _compute_signature(members: list[dict], zap_wallet: str | None, member_total
         amount = int(m.get("amount") or 0)
         lud16 = (m.get("lud16") or "").strip().lower()
         kinds = (m.get("kinds") or "").strip()
+        earned = ",".join(str(k) for k in sorted(m.get("engagement_kinds", [])))
         is_active = int(m.get("is_active") or 0)
-        parts.append(f"{pubkey}:{amount}:{lud16}:{kinds}:{is_active}:{m.get('display_name') or 'Anon'}")
+        parts.append(f"{pubkey}:{amount}:{lud16}:{kinds}:{earned}:{is_active}:{m.get('display_name') or 'Anon'}")
+    parts.append(f"minimum_sats={minimum_sats}")
     parts.append(f"zap={ (zap_wallet or '').strip().lower() }")
     parts.append(f"allocation={member_total}:alias={zap_wallet_alias}")
     raw = "|".join(parts)
@@ -145,7 +170,7 @@ async def _update_split_targets_proportional(
     member_allocation_percent = getattr(settings, "member_allocation_percent", 10 if zap_wallet else 100)
     member_total = member_allocation_percent if zap_wallet else 100
 
-    signature = _compute_signature(members, zap_wallet, member_total, zap_wallet_alias)
+    signature = _compute_signature(members, zap_wallet, member_total, zap_wallet_alias, getattr(settings, "minimum_sats", 10))
     prev_sig = _split_signature_cache.get(source_wallet)
     if prev_sig == signature and not strict:
         logger.debug("cyberherd: split recompute skipped (unchanged signature)")
@@ -191,7 +216,7 @@ async def _update_split_targets_proportional(
             logger.warning(f"failed to clear split targets: {e}")
         return {"targets": []}
 
-    shares_map = compute_member_share_percentages(eligible_members, member_total)
+    shares_map = compute_member_share_percentages(eligible_members, member_total, getattr(settings, "minimum_sats", 10))
 
     targets: list[Target] = []
     member_percent_used = 0
@@ -231,6 +256,7 @@ async def _update_split_targets_proportional(
             ),
         )
 
+    targets = _storage_safe_targets(targets)
     await split_set_targets(source_wallet, targets)
     _split_signature_cache[source_wallet] = signature
     return {

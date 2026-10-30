@@ -281,6 +281,50 @@ async def _restart_kind1_subscriptions_for_user(
 _membership_day_lock = asyncio.Lock()
 
 
+async def manual_reset_membership(user_id: str, app: Any | None = None):
+    """Reset the user's state atomically and retain failed split work for retry."""
+    from .services.headbutt import _get_headbutt_lock
+    from .services.time_utils import get_day_boundaries_utc
+
+    if not user_id:
+        raise ValueError("user_id is required for a manual reset")
+    async with _get_headbutt_lock(), _membership_day_lock:
+        schema = crud_module.db.references_schema
+        async with crud_module.admission_transaction():
+            settings = await crud_module.get_settings(user_id)
+            source_wallet = settings.source_wallet
+            values = {"user_id": user_id}
+            await crud_module._db().execute(
+                f"""UPDATE {schema}cyber_herd SET is_active=0, amount=0, payouts=0,
+                event_id=NULL, note=NULL, kinds=NULL WHERE user_id=:user_id""", values,
+            )
+            for table in ("processed_events", "processed_zaps", "zap_totals", "engagement_awards"):
+                await crud_module._db().execute(
+                    f"DELETE FROM {schema}{table} WHERE user_id=:user_id", values,
+                )
+            await crud_module._db().execute(
+                f"""UPDATE {schema}settings SET tracked_event_ids='[]',
+                tracked_event_timestamps='{{}}', tracked_event_addresses='{{}}'
+                WHERE user_id=:user_id""", values,
+            )
+            from .services.treats import cycle
+            await cycle(user_id, reset=True)
+            await crud_module._db().execute(
+                f"""INSERT INTO {schema}membership_reset_days (user_id,local_day,splits_pending)
+                VALUES (:user_id,:day,:pending) ON CONFLICT (user_id) DO UPDATE SET
+                local_day=excluded.local_day,splits_pending=excluded.splits_pending""",
+                {**values, "day": get_day_boundaries_utc().local_day_str,
+                 "pending": int(bool(source_wallet))},
+            )
+        await clear_monitor_cache_for_user(user_id)
+        if source_wallet:
+            await reset_splits_to_predefined_wallet(source_wallet, user_id=user_id)
+            await crud_module.db.execute(
+                f"UPDATE {schema}membership_reset_days SET splits_pending=0 WHERE user_id=:user_id",
+                values,
+            )
+
+
 async def ensure_membership_day(
     user_id: str | None = None, app: Any | None = None, *, admission_lock_held: bool = False
 ) -> list[str]:
@@ -333,6 +377,17 @@ async def ensure_membership_day(
                         {"user_id": uid},
                     )
                     if marker["local_day"] < today:
+                        from uuid import uuid4
+                        await execute(
+                            f"""INSERT INTO {schema}member_cycles (user_id,cycle_id)
+                            VALUES (:user_id,:token) ON CONFLICT (user_id)
+                            DO UPDATE SET cycle_id=excluded.cycle_id""",
+                            {"user_id": uid, "token": uuid4().hex},
+                        )
+                        await execute(
+                            f"DELETE FROM {schema}engagement_awards WHERE user_id=:user_id",
+                            {"user_id": uid},
+                        )
                         await execute(
                             f"""UPDATE {schema}cyber_herd SET is_active = 0, amount = 0,
                             payouts = 0.0, event_id = NULL, note = NULL, kinds = NULL

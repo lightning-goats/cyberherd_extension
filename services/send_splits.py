@@ -38,14 +38,33 @@ async def _resolve_wallet(wallet_ref: Optional[str]) -> Tuple[Optional[str], Any
     return None, None
 
 
-async def transfer_herd_balance_to_source(settings: CyberherdSettings) -> Dict[str, Any]:
-    """Move the full herd wallet balance to the source (CyberHerd) wallet.
+async def transfer_herd_balance_to_source(
+    settings: CyberherdSettings,
+    *,
+    amount_sats: int | None = None,
+    feeding_id: str | None = None,
+) -> Dict[str, Any]:
+    """Move exactly one feeding threshold to the source (CyberHerd) wallet.
 
     Uses a per-wallet lock to prevent concurrent transfers from racing
     (e.g. Lightning Goats feeder trigger vs CyberHerd auto-splits).
     """
     from ..tasks import ensure_membership_day
+
     await ensure_membership_day(user_id=settings.user_id)
+    if amount_sats is None:
+        from lnbits.extensions.lightning_goats.crud import (
+            get_settings as get_goat_settings,
+        )
+
+        goat_settings = await get_goat_settings(settings.user_id)
+        amount_sats = getattr(goat_settings, "feeder_trigger_sats", None)
+    if (
+        not isinstance(amount_sats, int)
+        or isinstance(amount_sats, bool)
+        or amount_sats <= 0
+    ):
+        return {"ok": False, "error": "A positive feeder threshold is required"}
     herd_wallet_ref = getattr(settings, "herd_wallet", None)
     target_wallet_ref = getattr(settings, "source_wallet", None)
 
@@ -79,7 +98,11 @@ async def transfer_herd_balance_to_source(settings: CyberherdSettings) -> Dict[s
                 "status_code": HTTPStatus.BAD_REQUEST,
             }
 
-        if not target_wallet_id or not target_wallet:
+        if (
+            not target_wallet_id
+            or not target_wallet
+            or target_wallet_id == herd_wallet_id
+        ):
             return {
                 "ok": False,
                 "error": "Could not resolve source_wallet",
@@ -95,21 +118,63 @@ async def transfer_herd_balance_to_source(settings: CyberherdSettings) -> Dict[s
         except Exception:
             balance_sats = 0
 
-        if balance_sats <= 0:
+        from .treats import key, record, put
+
+        identifier = (
+            key("feeding-transfer", settings.user_id, feeding_id)
+            if feeding_id
+            else None
+        )
+        previous = await record(identifier) if identifier else None
+        if previous and (
+            previous["data"].get("from_wallet") != herd_wallet_id
+            or previous["data"].get("to_wallet") != target_wallet_id
+        ):
             return {
                 "ok": False,
-                "error": "Herd wallet balance is zero",
+                "error": "Feeding transfer wallet configuration changed; reconcile first",
+            }
+        if previous and previous["state"] == "paid":
+            return {"ok": True, "sats": previous["data"]["sats"], "already_paid": True}
+        if balance_sats < amount_sats and not previous:
+            return {
+                "ok": False,
+                "error": "Herd wallet balance is below the feeder threshold",
                 "status_code": HTTPStatus.BAD_REQUEST,
             }
 
         try:
             invoice_data = CreateInvoice(
-                amount=balance_sats,
+                amount=amount_sats,
                 unit="sat",
                 memo="CyberHerd Distribution",
                 internal=True,
             )
-            internal_payment = await create_wallet_invoice(target_wallet_id, invoice_data)
+            if previous:
+                from types import SimpleNamespace
+
+                internal_payment = SimpleNamespace(**previous["data"])
+            else:
+                internal_payment = await create_wallet_invoice(
+                    target_wallet_id, invoice_data
+                )
+                if identifier:
+                    await put(
+                        identifier,
+                        settings.user_id,
+                        "feeding-transfer",
+                        "prepared",
+                        {
+                            "bolt11": internal_payment.bolt11,
+                            "payment_hash": internal_payment.payment_hash,
+                            "sats": amount_sats,
+                            "from_wallet": herd_wallet_id,
+                            "to_wallet": target_wallet_id,
+                            "wallet_id": target_wallet_id,
+                            "amount": amount_sats * 1000,
+                        },
+                        insert=True,
+                    )
         except Exception as exc:
             return {
                 "ok": False,
@@ -118,9 +183,31 @@ async def transfer_herd_balance_to_source(settings: CyberherdSettings) -> Dict[s
             }
 
         try:
-            paid = await pay_invoice(
-                wallet_id=herd_wallet_id, payment_request=internal_payment.bolt11
+            # Freeze recipients at funding time, before asynchronous invoice listeners.
+            from lnbits.extensions.splitpayments.crud import get_targets
+            from .treats import prepare_distribution
+
+            await prepare_distribution(
+                internal_payment, await get_targets(target_wallet_id)
             )
+            from lnbits.core.crud import get_standalone_payment
+
+            existing = await get_standalone_payment(
+                internal_payment.payment_hash, wallet_id=herd_wallet_id
+            )
+            if existing and existing.amount < 0:
+                if not existing.success:
+                    return {
+                        "ok": False,
+                        "error": "Feeding transfer requires settlement reconciliation",
+                    }
+                paid = existing
+            else:
+                paid = await pay_invoice(
+                    wallet_id=herd_wallet_id, payment_request=internal_payment.bolt11
+                )
+            if not paid.success:
+                return {"ok": False, "error": "Feeding transfer is not settled"}
         except Exception as exc:
             return {
                 "ok": False,
@@ -128,22 +215,32 @@ async def transfer_herd_balance_to_source(settings: CyberherdSettings) -> Dict[s
                 "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
             }
 
+        if identifier:
+            saved = await record(identifier)
+            await put(
+                identifier, settings.user_id, "feeding-transfer", "paid", saved["data"]
+            )
         return {
             "ok": True,
             "from_wallet": herd_wallet_id,
             "to_wallet": target_wallet_id,
-            "sats": balance_sats,
+            "sats": amount_sats,
             "payment_checking_id": getattr(paid, "checking_id", None),
         }
 
 
 async def maybe_send_splits_for_user(
-    user_id: str, settings: Optional[CyberherdSettings] = None, *, feeder_triggered: bool = False
+    user_id: str,
+    settings: Optional[CyberherdSettings] = None,
+    *,
+    feeder_triggered: bool = False,
+    amount_sats: int | None = None,
+    feeding_id: str | None = None,
 ) -> Optional[Dict[str, Any]]:
-    """Distribute only after the feeder integration reports a successful trigger.
+    """Transfer one threshold authorized by the feeder integration's batch.
 
     A balance-only invoice notification is not authorization to distribute.
-    The caller must be the feeder path, after override and trigger checks.
+    The feeder path also authorizes payout-only cycles beyond its three-feed cap.
     OpenHAB acceptance confirms a rule request, not physical food delivery.
     """
     if feeder_triggered is not True:
@@ -176,12 +273,12 @@ async def maybe_send_splits_for_user(
     except Exception:
         balance_sats = 0
 
-    if balance_sats <= 0:
+    if balance_sats <= 0 and not feeding_id:
         return {"ok": False, "error": "Herd wallet balance is zero"}
 
     last_ts = _LAST_ATTEMPT.get(user_id, 0.0)
     now = time.time()
-    if now - last_ts < _MIN_INTERVAL_SECONDS:
+    if not feeding_id and now - last_ts < _MIN_INTERVAL_SECONDS:
         logger.debug(
             "CyberHerd send-splits: throttled for user %s (last attempt %.2fs ago)",
             user_id,
@@ -189,7 +286,9 @@ async def maybe_send_splits_for_user(
         )
         return None
 
-    result = await transfer_herd_balance_to_source(settings_obj)
+    result = await transfer_herd_balance_to_source(
+        settings_obj, amount_sats=amount_sats, feeding_id=feeding_id
+    )
     _LAST_ATTEMPT[user_id] = now
 
     if result.get("ok"):

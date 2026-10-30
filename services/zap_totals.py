@@ -338,6 +338,7 @@ async def record_incremental_zap_total(
     amount_sats: int,
     event_timestamp: Optional[int] = None,
     event_id: Optional[str] = None,
+    note_id: Optional[str] = None,
     skip_member_check: bool = False,
     lock_already_held: bool = False,
 ) -> None:
@@ -369,6 +370,7 @@ async def record_incremental_zap_total(
             counted = await crud.account_zap_payment(
                 user_id=user_id, payment_hash=event_id, zapper_pubkey=zapper,
                 amount_sats=amount_sats, processed_at=event_ts,
+                note_id=note_id,
             )
             if not counted:
                 return

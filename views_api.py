@@ -74,8 +74,6 @@ _reconnect_nostrclient_ws = reconnect_nostrclient_ws
 # No compatibility shims required - import targets exist in helper modules
 from lnbits.core.crud import get_wallet_for_key
 from . import crud
-from .crud import clear_processed_events_for_user, clear_processed_zaps_for_user
-from .services.splits import reset_splits_to_predefined_wallet
 from .services.payment_coordinator import (
     get_payment_coordinator as get_zap_monitor,
     payment_listener_required,
@@ -538,40 +536,9 @@ async def api_manual_reset(
     """
     user_id = wallet_info.wallet.user
     
-    # 1. Deactivate all members
-    await crud.deactivate_all_cyberherd_members(user_id=user_id)
-    
-    # 2. Clear processed zap history for fresh reprocessing
-    try:
-        await clear_processed_zaps_for_user(user_id)
-    except Exception as e:
-        logger.warning(f"Manual reset: failed to clear processed zaps: {e}")
-    
-    # 3. Clear processed event history (reposts/reactions)
-    try:
-        await clear_processed_events_for_user(user_id)
-    except Exception as e:
-        logger.warning(f"Manual reset: failed to clear processed events: {e}")
-    
-    # 4. Reset tracked event IDs (clear today's note tracking)
-    try:
-        settings = await crud.get_settings(user_id)
-        if settings:
-            setattr(settings, "tracked_event_ids", [])
-            setattr(settings, "tracked_event_timestamps", {})
-            setattr(settings, "tracked_event_addresses", {})
-            await crud.upsert_settings(settings, user_id)
-    except Exception as e:
-        logger.warning(f"Manual reset: failed to reset tracked events: {e}")
-    
-    # 5. Reset splits to predefined wallet at 100%
-    try:
-        settings = await crud.get_settings(user_id)
-        if settings and settings.source_wallet:
-            await reset_splits_to_predefined_wallet(settings.source_wallet, user_id=user_id)
-    except Exception as e:
-        logger.warning(f"Manual reset: failed to reset splits: {e}")
-    
+    from .tasks import manual_reset_membership
+
+    await manual_reset_membership(user_id, request.app)
     return {"ok": True}
 
 
@@ -748,7 +715,7 @@ async def api_recover_events(request: Request, wallet_info: WalletTypeInfo = Dep
         diagnostics = {
             "user_id": user_id,
             "events_recovered": {"attempted": False, "notes": 0, "reposts": 0, "reactions": 0, "total": 0, "errors": []},
-            "zaps": {"attempted": False, "processed": 0, "errors": []},
+            "zaps": {"attempted": False, "processed": 0, "processing_attempts": 0, "errors": []},
             "messages": []
         }
 
@@ -812,7 +779,10 @@ async def api_recover_events(request: Request, wallet_info: WalletTypeInfo = Dep
                     try:
                         resz = await zap_monitor._recover_missed_payment_zaps(settings)
                         if isinstance(resz, dict):
-                            diagnostics["zaps"]["processed"] = int(resz.get("processed", 0))
+                            diagnostics["zaps"]["processing_attempts"] = int(resz.get("processed", 0))
+                            diagnostics["zaps"]["processed"] = int(resz.get("successful", 0))
+                            if resz.get("error"):
+                                diagnostics["zaps"]["errors"].append(resz["error"])
                             if resz.get("errors"):
                                 diagnostics["zaps"]["errors"].extend(resz.get("errors") or [])
                         diagnostics["messages"].append(f"Zap recovery: {diagnostics['zaps']['processed']} qualifying zaps processed")
@@ -1352,15 +1322,6 @@ async def api_put_settings(
     if send_splits_enabled is not None:
         settings.send_splits_enabled = coerce_bool(
             send_splits_enabled, getattr(settings, "send_splits_enabled", False)
-        )
-
-    if (
-        getattr(settings, "repost_tracking_enabled", True)
-        or getattr(settings, "likes_tracking_enabled", True)
-    ) and int(getattr(settings, "member_allocation_percent", 10)) < int(getattr(settings, "max_members", 3)):
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST,
-            detail="member_allocation_percent must cover 1% per max_members while engagement tracking is enabled",
         )
 
     # Pre-compute effective pubkey before the upsert to avoid recomputation later.
@@ -2360,24 +2321,15 @@ async def api_put_member(
             detail="tracked note id is not registered for this user",
         )
 
-    # Check for duplicate zap processing
+    # A failed write must remain retryable, and identities are tenant-scoped.
+    dup_key = None
     if zap_request:
-        dup_key = zap_event_id or zap_request.get("id")
-        if dup_key:
-            processed_zaps = getattr(api_put_member, "_processed_zaps", set())
-            if dup_key in processed_zaps:
-                logger.info(f"Cyberherd: skipping duplicate zap processing for event {dup_key}")
+        identity = zap_event_id or zap_request.get("id")
+        if identity:
+            dup_key = (user_id, identity)
+            if dup_key in getattr(api_put_member, "_processed_zaps", set()):
                 return {"ok": True}
-            processed_zaps.add(dup_key)
-            if len(processed_zaps) > 1000:
-                oldest_entries = list(processed_zaps)[:100]
-                for entry in oldest_entries:
-                    processed_zaps.discard(entry)
-            try:
-                setattr(api_put_member, '_processed_zaps', processed_zaps)
-            except Exception:
-                pass
-    
+
     # Check if member exists and activate them if they do
     row = await crud.get_cyberherd_member_by_pubkey(pubkey, user_id)
     
@@ -2387,7 +2339,8 @@ async def api_put_member(
     was_active = bool(row.get("is_active"))
     # Member exists - activate them
     logger.info(f"cyberherd: activating member {pubkey[:8]}...")
-    await crud.update_and_activate_member(pubkey, 0, user_id)
+    if payload.amount is None:
+        await crud.update_and_activate_member(pubkey, 0, user_id)
     
     # Adjust amount if provided (increase by delta)
     if payload.amount is not None:
@@ -2406,9 +2359,10 @@ async def api_put_member(
             event_for_storage = tracked_event_id or zap_event_id
             await crud.update_and_activate_member(
                 pubkey,
-                increase_amt,
+                0,
                 user_id,
                 event_id=event_for_storage,
+                amount_total=new_amt,
             )
 
             # Only publish messages for automated zap processing with amount increases
@@ -2535,6 +2489,12 @@ async def api_put_member(
         except Exception as e:
             logger.warning(f"Cyberherd: failed updating member {pubkey[:8]}…: {e}")
             raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail="update failed")
+    if dup_key is not None:
+        processed_zaps = getattr(api_put_member, "_processed_zaps", set())
+        processed_zaps.add(dup_key)
+        if len(processed_zaps) > 1000:
+            processed_zaps = {dup_key}
+        setattr(api_put_member, "_processed_zaps", processed_zaps)
     return {"ok": True}
 
 
@@ -2682,120 +2642,28 @@ async def api_get_shares(request: Request, auth=Depends(auth_wallet_or_admin_dep
             settings = CyberherdSettings()
         zap_wallet = getattr(settings, "zap_wallet", None)
         zap_alias = getattr(settings, "zap_wallet_alias", None) or "Zap Wallet"
-        source_wallet = getattr(settings, "source_wallet", None)
+        from .services.shares import compute_member_share_percentages, member_point_units
+        from .utils.common import is_valid_lightning_address
 
-        # Fetch split targets from splitpayments extension if source_wallet is configured
-        split_targets = []
-        if source_wallet:
-            try:
-                from lnbits.extensions.splitpayments.crud import get_targets
-                split_targets = await get_targets(source_wallet)
-            except Exception as e:
-                logger.debug(f"Could not fetch split targets for source_wallet {source_wallet}: {e}")
-                split_targets = []
-
-        # Create a lookup dict for cyberherd members by lud16
-        members_by_lud16 = {}
-        for m in active_list:
-            lud16 = (m.get("lud16") or "").strip()
-            if lud16:
-                members_by_lud16[lud16] = m
-
-        # Compute shares based on splitpayments data
-        shares: list[dict] = []
-
-        # Add zap wallet share if configured
+        minimum = max(1, int(getattr(settings, "minimum_sats", 10)))
+        eligible = [m for m in active_list if is_valid_lightning_address(m.get("lud16"))]
+        pool = int(getattr(settings, "member_allocation_percent", 10)) if zap_wallet else 100
+        member_pcts = compute_member_share_percentages(eligible, pool, minimum)
+        shares = [{"pubkey": m["pubkey"], "display_name": m.get("display_name") or "Anon",
+                   "lud16": m["lud16"], "amount": int(m.get("amount") or 0),
+                   "points": member_point_units(m, minimum) / minimum,
+                   "percent": member_pcts.get(m["pubkey"], 0), "type": "member"}
+                  for m in eligible if member_pcts.get(m["pubkey"], 0) > 0]
         if zap_wallet:
-            shares.append({
-                "zap_wallet": zap_wallet,
-                "display_name": zap_alias,
-                "percent": 100.0,  # Default to 100%, will be adjusted if split targets exist
-                "type": "zap_wallet"
-            })
+            shares.append({"zap_wallet": zap_wallet, "display_name": zap_alias,
+                           "percent": round(100 - sum(member_pcts.values()), 6), "type": "zap_wallet"})
+        has_members = any(s["type"] == "member" for s in shares)
+        shares.sort(key=lambda s: s["percent"], reverse=True)
+        return {"shares": shares, "zap_wallet": zap_wallet,
+                "allocation_model": "zap+members" if zap_wallet and has_members else
+                    "zap_only" if zap_wallet else "members_only" if has_members else "none",
+                "share_policy": "contribution_points", "minimum_sats_basis": minimum}
 
-        # Process split targets and associate with cyberherd members
-        total_split_percent = 0.0
-        valid_split_targets = []
-        for target in split_targets:
-            target_wallet = target.wallet.strip() if target.wallet else ""
-            if not target_wallet or target_wallet == source_wallet:
-                continue
-            valid_split_targets.append(target)
-
-        for target in valid_split_targets:
-            target_wallet = target.wallet.strip()
-            # Check if this target corresponds to a cyberherd member
-            member = members_by_lud16.get(target_wallet)
-            if member:
-                # This is a cyberherd member target
-                shares.append({
-                    "pubkey": member.get("pubkey"),
-                    "display_name": member.get("display_name") or "Anon",
-                    "lud16": target_wallet,
-                    "amount": member.get("amount", 0),  # Already sats
-                    "percent": float(target.percent),
-                    "type": "member"
-                })
-                total_split_percent += target.percent
-            elif target_wallet == zap_wallet and target.percent > 0:
-                # This is the zap wallet target - update its percentage only if > 0
-                for share in shares:
-                    if share.get("type") == "zap_wallet":
-                        share["percent"] = float(target.percent)
-                        total_split_percent += target.percent
-                        break
-            else:
-                # This is some other target (not a cyberherd member or zap wallet)
-                if target.percent > 0:  # Only include targets with positive percent
-                    shares.append({
-                        "wallet": target_wallet,
-                        "display_name": target.alias or target_wallet,
-                        "percent": float(target.percent),
-                        "type": "external_target"
-                    })
-                    total_split_percent += target.percent
-
-        # If we have valid split targets, adjust zap wallet percentage if it wasn't explicitly set
-        if valid_split_targets and zap_wallet:
-            zap_found_in_targets = any(
-                (target.wallet or "").strip() == zap_wallet for target in split_targets
-            )
-            if not zap_found_in_targets:
-                # Zap wallet not in split targets, so it gets the remainder
-                for share in shares:
-                    if share.get("type") == "zap_wallet":
-                        share["percent"] = 100.0 - total_split_percent
-                        break
-
-        # Derive the same configured allocation used by SplitPayments when
-        # targets have not yet been created.
-        if not split_targets:
-            from .services.shares import compute_member_share_percentages
-            from .utils.common import is_valid_lightning_address
-            eligible = [m for m in active_list if is_valid_lightning_address(m.get("lud16"))]
-            member_total = int(getattr(settings, "member_allocation_percent", 10)) if zap_wallet else 100
-            member_pcts = compute_member_share_percentages(eligible, member_total)
-            for m in eligible:
-                pct = float(member_pcts.get(str(m.get("pubkey") or "").lower(), 0))
-                if pct <= 0:
-                    continue
-                shares.append({
-                    "pubkey": m.get("pubkey"),
-                    "display_name": m.get("display_name") or "Anon",
-                    "lud16": m.get("lud16"),
-                    "amount": int(m.get("amount", 0) or 0),
-                    "percent": pct,
-                    "type": "member",
-                })
-            if zap_wallet:
-                for share in shares:
-                    if share.get("type") == "zap_wallet":
-                        share["percent"] = 100.0 - sum(float(p) for p in member_pcts.values())
-                        break
-
-        # Sort descending percent for UI
-        shares.sort(key=lambda s: s.get("percent", 0), reverse=True)
-        return {"shares": shares, "zap_wallet": zap_wallet, "allocation_model": ("zap+members" if zap_wallet and any(s.get("type") == "member" for s in shares) else ("zap_only" if zap_wallet else ("members_only" if any(s.get("type") == "member" for s in shares) else "none")))}
     except Exception as e:
         logger.warning(f"Cyberherd shares fetch failed: {e}")
         return {"shares": [], "allocation_model": "error"}

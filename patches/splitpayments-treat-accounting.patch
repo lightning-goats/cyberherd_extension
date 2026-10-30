@@ -1,0 +1,151 @@
+--- a/tasks.py
++++ b/tasks.py
+@@ -45,9 +45,35 @@
+ 
+     logger.trace(f"splitpayments: performing split payments to {len(targets)} targets")
+ 
++    contexts = {}
++    try:
++        from lnbits.extensions.cyberherd.services.treats import prepare_distribution
++
++        targets, contexts = await prepare_distribution(payment, targets)
++    except ImportError:
++        pass
++    except Exception:
++        # Never send an unrecorded CyberHerd distribution after snapshot failure.
++        logger.error(
++            "splitpayments: distribution snapshot failed; refusing untracked payouts"
++        )
++        return
++
+     for target in targets:
+         if target.percent > 0:
++            context = contexts.get(target.wallet)
++            if context:
++                from lnbits.extensions.cyberherd.services.treats import claim_recipient
++
++                if not await claim_recipient(context):
++                    continue
+             amount_msat = int(payment.amount * target.percent / 100)
++            sendable_msat = amount_msat
++            if "@" in target.wallet or "LNURL" in target.wallet:
++                sendable_msat -= fee_reserve(amount_msat)
++            if sendable_msat < 1000:
++                await _record_outcome(context, "too_small")
++                continue
+             memo = (
+                 f"Split payment: {target.percent}% "
+                 f"for {target.alias or target.wallet}"
+@@ -57,7 +83,11 @@
+             if "@" in target.wallet or "LNURL" in target.wallet:
+                 safe_amount_msat = amount_msat - fee_reserve(amount_msat)
+                 payment_request = await get_lnurl_invoice(
+-                    target.wallet, payment.wallet_id, safe_amount_msat, memo
++                    target.wallet,
++                    payment.wallet_id,
++                    safe_amount_msat,
++                    memo,
++                    context=context,
+                 )
+             else:
+                 wallet = await get_wallet_for_key(target.wallet)
+@@ -72,8 +102,17 @@
+                 payment_request = new_payment.bolt11
+ 
+             extra = {**payment.extra, "splitted": True}
++            if context:
++                extra["cyberherd_treat"] = context
+ 
+             if payment_request:
++                invoice = bolt11.decode(payment_request)
++                await _record_outcome(
++                    context,
++                    "attempted",
++                    payment_hash=invoice.payment_hash,
++                    amount_msat=invoice.amount_msat,
++                )
+                 task = asyncio.create_task(
+                     pay_invoice_in_background(
+                         payment_request=payment_request,
+@@ -82,32 +121,41 @@
+                         extra=extra,
+                     )
+                 )
+-                task.add_done_callback(lambda fut: logger.success(fut.result()))
++                task.add_done_callback(_payment_done)
++            else:
++                await _record_outcome(context, "invoice_failed")
+ 
+ 
+ async def pay_invoice_in_background(payment_request, wallet_id, description, extra):
+     try:
+-        await pay_invoice(
++        result = await pay_invoice(
+             payment_request=payment_request,
+             wallet_id=wallet_id,
+             description=description,
+             extra=extra,
+         )
+-        return f"Splitpayments: paid invoice for {description}"
++        await _record_outcome(extra.get("cyberherd_treat"), "pending")
++        if result.success:
++            return "Splitpayments: outgoing payment settled"
++        return "Splitpayments: outgoing payment pending"
+     except Exception as e:
+         logger.error(f"Failed to pay invoice: {e}")
+ 
+ 
+ async def get_lnurl_invoice(
+-    payoraddress: str, wallet_id: str, amount_msat: int, memo: str
++    payoraddress: str, wallet_id: str, amount_msat: int, memo: str, *, context=None
+ ) -> Optional[str]:
+ 
+     rounded_amount = floor(amount_msat / 1000) * 1000
++    if rounded_amount < 1000:
++        return None
+ 
+     try:
+         payment_request = await get_pr_from_lnurl(payoraddress, rounded_amount, memo)
+     except Exception as e:
+         logger.error(f"Error getting LNURL invoice: {e!s}")
++        if context and await _below_receiver_minimum(payoraddress, rounded_amount):
++            await _record_outcome(context, "too_small")
+         return None
+ 
+     invoice = bolt11.decode(payment_request)
+@@ -119,3 +167,35 @@
+         return None
+ 
+     return payment_request
++
++
++async def _record_outcome(identifier, state, **kwargs):
++    if identifier:
++        from lnbits.extensions.cyberherd.services.treats import outcome
++
++        await outcome(identifier, state, **kwargs)
++
++
++def _payment_done(future):
++    if future.cancelled():
++        return
++    error = future.exception()
++    if error:
++        logger.error("Splitpayments: outgoing task failed")
++    elif future.result():
++        logger.info(future.result())
++
++
++async def _below_receiver_minimum(address, amount_msat):
++    # Inspect typed metadata, never classify a receiver/network error by its text.
++    from lnurl import handle, LnurlPayResponse
++    from lnbits.settings import settings
++
++    try:
++        response = await handle(address, user_agent=settings.user_agent, timeout=10)
++        return (
++            isinstance(response, LnurlPayResponse)
++            and amount_msat < response.minSendable
++        )
++    except Exception:
++        return False

@@ -9,11 +9,12 @@ logger = logging.getLogger(__name__)
 
 
 class PaymentService:
-    def __init__(self, wallet=None, db=None):
+    def __init__(self, wallet=None, db=None, user_id: str | None = None):
         # wallet: either a source wallet id (str) or a wallet helper object
         # db: DB helper for reading Cyberherd members and payment targets
         self.wallet = wallet
         self.db = db
+        self.user_id = user_id
 
     async def pay_cyberherd_members_with_splits(
         self,
@@ -54,16 +55,15 @@ class PaymentService:
 
     async def _get_active_members(self) -> list[dict]:
         db_conn = self.db
-        if db_conn is None:
+        if db_conn is None or not self.user_id:
             return []
 
         try:
-            query = "SELECT pubkey, amount, payouts FROM cyber_herd WHERE is_active = 1"
-            rows = await db_conn.fetch_all(query)
+            rows = await db_conn.get_active_cyberherd_members(self.user_id)
             return [dict(r) for r in rows] if rows else []
         except Exception:
-            logger.debug("PaymentService: could not read members from DB")
-            return []
+            logger.error("PaymentService: could not read members from DB")
+            raise
 
     def _calculate_split_payments(
         self, members: list[dict], total_sats: int
